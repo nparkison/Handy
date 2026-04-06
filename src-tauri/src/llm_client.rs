@@ -4,10 +4,31 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, REFER
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ChatMessage {
     role: String,
-    content: String,
+    content: MessageContent,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(untagged)]
+enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(tag = "type")]
+enum ContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ImageUrl {
+    pub url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,14 +151,14 @@ pub async fn send_chat_completion_with_schema(
     if let Some(system) = system_prompt {
         messages.push(ChatMessage {
             role: "system".to_string(),
-            content: system,
+            content: MessageContent::Text(system),
         });
     }
 
     // Add user message
     messages.push(ChatMessage {
         role: "user".to_string(),
-        content: user_content,
+        content: MessageContent::Text(user_content),
     });
 
     // Build response_format if schema is provided
@@ -154,6 +175,79 @@ pub async fn send_chat_completion_with_schema(
         model: model.to_string(),
         messages,
         response_format,
+    };
+
+    let response = client
+        .post(&url)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Failed to read error response".to_string());
+        return Err(format!(
+            "API request failed with status {}: {}",
+            status, error_text
+        ));
+    }
+
+    let completion: ChatCompletionResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse API response: {}", e))?;
+
+    Ok(completion
+        .choices
+        .first()
+        .and_then(|choice| choice.message.content.clone()))
+}
+
+/// Send a chat completion request with an image (multimodal)
+/// The image is provided as a base64-encoded PNG string
+pub async fn send_chat_completion_with_image(
+    provider: &PostProcessProvider,
+    api_key: String,
+    model: &str,
+    system_prompt: &str,
+    user_text: &str,
+    image_base64: &str,
+) -> Result<Option<String>, String> {
+    let base_url = provider.base_url.trim_end_matches('/');
+    let url = format!("{}/chat/completions", base_url);
+
+    debug!("Sending multimodal chat completion request to: {}", url);
+
+    let client = create_client(provider, &api_key)?;
+
+    let messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: MessageContent::Text(system_prompt.to_string()),
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: MessageContent::Parts(vec![
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: format!("data:image/png;base64,{}", image_base64),
+                    },
+                },
+                ContentPart::Text {
+                    text: user_text.to_string(),
+                },
+            ]),
+        },
+    ];
+
+    let request_body = ChatCompletionRequest {
+        model: model.to_string(),
+        messages,
+        response_format: None,
     };
 
     let response = client
