@@ -35,7 +35,7 @@ use signal_hook::consts::{SIGUSR1, SIGUSR2};
 #[cfg(unix)]
 use signal_hook::iterator::Signals;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::image::Image;
 pub use transcription_coordinator::TranscriptionCoordinator;
 
@@ -460,6 +460,9 @@ pub fn run(cli_args: CliArgs) {
             FILE_LOG_LEVEL.store(file_log_level.to_level_filter() as u8, Ordering::Relaxed);
             let app_handle = app.handle().clone();
             app.manage(TranscriptionCoordinator::new(app_handle.clone()));
+
+            // Shared state for passing screenshot from hotkey-press (start) to pipeline (stop)
+            app.manage(Arc::new(Mutex::new(Option::<screen_context::ScreenContext>::None)));
 
             initialize_core_logic(&app_handle);
 

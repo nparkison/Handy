@@ -56,7 +56,11 @@ fn build_system_prompt(prompt_template: &str) -> String {
     prompt_template.replace("${output}", "").trim().to_string()
 }
 
-async fn post_process_transcription(settings: &AppSettings, transcription: &str) -> Option<String> {
+async fn post_process_transcription(
+    settings: &AppSettings,
+    transcription: &str,
+    screen_context: Option<&crate::screen_context::ScreenContext>,
+) -> Option<String> {
     let provider = match settings.active_post_process_provider().cloned() {
         Some(provider) => provider,
         None => {
@@ -117,6 +121,41 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
         .get(&provider.id)
         .cloned()
         .unwrap_or_default();
+
+    // Vision path: if screen context is available and provider supports vision
+    if let Some(ctx) = screen_context {
+        if provider.supports_vision {
+            let system_prompt = build_system_prompt(&prompt);
+
+            let user_text = format!(
+                "Here is my dictated speech. Clean it up and format it appropriately based on \
+                 what you can see on my screen:\n\n{}",
+                transcription
+            );
+
+            match crate::llm_client::send_chat_completion_with_image(
+                &provider,
+                api_key.clone(),
+                &model,
+                &system_prompt,
+                &user_text,
+                &ctx.image_base64,
+            )
+            .await
+            {
+                Ok(Some(result)) => {
+                    let cleaned = strip_invisible_chars(&result);
+                    return Some(cleaned);
+                }
+                Ok(None) => {
+                    log::warn!("Vision post-processing returned empty response, falling through to text-only");
+                }
+                Err(e) => {
+                    log::error!("Vision post-processing failed: {}, falling through to text-only", e);
+                }
+            }
+        }
+    }
 
     if provider.supports_structured_output {
         debug!("Using structured outputs for provider '{}'", provider.id);
@@ -325,6 +364,17 @@ impl ShortcutAction for TranscribeAction {
 
         // Get the microphone mode to determine audio feedback timing
         let settings = get_settings(app);
+
+        // Capture screen context if enabled (before recording starts, while user's target app is focused)
+        if settings.screen_context_enabled {
+            let ctx = crate::screen_context::capture_focused_window();
+            if let Some(state) = app.try_state::<std::sync::Arc<std::sync::Mutex<Option<crate::screen_context::ScreenContext>>>>() {
+                *state.lock().unwrap() = ctx;
+            }
+        } else if let Some(state) = app.try_state::<std::sync::Arc<std::sync::Mutex<Option<crate::screen_context::ScreenContext>>>>() {
+            *state.lock().unwrap() = None;
+        }
+
         let is_always_on = settings.always_on_microphone;
         debug!("Microphone mode - always_on: {}", is_always_on);
 
@@ -402,6 +452,11 @@ impl ShortcutAction for TranscribeAction {
         let binding_id = binding_id.to_string(); // Clone binding_id for the async task
         let post_process = self.post_process;
 
+        // Retrieve (and consume) the screen context captured at hotkey-press time
+        let screen_ctx = app
+            .try_state::<std::sync::Arc<std::sync::Mutex<Option<crate::screen_context::ScreenContext>>>>()
+            .and_then(|state| state.lock().unwrap().take());
+
         tauri::async_runtime::spawn(async move {
             let _guard = FinishGuard(ah.clone());
             let binding_id = binding_id.clone(); // Clone for the inner async task
@@ -446,7 +501,7 @@ impl ShortcutAction for TranscribeAction {
                                 show_processing_overlay(&ah);
                             }
                             let processed = if post_process {
-                                post_process_transcription(&settings, &final_text).await
+                                post_process_transcription(&settings, &final_text, screen_ctx.as_ref()).await
                             } else {
                                 None
                             };
