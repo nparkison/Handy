@@ -384,6 +384,12 @@
         "createFirst": "Click 'Create New Prompt' above to create your first post-processing prompt."
       }
     },
+    "screenContext": {
+      "title": "Screen Context",
+      "description": "Capture a screenshot when you start recording. The AI can see what's on your screen to better format your text.",
+      "enabled": "Enable Screen Context",
+      "providerWarning": "Requires a vision-capable model (e.g., Gemma 4 via Ollama)"
+    },
     "history": {
       "title": "History",
       "openFolder": "Open Recordings Folder",

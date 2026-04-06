@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { RefreshCcw } from "lucide-react";
 import { commands } from "@/bindings";
+import { ToggleSwitch } from "../../ui/ToggleSwitch";
 
 import { Alert } from "../../ui/Alert";
 import {
@@ -425,6 +426,12 @@ PostProcessingSettingsPrompts.displayName = "PostProcessingSettingsPrompts";
 
 export const PostProcessingSettings: React.FC = () => {
   const { t } = useTranslation();
+  const { getSetting, updateSetting, isUpdating, settings } = useSettings();
+
+  const provider = settings?.post_process_providers?.find(
+    (p: { id: string }) => p.id === settings?.post_process_provider_id,
+  );
+  const supportsVision = provider?.supports_vision ?? false;
 
   return (
     <div className="max-w-3xl w-full mx-auto space-y-6">
@@ -442,6 +449,27 @@ export const PostProcessingSettings: React.FC = () => {
 
       <SettingsGroup title={t("settings.postProcessing.prompts.title")}>
         <PostProcessingSettingsPrompts />
+      </SettingsGroup>
+
+      <SettingsGroup title={t("settings.screenContext.title")}>
+        <ToggleSwitch
+          checked={
+            (getSetting("screen_context_enabled") || false) && supportsVision
+          }
+          onChange={(enabled) =>
+            updateSetting("screen_context_enabled", enabled)
+          }
+          isUpdating={isUpdating("screen_context_enabled")}
+          label={t("settings.screenContext.enabled")}
+          description={
+            !supportsVision
+              ? t("settings.screenContext.providerWarning")
+              : t("settings.screenContext.description")
+          }
+          descriptionMode="inline"
+          grouped={true}
+          disabled={!supportsVision}
+        />
       </SettingsGroup>
     </div>
   );
