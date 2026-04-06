@@ -17,10 +17,12 @@ pub struct ScreenContext {
 /// Returns `None` if no focused window is found or capture fails.
 pub fn capture_focused_window() -> Option<ScreenContext> {
     let windows = Window::all().ok()?;
-    let focused = windows.into_iter().find(|w| w.is_focused())?;
+    let focused = windows
+        .into_iter()
+        .find(|w| w.is_focused().unwrap_or(false))?;
 
-    let app_name = focused.app_name().to_string();
-    let window_title = focused.title().to_string();
+    let app_name = focused.app_name().unwrap_or_default();
+    let window_title = focused.title().unwrap_or_default();
 
     let capture = focused.capture_image().ok()?;
 
