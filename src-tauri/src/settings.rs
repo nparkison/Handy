@@ -103,6 +103,8 @@ pub struct PostProcessProvider {
     pub models_endpoint: Option<String>,
     #[serde(default)]
     pub supports_structured_output: bool,
+    #[serde(default)]
+    pub supports_vision: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type)]
@@ -344,6 +346,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub post_process_selected_prompt_id: Option<String>,
     #[serde(default)]
+    pub screen_context_enabled: bool,
+    #[serde(default)]
     pub mute_while_recording: bool,
     #[serde(default)]
     pub append_trailing_space: bool,
@@ -462,6 +466,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             allow_base_url_edit: false,
             models_endpoint: Some("/models".to_string()),
             supports_structured_output: true,
+            supports_vision: true,
         },
         PostProcessProvider {
             id: "zai".to_string(),
@@ -470,6 +475,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             allow_base_url_edit: false,
             models_endpoint: Some("/models".to_string()),
             supports_structured_output: true,
+            supports_vision: false,
         },
         PostProcessProvider {
             id: "openrouter".to_string(),
@@ -478,6 +484,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             allow_base_url_edit: false,
             models_endpoint: Some("/models".to_string()),
             supports_structured_output: true,
+            supports_vision: true,
         },
         PostProcessProvider {
             id: "anthropic".to_string(),
@@ -486,6 +493,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             allow_base_url_edit: false,
             models_endpoint: Some("/models".to_string()),
             supports_structured_output: false,
+            supports_vision: true,
         },
         PostProcessProvider {
             id: "groq".to_string(),
@@ -494,6 +502,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             allow_base_url_edit: false,
             models_endpoint: Some("/models".to_string()),
             supports_structured_output: false,
+            supports_vision: true,
         },
         PostProcessProvider {
             id: "cerebras".to_string(),
@@ -502,6 +511,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             allow_base_url_edit: false,
             models_endpoint: Some("/models".to_string()),
             supports_structured_output: true,
+            supports_vision: false,
         },
     ];
 
@@ -518,6 +528,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             allow_base_url_edit: false,
             models_endpoint: None,
             supports_structured_output: true,
+            supports_vision: false,
         });
     }
 
@@ -529,6 +540,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
         allow_base_url_edit: true,
         models_endpoint: Some("/models".to_string()),
         supports_structured_output: false,
+        supports_vision: true,
     });
 
     providers
@@ -591,6 +603,17 @@ fn ensure_post_process_defaults(settings: &mut AppSettings) -> bool {
                         provider.supports_structured_output
                     );
                     existing.supports_structured_output = provider.supports_structured_output;
+                    changed = true;
+                }
+                // Sync supports_vision field for existing providers (migration)
+                if existing.supports_vision != provider.supports_vision {
+                    debug!(
+                        "Updating supports_vision for provider '{}' from {} to {}",
+                        provider.id,
+                        existing.supports_vision,
+                        provider.supports_vision
+                    );
+                    existing.supports_vision = provider.supports_vision;
                     changed = true;
                 }
             }
@@ -717,6 +740,7 @@ pub fn get_default_settings() -> AppSettings {
         post_process_models: default_post_process_models(),
         post_process_prompts: default_post_process_prompts(),
         post_process_selected_prompt_id: None,
+        screen_context_enabled: false,
         mute_while_recording: false,
         append_trailing_space: false,
         app_language: default_app_language(),
