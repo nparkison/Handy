@@ -8,6 +8,7 @@ mod catalog;
 mod chinese_script;
 pub mod cli;
 mod clipboard;
+mod cockpit;
 mod commands;
 mod dead_air;
 mod helpers;
@@ -713,6 +714,11 @@ pub fn run(cli_args: CliArgs) {
             shortcut::resume_all_bindings,
             shortcut::change_mute_while_recording_setting,
             shortcut::change_silent_mic_warning_setting,
+            shortcut::change_post_process_every_dictation_setting,
+            shortcut::change_post_process_timeout_ms_setting,
+            shortcut::change_tap_gestures_enabled_setting,
+            shortcut::change_tap_max_duration_ms_setting,
+            shortcut::change_double_tap_window_ms_setting,
             shortcut::change_append_trailing_space_setting,
             shortcut::change_lazy_stream_close_setting,
             shortcut::change_vad_enabled_setting,

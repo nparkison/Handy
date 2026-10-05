@@ -165,8 +165,10 @@ pub fn change_binding(
     id: String,
     binding: String,
 ) -> Result<BindingResponse, String> {
-    // Reject empty bindings — every shortcut should have a value
-    if binding.trim().is_empty() {
+    // Reject empty bindings, except for the optional ones that ship unbound:
+    // for those an empty value clears (unbinds) the shortcut.
+    let unbinding = binding.trim().is_empty();
+    if unbinding && !settings::is_optional_binding(&id) {
         return Err("Binding cannot be empty".to_string());
     }
 
@@ -222,8 +224,12 @@ pub fn change_binding(
     }
 
     // Validate the new shortcut for the current keyboard implementation
-    if let Err(e) = validate_shortcut_for_implementation(&binding, settings.keyboard_implementation)
-    {
+    // (an unbound optional shortcut has nothing to validate or register).
+    if let Err(e) = if unbinding {
+        Ok(())
+    } else {
+        validate_shortcut_for_implementation(&binding, settings.keyboard_implementation)
+    } {
         warn!("change_binding validation error: {}", e);
         restore_registration(&app, &binding_to_modify);
         return Err(e);
@@ -507,7 +513,11 @@ fn register_all_shortcuts_for_implementation(
             .cloned()
             .unwrap_or_else(|| default_binding.clone());
 
-        // Validate the shortcut for the target implementation
+        // Validate the shortcut for the target implementation (unbound
+        // optional shortcuts are skipped: there is nothing to register).
+        if settings::is_unbound(&binding) {
+            continue;
+        }
         if let Err(e) =
             validate_shortcut_for_implementation(&binding.current_binding, implementation)
         {
@@ -1342,6 +1352,54 @@ pub fn change_silent_mic_warning_setting(app: AppHandle, enabled: bool) -> Resul
     if !enabled {
         crate::dead_air::reset(&app);
     }
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn change_post_process_every_dictation_setting(
+    app: AppHandle,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.post_process_every_dictation = enabled;
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn change_post_process_timeout_ms_setting(app: AppHandle, ms: u64) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.post_process_timeout_ms = ms;
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn change_tap_gestures_enabled_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.tap_gestures_enabled = enabled;
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn change_tap_max_duration_ms_setting(app: AppHandle, ms: u64) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.tap_max_duration_ms = ms;
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn change_double_tap_window_ms_setting(app: AppHandle, ms: u64) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.double_tap_window_ms = ms;
+    settings::write_settings(&app, settings);
     Ok(())
 }
 

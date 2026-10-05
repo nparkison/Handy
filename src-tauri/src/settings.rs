@@ -478,6 +478,25 @@ pub struct AppSettings {
     /// Dead-air guard: skip silent recordings and say which mic to check.
     #[serde(default = "default_silent_mic_warning")]
     pub silent_mic_warning: bool,
+    /// Run AI cleanup on every dictation made with the main `transcribe`
+    /// binding (the post-process binding keeps working as before).
+    #[serde(default)]
+    pub post_process_every_dictation: bool,
+    /// Cleanup deadline in ms, measured from when the LLM request is sent.
+    /// On a miss the original text is pasted and the cleaned-up version is
+    /// saved to History when it arrives. 0 = no limit (always wait).
+    #[serde(default = "default_post_process_timeout_ms")]
+    pub post_process_timeout_ms: u64,
+    /// Tap / double-tap on the main binding pastes / swaps the last dictation.
+    /// Only active with push-to-talk (Hold) activation.
+    #[serde(default)]
+    pub tap_gestures_enabled: bool,
+    /// A press shorter than this with no speech is a tap.
+    #[serde(default = "default_tap_max_duration_ms")]
+    pub tap_max_duration_ms: u64,
+    /// A second tap must start this soon after the first tap's release.
+    #[serde(default = "default_double_tap_window_ms")]
+    pub double_tap_window_ms: u64,
     #[serde(default)]
     pub append_trailing_space: bool,
     #[serde(default = "default_app_language")]
@@ -698,6 +717,18 @@ fn default_show_recent_dictations_in_tray() -> bool {
 
 fn default_silent_mic_warning() -> bool {
     true
+}
+
+fn default_post_process_timeout_ms() -> u64 {
+    1_500
+}
+
+fn default_tap_max_duration_ms() -> u64 {
+    200
+}
+
+fn default_double_tap_window_ms() -> u64 {
+    250
 }
 
 fn default_post_process_provider_id() -> String {
@@ -982,6 +1013,31 @@ pub fn get_default_settings() -> AppSettings {
         },
     );
 
+    // Unbound by default: users opt in by recording a shortcut.
+    for (id, name, description) in [
+        (
+            "paste_last",
+            "Paste Last",
+            "Pastes your most recent dictation again.",
+        ),
+        (
+            "swap_last",
+            "Swap Last",
+            "Replaces the text Handy just pasted with the other version.",
+        ),
+    ] {
+        bindings.insert(
+            id.to_string(),
+            ShortcutBinding {
+                id: id.to_string(),
+                name: name.to_string(),
+                description: description.to_string(),
+                default_binding: String::new(),
+                current_binding: String::new(),
+            },
+        );
+    }
+
     AppSettings {
         settings_schema_version: default_settings_schema_version(),
         bindings,
@@ -1026,6 +1082,11 @@ pub fn get_default_settings() -> AppSettings {
         screen_context_enabled: false,
         mute_while_recording: false,
         silent_mic_warning: default_silent_mic_warning(),
+        post_process_every_dictation: false,
+        post_process_timeout_ms: default_post_process_timeout_ms(),
+        tap_gestures_enabled: false,
+        tap_max_duration_ms: default_tap_max_duration_ms(),
+        double_tap_window_ms: default_double_tap_window_ms(),
         append_trailing_space: false,
         app_language: default_app_language(),
         theme: default_theme(),
@@ -1079,6 +1140,34 @@ impl AppSettings {
         self.post_process_providers
             .iter_mut()
             .find(|provider| provider.id == provider_id)
+    }
+
+    /// Whether dictations made with the main `transcribe` binding run AI
+    /// cleanup. Still gated by the Post Processing feature toggle.
+    pub fn cleans_up_every_dictation(&self) -> bool {
+        self.post_process_enabled && self.post_process_every_dictation
+    }
+
+    /// Cleanup deadline measured from when the LLM request is sent; `None`
+    /// means no limit.
+    pub fn cleanup_deadline(&self) -> Option<std::time::Duration> {
+        (self.post_process_timeout_ms > 0)
+            .then(|| std::time::Duration::from_millis(self.post_process_timeout_ms))
+    }
+
+    /// Tap gestures only apply in push-to-talk (Hold) mode; in the other
+    /// modes the setting is kept but suspended.
+    pub fn tap_gestures_active(&self) -> bool {
+        self.tap_gestures_enabled && self.shortcut_activation == ShortcutActivation::PushToTalk
+    }
+
+    /// The user has some way to trigger Swap last (a binding or double-tap).
+    pub fn swap_last_reachable(&self) -> bool {
+        self.tap_gestures_active()
+            || self
+                .bindings
+                .get("swap_last")
+                .is_some_and(|b| !b.current_binding.trim().is_empty())
     }
 }
 
@@ -1322,6 +1411,16 @@ pub fn write_settings(app: &AppHandle, settings: AppSettings) {
         .expect("Failed to initialize store");
 
     store.set("settings", serde_json::to_value(&settings).unwrap());
+}
+
+/// Bindings that ship unbound and may be cleared back to unbound.
+pub fn is_optional_binding(id: &str) -> bool {
+    matches!(id, "paste_last" | "swap_last")
+}
+
+/// An unbound shortcut (empty `current_binding`) is never registered.
+pub fn is_unbound(binding: &ShortcutBinding) -> bool {
+    binding.current_binding.trim().is_empty()
 }
 
 pub fn get_bindings(app: &AppHandle) -> HashMap<String, ShortcutBinding> {
