@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 #[derive(Debug, Serialize)]
 struct ChatMessage {
@@ -193,13 +194,51 @@ fn build_headers(provider: &PostProcessProvider, api_key: &str) -> Result<Header
     Ok(headers)
 }
 
-/// Create an HTTP client with provider-specific headers
-fn create_client(provider: &PostProcessProvider, api_key: &str) -> Result<reqwest::Client, String> {
-    let headers = build_headers(provider, api_key)?;
-    reqwest::Client::builder()
-        .default_headers(headers)
+/// Upper bound for one HTTP request (connect + response). Without it a hung
+/// endpoint would keep a request alive forever. Generous on purpose: with the
+/// cleanup deadline set to "No limit" a cold local model may take a while.
+/// After a deadline miss the background wait is capped separately (30 s).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One process-wide client so connections (and their TLS sessions) are
+/// pooled across dictations: re-handshaking on every cleanup request costs
+/// hundreds of milliseconds against a 1.5 s budget.
+fn shared_http_client() -> Result<reqwest::Client, String> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
         .build()
-        .map_err(|e| report_reqwest_error("Failed to build HTTP client", &e))
+        .map_err(|e| report_reqwest_error("Failed to build HTTP client", &e))?;
+    Ok(CLIENT.get_or_init(|| client).clone())
+}
+
+/// The shared client plus one provider's headers, applied per request.
+struct ProviderClient {
+    client: reqwest::Client,
+    headers: HeaderMap,
+}
+
+impl ProviderClient {
+    fn post(&self, url: &str) -> reqwest::RequestBuilder {
+        self.client.post(url).headers(self.headers.clone())
+    }
+
+    fn get(&self, url: &str) -> reqwest::RequestBuilder {
+        self.client.get(url).headers(self.headers.clone())
+    }
+}
+
+/// Create an HTTP client with provider-specific headers
+fn create_client(provider: &PostProcessProvider, api_key: &str) -> Result<ProviderClient, String> {
+    Ok(ProviderClient {
+        client: shared_http_client()?,
+        headers: build_headers(provider, api_key)?,
+    })
 }
 
 /// Format a bounded error source chain.
