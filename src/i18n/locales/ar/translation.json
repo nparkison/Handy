@@ -15,7 +15,8 @@
     "heardNothing": "Heard nothing from {{mic}}",
     "sentNoAudio": "{{mic}} sent no audio - check mic access",
     "micSilentNotificationTitle": "Microphone silent",
-    "micSilentNotificationBody": "Your last {{count}} recordings from {{mic}} were silent."
+    "micSilentNotificationBody": "Your last {{count}} recordings from {{mic}} were silent.",
+    "defaultMicrophone": "Default microphone"
   },
   "sidebar": {
     "general": "عام",
@@ -565,7 +566,7 @@
         "cleaningUp": "Cleaning up...",
         "cleanedUpLate": "Cleaned up late"
       },
-      "contextSent": "Sent: {{context}}",
+      "contextSent": "Sent: {{details}}",
       "screenshotShared": "Screenshot shared"
     },
     "debug": {
@@ -605,7 +606,9 @@
       "historyLimit": {
         "title": "حد السجل",
         "description": "الحد الأقصى لعدد إدخالات السجل المراد الاحتفاظ بها",
-        "entries": "إدخالات"
+        "entries": "إدخالات",
+        "lowerTitle": "Lower history limit?",
+        "lowerConfirm": "Keep only the newest {{count}} unsaved dictations? Older ones and their recordings are deleted now. Starred dictations are kept."
       },
       "recordingRetention": {
         "title": "حذف التسجيلات تلقائياً",
@@ -731,6 +734,7 @@
         "copied": "Copied",
         "notSaved": "Results are not saved.",
         "loadNote": "Models load one at a time next to your active model, which stays ready for dictation. Dictating pauses the bench.",
+        "activeCopyNote": "Your active model is selected, so the bench loads a second copy of it. Expect about twice its memory use while it runs.",
         "oneModel": "Install another model to compare.",
         "openModels": "Open Models",
         "finished": "Run finished.",

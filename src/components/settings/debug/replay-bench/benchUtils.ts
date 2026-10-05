@@ -59,7 +59,12 @@ export const formatRtf = (rtf: number | null | undefined): string =>
 
 const csvCell = (value: string | number | null | undefined): string => {
   if (value === null || value === undefined) return "";
-  const text = String(value);
+  let text = String(value);
+  // Dictated text that starts like a formula would run as one when the CSV
+  // is opened in a spreadsheet; a leading quote makes it plain text.
+  if (typeof value === "string" && /^[=+\-@\t\r]/.test(text)) {
+    text = `'${text}`;
+  }
   return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 };
 

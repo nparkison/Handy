@@ -94,7 +94,11 @@ export const HistorySettings: React.FC = () => {
   const sentinelRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const entriesRef = useRef<HistoryEntry[]>([]);
-  const loadingRef = useRef(false);
+  // Token of the request that owns the loading lock (null when idle). Only
+  // its owner releases it, so a superseded request finishing late can't
+  // unlock infinite scroll while a newer first page is still loading.
+  const loadingRef = useRef<number | null>(null);
+  const requestTokenRef = useRef(0);
   const activeQueryRef = useRef("");
   // Identifies the current list; responses for an older list are dropped.
   const generationRef = useRef(0);
@@ -120,8 +124,11 @@ export const HistorySettings: React.FC = () => {
 
   const loadPage = useCallback(async (cursor?: number) => {
     const isFirstPage = cursor === undefined;
-    if (!isFirstPage && loadingRef.current) return;
-    loadingRef.current = true;
+    // Next pages wait for any in-flight load, including a first page for a
+    // new query (whose cursor would come from the old list).
+    if (!isFirstPage && loadingRef.current !== null) return;
+    const token = ++requestTokenRef.current;
+    loadingRef.current = token;
 
     if (isFirstPage) {
       generationRef.current += 1;
@@ -144,9 +151,20 @@ export const HistorySettings: React.FC = () => {
       if (generation !== generationRef.current) return;
       if (result.status === "ok") {
         const { entries: newEntries, has_more } = result.data;
-        setEntries((prev) =>
-          isFirstPage ? newEntries : [...prev, ...newEntries],
-        );
+        setEntries((prev) => {
+          if (!isFirstPage) {
+            const known = new Set(prev.map((e) => e.id));
+            return [...prev, ...newEntries.filter((e) => !known.has(e.id))];
+          }
+          // Keep live "added" entries that arrived while this page loaded
+          // and are newer than its first row (ids only grow).
+          const newestId = newEntries[0]?.id ?? -Infinity;
+          const live = prev.filter(
+            (e) =>
+              e.id > newestId && entryMatchesQuery(e, activeQueryRef.current),
+          );
+          return [...live, ...newEntries];
+        });
         setHasMore(has_more);
         if (isFirstPage) setPageVersion((v) => v + 1);
       } else {
@@ -160,7 +178,7 @@ export const HistorySettings: React.FC = () => {
         setFetching(false);
         initialLoadDoneRef.current = true;
       }
-      loadingRef.current = false;
+      if (loadingRef.current === token) loadingRef.current = null;
     }
   }, []);
 
@@ -201,7 +219,11 @@ export const HistorySettings: React.FC = () => {
       if (payload.action === "added") {
         // While searching, only show new dictations that match.
         if (entryMatchesQuery(payload.entry, activeQueryRef.current)) {
-          setEntries((prev) => [payload.entry, ...prev]);
+          setEntries((prev) =>
+            prev.some((e) => e.id === payload.entry.id)
+              ? prev
+              : [payload.entry, ...prev],
+          );
         }
       } else if (payload.action === "updated") {
         setEntries((prev) =>
@@ -484,7 +506,7 @@ const ContextLine: React.FC<{ entry: HistoryEntry }> = ({ entry }) => {
   return (
     <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-text/60 break-words">
       {sent && (
-        <span>{t("settings.history.contextSent", { context: sent })}</span>
+        <span>{t("settings.history.contextSent", { details: sent })}</span>
       )}
       {context.screenshot && (
         <span className="inline-flex items-center gap-1">

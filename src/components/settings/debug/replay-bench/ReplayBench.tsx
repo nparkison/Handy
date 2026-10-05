@@ -271,6 +271,11 @@ export const ReplayBench: React.FC<ReplayBenchProps> = ({ onOpenModels }) => {
         <p className="text-xs text-mid-gray">
           {t("settings.debug.replayBench.loadNote")}
         </p>
+        {currentModel && selectedModels.includes(currentModel) && (
+          <p className="text-xs text-mid-gray">
+            {t("settings.debug.replayBench.activeCopyNote")}
+          </p>
+        )}
         {tooFewInstalled && (
           <p className="text-sm">
             {t("settings.debug.replayBench.oneModel")}{" "}

@@ -20,15 +20,20 @@ export const SilentMicAlert: React.FC = () => {
 
   useEffect(() => {
     let active = true;
+    // An event is newer than the initial read, which may resolve after it.
+    let eventSeen = false;
     commands
       .getSilentMicAlert()
       .then((current) => {
-        if (active) setAlert(current);
+        if (active && !eventSeen) setAlert(current);
       })
       .catch((e) => console.warn("Failed to read silent-mic alert:", e));
     const unlisten = listen<SilentMicAlertState | null>(
       "silent-mic-alert-changed",
-      (event) => setAlert(event.payload),
+      (event) => {
+        eventSeen = true;
+        setAlert(event.payload);
+      },
     );
     return () => {
       active = false;
