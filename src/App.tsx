@@ -166,6 +166,19 @@ function App() {
     };
   }, [t]);
 
+  // The backend can ask to open a specific settings page (e.g. the dead-air
+  // notice's "Mic settings" action opens General > Sound).
+  useEffect(() => {
+    const unlisten = listen<string>("navigate-to-section", (event) => {
+      if (event.payload in SECTIONS_CONFIG) {
+        setCurrentSection(event.payload as SidebarSection);
+      }
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
   // Listen for paste failures and show a toast.
   // The technical error detail is logged to handy.log on the Rust side
   // (see actions.rs `error!("Failed to paste transcription: ...")`),

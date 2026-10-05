@@ -7,7 +7,12 @@
     "model": "Modèle",
     "quit": "Quitter",
     "cancel": "Annuler",
-    "secureInputWarning": "⚠ Raccourcis bloqués par Secure Input"
+    "secureInputWarning": "⚠ Raccourcis bloqués par Secure Input",
+    "micSilent": "⚠ Microphone silent - check {{mic}}",
+    "heardNothing": "Heard nothing from {{mic}}",
+    "sentNoAudio": "{{mic}} sent no audio - check mic access",
+    "micSilentNotificationTitle": "Microphone silent",
+    "micSilentNotificationBody": "Your last {{count}} recordings from {{mic}} were silent."
   },
   "sidebar": {
     "general": "Général",
@@ -236,6 +241,14 @@
         "description": "Sélectionnez votre périphérique d'entrée audio",
         "placeholder": "Sélectionner un microphone...",
         "loading": "Chargement..."
+      },
+      "silentMicWarning": {
+        "label": "Warn when the mic hears nothing",
+        "description": "If a recording is silent, skip it and tell you which microphone to check."
+      },
+      "silentMicAlert": {
+        "message": "Your last {{count}} recordings from {{mic}} were silent.",
+        "dismiss": "Dismiss"
       },
       "channel": {
         "title": "Canal d’entrée",
@@ -714,7 +727,18 @@
   },
   "overlay": {
     "transcribing": "Transcription...",
-    "processing": "Traitement..."
+    "processing": "Traitement...",
+    "notice": {
+      "heardNothing": "Heard nothing from {{mic}}",
+      "sentNoAudioWindows": "{{mic}} sent no audio - check Windows mic access",
+      "sentNoAudio": "{{mic}} sent no audio - check mic access and mute",
+      "useMic": "Use {{mic}}",
+      "micSettings": "Mic settings",
+      "switchedMic": "Switched to {{mic}}",
+      "switchFailed": "Couldn't switch to {{mic}}",
+      "warning": "Warning",
+      "info": "Info"
+    }
   },
   "whatsNew": {
     "title": "Nouveautés de Handy v{{version}}"

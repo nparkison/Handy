@@ -7,7 +7,12 @@
     "model": "Model",
     "quit": "Keluar",
     "cancel": "Batal",
-    "secureInputWarning": "⚠ Pintasan diblokir oleh Secure Input"
+    "secureInputWarning": "⚠ Pintasan diblokir oleh Secure Input",
+    "micSilent": "⚠ Microphone silent - check {{mic}}",
+    "heardNothing": "Heard nothing from {{mic}}",
+    "sentNoAudio": "{{mic}} sent no audio - check mic access",
+    "micSilentNotificationTitle": "Microphone silent",
+    "micSilentNotificationBody": "Your last {{count}} recordings from {{mic}} were silent."
   },
   "sidebar": {
     "general": "Umum",
@@ -236,6 +241,14 @@
         "description": "Pilih perangkat mikrofon yang Anda inginkan",
         "placeholder": "Pilih mikrofon...",
         "loading": "Memuat..."
+      },
+      "silentMicWarning": {
+        "label": "Warn when the mic hears nothing",
+        "description": "If a recording is silent, skip it and tell you which microphone to check."
+      },
+      "silentMicAlert": {
+        "message": "Your last {{count}} recordings from {{mic}} were silent.",
+        "dismiss": "Dismiss"
       },
       "channel": {
         "title": "Kanal Masukan",
@@ -717,7 +730,18 @@
   },
   "overlay": {
     "transcribing": "Mentranskripsikan...",
-    "processing": "Memproses..."
+    "processing": "Memproses...",
+    "notice": {
+      "heardNothing": "Heard nothing from {{mic}}",
+      "sentNoAudioWindows": "{{mic}} sent no audio - check Windows mic access",
+      "sentNoAudio": "{{mic}} sent no audio - check mic access and mute",
+      "useMic": "Use {{mic}}",
+      "micSettings": "Mic settings",
+      "switchedMic": "Switched to {{mic}}",
+      "switchFailed": "Couldn't switch to {{mic}}",
+      "warning": "Warning",
+      "info": "Info"
+    }
   },
   "secureInput": {
     "blockedWithCulprit_one": "{{name}} mungkin memblokir 1 pintasan",

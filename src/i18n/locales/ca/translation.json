@@ -7,7 +7,12 @@
     "model": "Model",
     "quit": "Surt",
     "cancel": "Cancel·la",
-    "secureInputWarning": "⚠ Dreceres blocades per l'entrada segura"
+    "secureInputWarning": "⚠ Dreceres blocades per l'entrada segura",
+    "micSilent": "⚠ Microphone silent - check {{mic}}",
+    "heardNothing": "Heard nothing from {{mic}}",
+    "sentNoAudio": "{{mic}} sent no audio - check mic access",
+    "micSilentNotificationTitle": "Microphone silent",
+    "micSilentNotificationBody": "Your last {{count}} recordings from {{mic}} were silent."
   },
   "sidebar": {
     "general": "General",
@@ -236,6 +241,14 @@
         "description": "Selecciona el micròfon preferit",
         "placeholder": "Seleccionaun micròfon...",
         "loading": "S'està carregant..."
+      },
+      "silentMicWarning": {
+        "label": "Warn when the mic hears nothing",
+        "description": "If a recording is silent, skip it and tell you which microphone to check."
+      },
+      "silentMicAlert": {
+        "message": "Your last {{count}} recordings from {{mic}} were silent.",
+        "dismiss": "Dismiss"
       },
       "channel": {
         "title": "Canal d'entrada",
@@ -717,7 +730,18 @@
   },
   "overlay": {
     "transcribing": "S'està transcrivint...",
-    "processing": "S'està processant..."
+    "processing": "S'està processant...",
+    "notice": {
+      "heardNothing": "Heard nothing from {{mic}}",
+      "sentNoAudioWindows": "{{mic}} sent no audio - check Windows mic access",
+      "sentNoAudio": "{{mic}} sent no audio - check mic access and mute",
+      "useMic": "Use {{mic}}",
+      "micSettings": "Mic settings",
+      "switchedMic": "Switched to {{mic}}",
+      "switchFailed": "Couldn't switch to {{mic}}",
+      "warning": "Warning",
+      "info": "Info"
+    }
   },
   "secureInput": {
     "blockedWithCulprit_one": "{{name}} pot estar blocant 1 drecera",

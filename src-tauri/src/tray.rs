@@ -57,6 +57,11 @@ impl TrayIconState {
 struct MenuInputs {
     busy: bool,
     warning: bool,
+    /// Persistent dead-air alert: the microphone that keeps recording silence.
+    mic_silent: Option<String>,
+    /// Transient warning line appended to the tooltip when the overlay is off
+    /// (see `overlay_notice`).
+    notice_line: Option<String>,
     model_loaded: bool,
     selected_model: String,
     /// `(id, name)` of downloaded models, sorted by name.
@@ -75,6 +80,10 @@ struct TrayDesired {
 struct TrayInner {
     /// Intent set by [`set_tray_state`].
     icon_state: TrayIconState,
+    /// Intent set by [`set_mic_silent_alert`].
+    mic_silent: Option<String>,
+    /// Intent set by [`set_tray_notice`].
+    notice_line: Option<String>,
     /// Latest computed snapshot, waiting to be (or just) applied.
     desired: Option<TrayDesired>,
     /// Icon the native tray currently shows. Only updated when `set_icon`
@@ -102,6 +111,8 @@ impl TrayState {
     pub fn new() -> Self {
         Self(Mutex::new(TrayInner {
             icon_state: TrayIconState::Idle,
+            mic_silent: None,
+            notice_line: None,
             desired: None,
             applied_icon: None,
             applied_menu: None,
@@ -219,6 +230,18 @@ pub fn set_tray_state(app: &AppHandle, state: TrayIconState) {
     sync_tray_with(app, |inner| inner.icon_state = state);
 }
 
+/// Shows (Some(mic)) or clears (None) the persistent "microphone silent"
+/// alert: warning icon plus a menu item at the top that opens Sound settings.
+pub fn set_mic_silent_alert(app: &AppHandle, mic: Option<String>) {
+    sync_tray_with(app, |inner| inner.mic_silent = mic);
+}
+
+/// Sets (Some) or clears (None) a transient warning line in the tray tooltip.
+/// Used by `overlay_notice` when the overlay is turned off.
+pub fn set_tray_notice(app: &AppHandle, line: Option<String>) {
+    sync_tray_with(app, |inner| inner.notice_line = line);
+}
+
 /// Re-syncs the tray after something other than the recording state changed
 /// (theme, Secure Input warning). The recording state itself is preserved.
 pub fn refresh_tray_icon(app: &AppHandle) {
@@ -249,11 +272,16 @@ fn sync_tray_with(app: &AppHandle, update: impl FnOnce(&mut TrayInner)) {
 
     // Record intent and claim a sequence number in one critical section, so
     // sequence order == the order in which state changes were requested.
-    let (seq, icon_state) = {
+    let (seq, icon_state, mic_silent, notice_line) = {
         let mut inner = state.lock();
         update(&mut inner);
         inner.next_seq += 1;
-        (inner.next_seq, inner.icon_state)
+        (
+            inner.next_seq,
+            inner.icon_state,
+            inner.mic_silent.clone(),
+            inner.notice_line.clone(),
+        )
     };
 
     // Tray not built yet (early secure-input monitor callbacks). The intent
@@ -262,7 +290,7 @@ fn sync_tray_with(app: &AppHandle, update: impl FnOnce(&mut TrayInner)) {
         return;
     }
 
-    let desired = compute_desired(app, icon_state);
+    let desired = compute_desired(app, icon_state, mic_silent, notice_line);
 
     // Decode the icon off the main thread, once per path, outside the lock.
     let needs_icon = !state.lock().icons.contains_key(desired.icon_path);
@@ -309,7 +337,12 @@ fn sync_tray_with(app: &AppHandle, update: impl FnOnce(&mut TrayInner)) {
     }
 }
 
-fn compute_desired(app: &AppHandle, icon_state: TrayIconState) -> TrayDesired {
+fn compute_desired(
+    app: &AppHandle,
+    icon_state: TrayIconState,
+    mic_silent: Option<String>,
+    notice_line: Option<String>,
+) -> TrayDesired {
     let settings = settings::get_settings(app);
     let theme = get_current_theme(app);
     let warning = crate::secure_input::tray_warning_active(app);
@@ -325,10 +358,12 @@ fn compute_desired(app: &AppHandle, icon_state: TrayIconState) -> TrayDesired {
     downloaded_models.sort_by(|a, b| a.1.cmp(&b.1));
 
     TrayDesired {
-        icon_path: get_icon_path(theme, icon_state, warning),
+        icon_path: get_icon_path(theme, icon_state, warning || mic_silent.is_some()),
         menu: MenuInputs {
             busy: icon_state.is_busy(),
             warning,
+            mic_silent,
+            notice_line,
             model_loaded,
             selected_model: settings.selected_model,
             downloaded_models,
@@ -479,6 +514,24 @@ fn build_menu(app: &AppHandle, inputs: &MenuInputs) -> tauri::Result<(Menu<tauri
         None
     };
 
+    let mic_silent_warning = match &inputs.mic_silent {
+        Some(mic) => {
+            let template = if strings.mic_silent.is_empty() {
+                get_tray_translations(Some("en".to_string())).mic_silent
+            } else {
+                strings.mic_silent.clone()
+            };
+            Some(MenuItem::with_id(
+                app,
+                "mic_silent_warning",
+                template.replace("{{mic}}", mic),
+                true,
+                None::<&str>,
+            )?)
+        }
+        None => None,
+    };
+
     // Platform-specific accelerators
     #[cfg(target_os = "macos")]
     let (settings_accelerator, quit_accelerator) = (Some("Cmd+,"), Some("Cmd+Q"));
@@ -585,10 +638,18 @@ fn build_menu(app: &AppHandle, inputs: &MenuInputs) -> tauri::Result<(Menu<tauri
     // Both layouts start with [version, separator, ...]; slot the warning in
     // right below the version line so it's the first actionable thing seen.
     let mut tooltip = version_label;
-    if let Some(warning_item) = secure_input_warning {
-        menu.insert(&warning_item, 2)?;
-        menu.insert(&separator()?, 3)?;
+    let mut warning_slot = 2;
+    for warning_item in [secure_input_warning, mic_silent_warning]
+        .into_iter()
+        .flatten()
+    {
+        menu.insert(&warning_item, warning_slot)?;
+        menu.insert(&separator()?, warning_slot + 1)?;
+        warning_slot += 2;
         tooltip = format!("{} — {}", tooltip, warning_item.text().unwrap_or_default());
+    }
+    if let Some(line) = &inputs.notice_line {
+        tooltip = format!("{tooltip} — {line}");
     }
 
     Ok((menu, tooltip))
@@ -689,6 +750,8 @@ mod tests {
         MenuInputs {
             busy,
             warning: false,
+            mic_silent: None,
+            notice_line: None,
             model_loaded: true,
             selected_model: "small".to_string(),
             downloaded_models: vec![("small".to_string(), "Small".to_string())],

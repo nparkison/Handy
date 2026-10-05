@@ -1,7 +1,7 @@
 use crate::input;
 use crate::settings;
 use crate::settings::{OverlayPosition, OverlayStyle};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize};
 
@@ -53,12 +53,38 @@ const OVERLAY_HEIGHT: f64 = 50.0;
 const OVERLAY_STREAM_WIDTH: f64 = 400.0;
 const OVERLAY_STREAM_HEIGHT: f64 = 120.0;
 
+// Notice card (see overlay_notice.rs): up to --ov-notice-w (420) wide and two
+// short text lines plus padding tall; a little slack on both axes.
+const OVERLAY_NOTICE_WIDTH: f64 = 432.0;
+const OVERLAY_NOTICE_HEIGHT: f64 = 84.0;
+
 /// Overlay window size (logical) for a given UI state.
 fn overlay_dimensions(state: &str) -> (f64, f64) {
-    if state == "streaming" {
-        (OVERLAY_STREAM_WIDTH, OVERLAY_STREAM_HEIGHT)
-    } else {
-        (OVERLAY_WIDTH, OVERLAY_HEIGHT)
+    match state {
+        "streaming" => (OVERLAY_STREAM_WIDTH, OVERLAY_STREAM_HEIGHT),
+        "notice" => (OVERLAY_NOTICE_WIDTH, OVERLAY_NOTICE_HEIGHT),
+        _ => (OVERLAY_WIDTH, OVERLAY_HEIGHT),
+    }
+}
+
+/// Window layout of the most recently shown overlay state, so repositioning
+/// (Windows) can keep its size: 0 compact, 1 streaming, 2 notice.
+static OVERLAY_LAYOUT: AtomicU8 = AtomicU8::new(0);
+
+fn layout_code(state: &str) -> u8 {
+    match state {
+        "streaming" => 1,
+        "notice" => 2,
+        _ => 0,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn layout_state(code: u8) -> &'static str {
+    match code {
+        1 => "streaming",
+        2 => "notice",
+        _ => "recording",
     }
 }
 
@@ -286,9 +312,6 @@ fn current_overlay_logical_size(window: &tauri::webview::WebviewWindow) -> Optio
     Some((size.width as f64 / scale, size.height as f64 / scale))
 }
 
-#[cfg(target_os = "windows")]
-static WINDOWS_OVERLAY_IS_STREAMING: AtomicBool = AtomicBool::new(false);
-
 /// Windows accessibility text size (Settings > Accessibility > Text size), a
 /// separate axis from display scaling that WebView2 applies as a document zoom.
 #[cfg(target_os = "windows")]
@@ -508,8 +531,35 @@ fn show_overlay_state(app_handle: &AppHandle, state: &str) {
 }
 
 fn show_overlay_state_on_main(app_handle: &AppHandle, state: &str) {
-    // Size the overlay for this state (compact vs. streaming), then position it.
+    // A dictation state always wins over a transient notice.
+    crate::overlay_notice::forget_active_notice();
+    if let Some(overlay_window) = present_overlay_window(app_handle, state) {
+        let _ = overlay_window.emit("show-overlay", state);
+    }
+}
+
+/// Shows a transient notice (see `overlay_notice`) in the overlay window,
+/// replacing whatever state it shows. Callers check `overlay_style` first.
+pub(crate) fn show_notice_overlay(
+    app_handle: &AppHandle,
+    payload: crate::overlay_notice::OverlayNoticePayload,
+) {
+    let handle = app_handle.clone();
+    let _ = app_handle.run_on_main_thread(move || {
+        if let Some(overlay_window) = present_overlay_window(&handle, "notice") {
+            let _ = overlay_window.emit("overlay-notice", payload);
+        }
+    });
+}
+
+/// Sizes, positions and shows the overlay window for `state`. Main thread only.
+fn present_overlay_window(
+    app_handle: &AppHandle,
+    state: &str,
+) -> Option<tauri::webview::WebviewWindow> {
+    // Size the overlay for this state (compact / streaming / notice), then position it.
     let (width, height) = overlay_dimensions(state);
+    OVERLAY_LAYOUT.store(layout_code(state), Ordering::Relaxed);
     if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
         // Invalidate any delayed hide still in flight from a previous session
         // (see `hide_recording_overlay`).
@@ -537,8 +587,6 @@ fn show_overlay_state_on_main(app_handle: &AppHandle, state: &str) {
             #[cfg(not(target_os = "windows"))]
             let _ =
                 overlay_window.set_size(tauri::Size::Logical(tauri::LogicalSize { width, height }));
-            #[cfg(target_os = "windows")]
-            WINDOWS_OVERLAY_IS_STREAMING.store(state == "streaming", Ordering::Relaxed);
             let size_elapsed = size_started.elapsed();
 
             let pos_started = std::time::Instant::now();
@@ -589,8 +637,9 @@ fn show_overlay_state_on_main(app_handle: &AppHandle, state: &str) {
             );
         }
 
-        let _ = overlay_window.emit("show-overlay", state);
+        return Some(overlay_window);
     }
+    None
 }
 
 /// Notify the visible recording overlay that the input stream has delivered its
@@ -652,12 +701,8 @@ fn update_overlay_position_on_main(app_handle: &AppHandle) {
 
         #[cfg(target_os = "windows")]
         {
-            let state = if WINDOWS_OVERLAY_IS_STREAMING.load(Ordering::Relaxed) {
-                "streaming"
-            } else {
-                "recording"
-            };
-            let (width, height) = overlay_dimensions(state);
+            let (width, height) =
+                overlay_dimensions(layout_state(OVERLAY_LAYOUT.load(Ordering::Relaxed)));
             if let Err(error) = place_windows_overlay(app_handle, &overlay_window, width, height) {
                 log::error!("Failed to update recording overlay position: {error}");
             }

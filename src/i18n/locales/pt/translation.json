@@ -7,7 +7,12 @@
     "model": "Modelo",
     "quit": "Sair",
     "cancel": "Cancelar",
-    "secureInputWarning": "⚠ Atalhos bloqueados pelo Secure Input"
+    "secureInputWarning": "⚠ Atalhos bloqueados pelo Secure Input",
+    "micSilent": "⚠ Microphone silent - check {{mic}}",
+    "heardNothing": "Heard nothing from {{mic}}",
+    "sentNoAudio": "{{mic}} sent no audio - check mic access",
+    "micSilentNotificationTitle": "Microphone silent",
+    "micSilentNotificationBody": "Your last {{count}} recordings from {{mic}} were silent."
   },
   "sidebar": {
     "general": "Geral",
@@ -236,6 +241,14 @@
         "description": "Selecione seu dispositivo de microfone preferido",
         "placeholder": "Selecionar microfone...",
         "loading": "Carregando..."
+      },
+      "silentMicWarning": {
+        "label": "Warn when the mic hears nothing",
+        "description": "If a recording is silent, skip it and tell you which microphone to check."
+      },
+      "silentMicAlert": {
+        "message": "Your last {{count}} recordings from {{mic}} were silent.",
+        "dismiss": "Dismiss"
       },
       "channel": {
         "title": "Canal de entrada",
@@ -714,7 +727,18 @@
   },
   "overlay": {
     "transcribing": "Transcrevendo...",
-    "processing": "Processando..."
+    "processing": "Processando...",
+    "notice": {
+      "heardNothing": "Heard nothing from {{mic}}",
+      "sentNoAudioWindows": "{{mic}} sent no audio - check Windows mic access",
+      "sentNoAudio": "{{mic}} sent no audio - check mic access and mute",
+      "useMic": "Use {{mic}}",
+      "micSettings": "Mic settings",
+      "switchedMic": "Switched to {{mic}}",
+      "switchFailed": "Couldn't switch to {{mic}}",
+      "warning": "Warning",
+      "info": "Info"
+    }
   },
   "whatsNew": {
     "title": "Novidades no Handy v{{version}}"

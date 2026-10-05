@@ -1,7 +1,9 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::apple_intelligence;
 use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, SoundType};
-use crate::audio_toolkit::{is_microphone_access_denied, is_no_input_device_error, VadPolicy};
+use crate::audio_toolkit::{
+    classify_clip, is_microphone_access_denied, is_no_input_device_error, ClipVerdict, VadPolicy,
+};
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::history::HistoryManager;
 use crate::managers::model::ModelManager;
@@ -501,6 +503,7 @@ impl ShortcutAction for TranscribeAction {
     fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
         let start_time = Instant::now();
         debug!("TranscribeAction::start called for binding: {}", binding_id);
+        crate::overlay_notice::on_new_press(app);
 
         // Load model in the background
         let tm = app.state::<Arc<TranscriptionManager>>();
@@ -744,7 +747,8 @@ impl ShortcutAction for TranscribeAction {
             );
 
             let stop_recording_time = Instant::now();
-            if let Some(samples) = rm.stop_recording(&binding_id, cancel_generation) {
+            if let Some(stopped) = rm.stop_recording(&binding_id, cancel_generation) {
+                let samples = stopped.samples;
                 debug!(
                     "Recording stopped and samples retrieved in {:?}, sample count: {}",
                     stop_recording_time.elapsed(),
@@ -757,6 +761,38 @@ impl ShortcutAction for TranscribeAction {
                     utils::hide_recording_overlay(&ah);
                     set_tray_state(&ah, TrayIconState::Idle);
                     return;
+                }
+
+                // Dead-air guard: O(1) over stats the capture consumer already
+                // gathered, so the normal path pays nothing measurable.
+                let verdict = classify_clip(&stopped.stats, stopped.wall_ms);
+                debug!(
+                    "Clip verdict {:?}: {}ms captured, peak={:.5}, rms={:.5}, vad_active={}, speech_samples={}",
+                    verdict,
+                    stopped.stats.duration_ms(),
+                    stopped.stats.peak,
+                    stopped.stats.rms(),
+                    stopped.stats.vad_active,
+                    stopped.stats.speech_samples
+                );
+                if verdict.is_dead_air() && get_settings(&ah).silent_mic_warning {
+                    // Skip STT, cleanup, paste and History. Any live-preview
+                    // text is discarded with the stream; the notice replaces
+                    // the Live panel.
+                    tm.cancel_stream();
+                    set_tray_state(&ah, TrayIconState::Idle);
+                    crate::dead_air::on_silent_clip(&ah, verdict, stopped.device_name);
+                    return;
+                }
+                if verdict != ClipVerdict::TooShort {
+                    // VAD-less recordings can't prove speech; a non-dead clip
+                    // is the best evidence the mic works.
+                    let had_speech = stopped.stats.has_speech() || !stopped.stats.vad_active;
+                    crate::dead_air::on_usable_clip(
+                        &ah,
+                        stopped.device_name.as_deref(),
+                        had_speech && verdict == ClipVerdict::Usable,
+                    );
                 }
 
                 if samples.is_empty() {

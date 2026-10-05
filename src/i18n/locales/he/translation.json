@@ -7,7 +7,12 @@
     "model": "מודל",
     "quit": "יציאה",
     "cancel": "ביטול",
-    "secureInputWarning": "⚠ קיצורי המקשים חסומים על ידי Secure Input"
+    "secureInputWarning": "⚠ קיצורי המקשים חסומים על ידי Secure Input",
+    "micSilent": "⚠ Microphone silent - check {{mic}}",
+    "heardNothing": "Heard nothing from {{mic}}",
+    "sentNoAudio": "{{mic}} sent no audio - check mic access",
+    "micSilentNotificationTitle": "Microphone silent",
+    "micSilentNotificationBody": "Your last {{count}} recordings from {{mic}} were silent."
   },
   "sidebar": {
     "general": "כללי",
@@ -236,6 +241,14 @@
         "description": "בחר את המיקרופון המועדף עליך",
         "placeholder": "בחר מיקרופון...",
         "loading": "טוען..."
+      },
+      "silentMicWarning": {
+        "label": "Warn when the mic hears nothing",
+        "description": "If a recording is silent, skip it and tell you which microphone to check."
+      },
+      "silentMicAlert": {
+        "message": "Your last {{count}} recordings from {{mic}} were silent.",
+        "dismiss": "Dismiss"
       },
       "channel": {
         "title": "ערוץ קלט",
@@ -714,7 +727,18 @@
   },
   "overlay": {
     "transcribing": "מתמלל...",
-    "processing": "מעבד..."
+    "processing": "מעבד...",
+    "notice": {
+      "heardNothing": "Heard nothing from {{mic}}",
+      "sentNoAudioWindows": "{{mic}} sent no audio - check Windows mic access",
+      "sentNoAudio": "{{mic}} sent no audio - check mic access and mute",
+      "useMic": "Use {{mic}}",
+      "micSettings": "Mic settings",
+      "switchedMic": "Switched to {{mic}}",
+      "switchFailed": "Couldn't switch to {{mic}}",
+      "warning": "Warning",
+      "info": "Info"
+    }
   },
   "whatsNew": {
     "title": "חדש ב-Handy v{{version}}"

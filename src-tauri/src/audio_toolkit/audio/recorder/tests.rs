@@ -2,6 +2,7 @@ use super::{
     is_microphone_access_denied, is_no_input_device_error, run_consumer, AudioRecorder,
     CaptureProcessor, CaptureTransportState, ChunkDisposition, Cmd, VadConfig, VadPolicy,
 };
+use crate::audio_toolkit::audio::CaptureStats;
 use crate::audio_toolkit::vad::{VadFrame, VoiceActivityDetector};
 use rtrb::RingBuffer;
 use std::{
@@ -415,4 +416,74 @@ fn detects_coreaudio_config_error() {
 fn does_not_match_other_errors_for_no_device() {
     assert!(!is_no_input_device_error("permission denied"));
     assert!(!is_no_input_device_error("device not found"));
+}
+
+/// Detector that never hears speech, standing in for a dead or silent mic.
+struct NeverSpeechVad(usize);
+
+impl VoiceActivityDetector for NeverSpeechVad {
+    fn push_frame<'a>(&'a mut self, _frame: &'a [f32]) -> anyhow::Result<VadFrame<'a>> {
+        Ok(VadFrame::Noise)
+    }
+
+    fn frame_samples(&self) -> usize {
+        self.0
+    }
+}
+
+fn stats_after_capture(
+    detector: Box<dyn VoiceActivityDetector>,
+    policy: VadPolicy,
+    input: &[f32],
+) -> (Vec<f32>, CaptureStats) {
+    let frame_samples = detector.frame_samples();
+    let vad = VadConfig {
+        detector: Arc::new(Mutex::new(detector)),
+        frame_samples,
+        offline_hangover_frames: 0,
+        streaming_hangover_frames: 0,
+    };
+    let sink = Arc::new(Mutex::new(CaptureStats::default()));
+    let mut processor = CaptureProcessor::new(16_000, Some(vad), None, None, Instant::now())
+        .with_stats_sink(Arc::clone(&sink));
+    let (ready_tx, _ready_rx) = mpsc::channel();
+    processor.begin_recording(policy, ready_tx);
+    processor.process_raw_chunk(input, ChunkDisposition::Capture);
+    let samples = processor.finish_recording();
+    let stats = *sink.lock().unwrap();
+    (samples, stats)
+}
+
+#[test]
+fn capture_stats_see_audio_that_vad_drops() {
+    let input = vec![0.001f32; 16_000];
+    let (samples, stats) =
+        stats_after_capture(Box::new(NeverSpeechVad(480)), VadPolicy::Offline, &input);
+
+    // VAD dropped everything, but the stats still describe the input.
+    assert!(samples.is_empty());
+    assert!(stats.vad_active);
+    assert_eq!(stats.speech_samples, 0);
+    // The resampler pads the final partial frame on finish.
+    assert!((16_000..16_000 + 480).contains(&stats.total_samples));
+    assert!((stats.peak - 0.001).abs() < 1e-6);
+}
+
+#[test]
+fn capture_stats_count_speech_frames() {
+    let input = vec![0.2f32; 4_800];
+    let (samples, stats) =
+        stats_after_capture(Box::new(FixedFrameVad(480)), VadPolicy::Offline, &input);
+    assert_eq!(samples.len(), 4_800);
+    assert!(stats.has_speech());
+    assert_eq!(stats.speech_samples, stats.total_samples);
+}
+
+#[test]
+fn capture_stats_mark_vad_inactive_when_disabled() {
+    let input = vec![0.2f32; 4_800];
+    let (_, stats) = stats_after_capture(Box::new(FixedFrameVad(480)), VadPolicy::Disabled, &input);
+    assert!(!stats.vad_active);
+    assert!(!stats.has_speech());
+    assert_eq!(stats.total_samples, 4_800);
 }

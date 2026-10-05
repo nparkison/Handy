@@ -1,10 +1,12 @@
 // Re-export all audio components
+mod clip_stats;
 mod device;
 mod recorder;
 mod resampler;
 mod utils;
 mod visualizer;
 
+pub use clip_stats::{classify_clip, CaptureStats, ClipVerdict};
 pub use device::{list_input_devices, list_output_devices, CpalDeviceInfo};
 pub use recorder::{
     is_microphone_access_denied, is_no_input_device_error, AudioRecorder, VadPolicy,

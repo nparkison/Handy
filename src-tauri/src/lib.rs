@@ -9,12 +9,14 @@ mod chinese_script;
 pub mod cli;
 mod clipboard;
 mod commands;
+mod dead_air;
 mod helpers;
 mod input;
 mod llm_client;
 mod managers;
 mod memory;
 mod overlay;
+mod overlay_notice;
 mod paste_tx;
 pub mod portable;
 mod screen_context;
@@ -96,7 +98,7 @@ fn build_console_filter() -> env_filter::Filter {
     builder.build()
 }
 
-fn show_main_window(app: &AppHandle) {
+pub(crate) fn show_main_window(app: &AppHandle) {
     if let Some(main_window) = app.get_webview_window("main") {
         if let Err(e) = main_window.unminimize() {
             log::error!("Failed to unminimize webview window: {}", e);
@@ -293,6 +295,9 @@ fn initialize_core_logic(app_handle: &AppHandle) {
             "secure_input_warning" => {
                 // Full explanation lives in the settings-window banner
                 show_main_window(app);
+            }
+            "mic_silent_warning" => {
+                dead_air::open_sound_settings(app);
             }
             "check_updates" => {
                 let settings = settings::get_settings(app);
@@ -693,6 +698,7 @@ pub fn run(cli_args: CliArgs) {
             shortcut::suspend_all_bindings,
             shortcut::resume_all_bindings,
             shortcut::change_mute_while_recording_setting,
+            shortcut::change_silent_mic_warning_setting,
             shortcut::change_append_trailing_space_setting,
             shortcut::change_lazy_stream_close_setting,
             shortcut::change_vad_enabled_setting,
@@ -716,6 +722,10 @@ pub fn run(cli_args: CliArgs) {
             secure_input::run_keyboard_diagnostic,
             trigger_update_check,
             show_main_window_command,
+            overlay_notice::dismiss_overlay_notice,
+            overlay_notice::run_overlay_notice_action,
+            dead_air::get_silent_mic_alert,
+            dead_air::dismiss_silent_mic_alert,
             commands::cancel_operation,
             commands::is_portable,
             commands::is_update_checks_locked,
@@ -877,6 +887,7 @@ pub fn run(cli_args: CliArgs) {
     #[allow(unused_mut)]
     let mut app = builder
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_os::init())
