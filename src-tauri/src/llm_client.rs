@@ -131,6 +131,29 @@ fn remember_rejection(key: String) {
     }
 }
 
+/// Endpoints (base_url|model) that rejected an image request with a 4xx
+/// while it carried no other optional fields: the model cannot read images.
+/// Remembered for the process lifetime so later dictations skip the doomed
+/// upload and go straight to the text request.
+fn image_rejections() -> &'static Mutex<HashSet<String>> {
+    static REJECTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    REJECTED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Has this provider + model already rejected an image request?
+pub fn rejects_images(provider: &PostProcessProvider, model: &str) -> bool {
+    image_rejections()
+        .lock()
+        .map(|set| set.contains(&endpoint_key(provider, model)))
+        .unwrap_or(false)
+}
+
+fn remember_image_rejection(key: String) {
+    if let Ok(mut set) = image_rejections().lock() {
+        set.insert(key);
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ChatCompletionRequest {
     model: String,
@@ -429,6 +452,7 @@ pub async fn send_chat_completion_with_schema(
         messages,
         response_format,
         disable_reasoning,
+        false,
     )
     .await
 }
@@ -437,7 +461,9 @@ pub async fn send_chat_completion_with_schema(
 /// message made of an image (base64-encoded, of type `image_mime`) and text.
 ///
 /// Uses the same request path as `send_chat_completion_with_schema`
-/// (`stream: false`, reasoning-disable fields with retry-on-rejection).
+/// (`stream: false`, reasoning-disable fields), but never retries: a 4xx
+/// without optional fields marks the model as text-only (see
+/// [`rejects_images`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn send_chat_completion_with_image(
     provider: &PostProcessProvider,
@@ -449,8 +475,20 @@ pub async fn send_chat_completion_with_image(
     image_base64: &str,
     disable_reasoning: bool,
 ) -> Result<Option<String>, String> {
+    if rejects_images(provider, model) {
+        return Err("This model does not accept images".to_string());
+    }
     let messages = build_image_messages(system_prompt, user_text, image_mime, image_base64);
-    send_chat_request(provider, &api_key, model, messages, None, disable_reasoning).await
+    send_chat_request(
+        provider,
+        &api_key,
+        model,
+        messages,
+        None,
+        disable_reasoning,
+        true,
+    )
+    .await
 }
 
 fn build_image_messages(
@@ -490,6 +528,7 @@ async fn send_chat_request(
     messages: Vec<ChatMessage>,
     response_format: Option<ResponseFormat>,
     disable_reasoning: bool,
+    has_image: bool,
 ) -> Result<Option<String>, String> {
     let base_url = provider.base_url.trim_end_matches('/');
     let url = format!("{}/chat/completions", base_url);
@@ -531,10 +570,27 @@ async fn send_chat_request(
     );
 
     // A 400/422 on a request carrying reasoning-disable fields is almost always
-    // the endpoint rejecting those fields — retry once without them.
+    // the endpoint rejecting those fields — retry once without them. Never for
+    // an image request: the image is the likelier culprit, re-uploading it
+    // would double the wait, and the text fallback learns the reasoning
+    // rejection on its own.
+    if !status.is_success()
+        && matches!(status.as_u16(), 400 | 422)
+        && has_image
+        && request_body.reasoning.is_empty()
+    {
+        info!(
+            "'{}' (model '{}') rejected an image request (status {}); sending text only from now on",
+            sanitized_url_for_log(base_url),
+            model,
+            status
+        );
+        remember_image_rejection(key.clone());
+    }
     if !status.is_success()
         && matches!(status.as_u16(), 400 | 422)
         && !request_body.reasoning.is_empty()
+        && !has_image
     {
         let error_text = response.text().await.unwrap_or_else(|e| {
             report_reqwest_error("Failed to read reasoning rejection response", &e)

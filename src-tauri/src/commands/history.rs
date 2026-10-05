@@ -131,15 +131,7 @@ pub async fn retry_history_entry_transcription(
     // the time): it re-selects the app rule's prompt. No screenshot is retaken.
     let app_info = entry
         .context
-        .filter(|ctx| ctx.app.is_some() || ctx.title.is_some())
-        .map(|ctx| {
-            let app_name = ctx.app.unwrap_or_default();
-            AppInfo {
-                process_name: app_name.clone(),
-                app_name,
-                window_title: ctx.title,
-            }
-        });
+        .and_then(|ctx| AppInfo::from_history(ctx.app, ctx.title));
     let processed =
         process_transcription_output(&app, &transcription, post_process, app_info).await;
     history_manager
@@ -148,6 +140,9 @@ pub async fn retry_history_entry_transcription(
             transcription,
             processed.post_processed_text,
             processed.post_process_prompt,
+            // Only an attempted request counts: a skipped cleanup (nothing
+            // configured) must not read as "Cleanup failed".
+            processed.cleanup_attempted,
             processed.context,
         )
         .map(|_| ())
