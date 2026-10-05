@@ -3,8 +3,15 @@ import { useTranslation } from "react-i18next";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { arch, platform } from "@tauri-apps/plugin-os";
 import { ProgressBar } from "../shared";
 import { useSettings } from "../../hooks/useSettings";
+import { commands } from "../../bindings";
+import {
+  resolvePortableInstallerUrl,
+  PORTABLE_RELEASES_URL,
+} from "./portableInstaller";
 
 interface UpdateCheckerProps {
   className?: string;
@@ -18,10 +25,22 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
   const [isInstalling, setIsInstalling] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [showUpToDate, setShowUpToDate] = useState(false);
+  const [showPortableUpdateDialog, setShowPortableUpdateDialog] =
+    useState(false);
+  const [portableInstallerUrl, setPortableInstallerUrl] = useState<string>(
+    PORTABLE_RELEASES_URL,
+  );
 
-  const { settings, isLoading } = useSettings();
-  const settingsLoaded = !isLoading && settings !== null;
-  const updateChecksEnabled = settings?.update_checks_enabled ?? false;
+  const { settings, isLoading, updateChecksLocked } = useSettings();
+  // Wait for the lock state too (null = not loaded yet), otherwise the first
+  // render could fire an update check before HANDY_DISABLE_UPDATER is known.
+  const settingsLoaded =
+    !isLoading && settings !== null && updateChecksLocked !== null;
+  // Forced-off by system configuration (HANDY_DISABLE_UPDATER) overrides the
+  // stored preference without persisting it, mirroring the backend's effective
+  // updater state.
+  const updateChecksEnabled =
+    (settings?.update_checks_enabled ?? false) && updateChecksLocked === false;
 
   const upToDateTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
   const isManualCheckRef = useRef(false);
@@ -68,6 +87,11 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
       if (update) {
         setUpdateAvailable(true);
         setShowUpToDate(false);
+        // Portable installs can't self-update in place — the manual dialog links
+        // straight at the matching installer from this manifest instead.
+        setPortableInstallerUrl(
+          resolvePortableInstallerUrl(update.rawJson, platform(), arch()),
+        );
       } else {
         setUpdateAvailable(false);
 
@@ -97,6 +121,13 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
 
   const installUpdate = async () => {
     if (!updateChecksEnabled) return;
+
+    const portable = await commands.isPortable();
+    if (portable) {
+      setShowPortableUpdateDialog(true);
+      return;
+    }
+
     try {
       setIsInstalling(true);
       setDownloadProgress(0);
@@ -171,38 +202,77 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
   const isUpdateClickable =
     !isUpdateDisabled && (updateAvailable || (!isChecking && !showUpToDate));
 
-  return (
-    <div className={`flex items-center gap-3 ${className}`}>
-      {isUpdateClickable ? (
-        <button
-          onClick={getUpdateStatusAction()}
-          disabled={isUpdateDisabled}
-          className={`transition-colors disabled:opacity-50 tabular-nums ${
-            updateAvailable
-              ? "text-logo-primary hover:text-logo-primary/80 font-medium"
-              : "text-text/60 hover:text-text/80"
-          }`}
-        >
-          {getUpdateStatusText()}
-        </button>
-      ) : (
-        <span className="text-text/60 tabular-nums">
-          {getUpdateStatusText()}
-        </span>
-      )}
+  // When no installer could be resolved for this target the button falls back to
+  // the releases index, so the dialog has to say "browse" rather than "download".
+  const hasDirectInstaller = portableInstallerUrl !== PORTABLE_RELEASES_URL;
 
-      {isInstalling && downloadProgress > 0 && downloadProgress < 100 && (
-        <ProgressBar
-          progress={[
-            {
-              id: "update",
-              percentage: downloadProgress,
-            },
-          ]}
-          size="large"
-        />
+  return (
+    <>
+      {showPortableUpdateDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="bg-background border border-mid-gray/20 rounded-lg p-6 max-w-md w-full mx-4 space-y-4">
+            <h2 className="text-base font-semibold">
+              {t("footer.portableUpdateTitle")}
+            </h2>
+            <p className="text-sm text-text/70">
+              {hasDirectInstaller
+                ? t("footer.portableUpdateMessage")
+                : t("footer.portableUpdateBrowseMessage")}
+            </p>
+            <div className="flex gap-2 justify-end">
+              <button
+                className="px-3 py-1.5 text-sm rounded border border-mid-gray/20 hover:bg-mid-gray/10 transition-colors"
+                onClick={() => setShowPortableUpdateDialog(false)}
+              >
+                {t("common.close")}
+              </button>
+              <button
+                className="px-3 py-1.5 text-sm rounded bg-logo-primary text-white hover:bg-logo-primary/80 transition-colors"
+                onClick={() => {
+                  openUrl(portableInstallerUrl);
+                  setShowPortableUpdateDialog(false);
+                }}
+              >
+                {hasDirectInstaller
+                  ? t("footer.portableUpdateButton")
+                  : t("footer.portableUpdateBrowseButton")}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
-    </div>
+      <div className={`flex items-center gap-3 ${className}`}>
+        {isUpdateClickable ? (
+          <button
+            onClick={getUpdateStatusAction()}
+            disabled={isUpdateDisabled}
+            className={`transition-colors disabled:opacity-50 tabular-nums ${
+              updateAvailable
+                ? "text-logo-primary hover:text-logo-primary/80 font-medium"
+                : "text-text/60 hover:text-text/80"
+            }`}
+          >
+            {getUpdateStatusText()}
+          </button>
+        ) : (
+          <span className="text-text/60 tabular-nums">
+            {getUpdateStatusText()}
+          </span>
+        )}
+
+        {isInstalling && downloadProgress > 0 && downloadProgress < 100 && (
+          <ProgressBar
+            progress={[
+              {
+                id: "update",
+                percentage: downloadProgress,
+              },
+            ]}
+            size="large"
+          />
+        )}
+      </div>
+    </>
   );
 };
 
