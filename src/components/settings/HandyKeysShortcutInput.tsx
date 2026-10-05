@@ -16,6 +16,7 @@ interface HandyKeysShortcutInputProps {
   grouped?: boolean;
   shortcutId: string;
   disabled?: boolean;
+  descriptionOverride?: string;
 }
 
 interface HandyKeysEvent {
@@ -30,6 +31,7 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
   grouped = false,
   shortcutId,
   disabled = false,
+  descriptionOverride,
 }) => {
   const { t } = useTranslation();
   const { getSetting, updateBinding, resetBinding, isUpdating, isLoading } =
@@ -309,10 +311,16 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
     `settings.general.shortcut.bindings.${shortcutId}.name`,
     binding.name,
   );
-  const translatedDescription = t(
-    `settings.general.shortcut.bindings.${shortcutId}.description`,
-    binding.description,
-  );
+  const translatedDescription =
+    descriptionOverride ??
+    t(
+      `settings.general.shortcut.bindings.${shortcutId}.description`,
+      binding.description,
+    );
+  // Optional shortcuts (paste_last, swap_last) default to unbound: "" means
+  // "not set", and resetting them clears the binding.
+  const isOptional = binding.default_binding === "";
+  const isUnbound = binding.current_binding === "";
 
   return (
     <SettingContainer
@@ -336,12 +344,23 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
             className="px-2 py-1 text-sm font-semibold bg-mid-gray/10 border border-mid-gray/80 hover:bg-logo-primary/10 rounded-md cursor-pointer hover:border-logo-primary"
             onClick={startRecording}
           >
-            {formatKeyCombination(binding.current_binding, osType)}
+            {isUnbound ? (
+              <span className="font-normal text-mid-gray">
+                {t("settings.general.shortcut.notSet")}
+              </span>
+            ) : (
+              formatKeyCombination(binding.current_binding, osType)
+            )}
           </div>
         )}
         <ResetButton
           onClick={() => resetBinding(shortcutId)}
-          disabled={isUpdating(`binding_${shortcutId}`)}
+          disabled={
+            isUpdating(`binding_${shortcutId}`) || (isOptional && isUnbound)
+          }
+          ariaLabel={
+            isOptional ? t("settings.general.shortcut.clear") : undefined
+          }
         />
       </div>
     </SettingContainer>

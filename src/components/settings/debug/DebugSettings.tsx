@@ -5,6 +5,7 @@ import { LogLevelSelector } from "./LogLevelSelector";
 import { LiveLogViewer } from "./LiveLogViewer";
 import { PasteDelay } from "./PasteDelay";
 import { HoldThreshold } from "./HoldThreshold";
+import { DoubleTapWindow, TapMaxDuration } from "./TapThresholds";
 import { ReliablePasteToggle } from "./ReliablePaste";
 import { RecordingBuffer } from "./RecordingBuffer";
 import { PrePressBuffer } from "./PrePressBuffer";
@@ -60,6 +61,8 @@ export const DebugSettings: React.FC<DebugSettingsProps> = ({
         />
         <ReliablePasteToggle descriptionMode="tooltip" grouped={true} />
         <HoldThreshold descriptionMode="tooltip" grouped={true} />
+        <TapMaxDuration descriptionMode="tooltip" grouped={true} />
+        <DoubleTapWindow descriptionMode="tooltip" grouped={true} />
         <PrePressBuffer descriptionMode="tooltip" grouped={true} />
         <RecordingBuffer descriptionMode="tooltip" grouped={true} />
         <AlwaysOnMicrophone descriptionMode="tooltip" grouped={true} />

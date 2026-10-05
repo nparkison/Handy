@@ -441,6 +441,8 @@ const Highlighted: React.FC<{ text: string; query: string }> = ({
 
 const STATUS_LABEL_KEYS: Record<EntryStatus, string> = {
   cleanedUp: "settings.history.status.cleanedUp",
+  cleanedUpLate: "settings.history.status.cleanedUpLate",
+  cleaningUp: "settings.history.status.cleaningUp",
   original: "settings.history.status.original",
   cleanupFailed: "settings.history.status.cleanupFailed",
 };
@@ -450,7 +452,7 @@ const StatusBadge: React.FC<{ status: EntryStatus }> = ({ status }) => {
   const tone =
     status === "cleanupFailed"
       ? "border-red-500/40 text-red-600 dark:text-red-400"
-      : status === "cleanedUp"
+      : status === "cleanedUp" || status === "cleanedUpLate"
         ? "border-logo-primary/40 text-text/80"
         : "border-mid-gray/40 text-text/60";
   return (

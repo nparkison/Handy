@@ -367,6 +367,46 @@ async changeSilentMicWarningSetting(enabled: boolean) : Promise<Result<null, str
     else return { status: "error", error: e  as any };
 }
 },
+async changePostProcessEveryDictationSetting(enabled: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_post_process_every_dictation_setting", { enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async changePostProcessTimeoutMsSetting(ms: number) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_post_process_timeout_ms_setting", { ms }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async changeTapGesturesEnabledSetting(enabled: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_tap_gestures_enabled_setting", { enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async changeTapMaxDurationMsSetting(ms: number) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_tap_max_duration_ms_setting", { ms }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async changeDoubleTapWindowMsSetting(ms: number) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_double_tap_window_ms_setting", { ms }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async changeAppendTrailingSpaceSetting(enabled: boolean) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("change_append_trailing_space_setting", { enabled }) };
@@ -1080,7 +1120,31 @@ selected_channel?: number | null; clamshell_microphone?: string | null; selected
 /**
  * Dead-air guard: skip silent recordings and say which mic to check.
  */
-silent_mic_warning?: boolean; append_trailing_space?: boolean; app_language?: string; theme?: Theme; experimental_enabled?: boolean; lazy_stream_close?: boolean; keyboard_implementation?: KeyboardImplementation; show_tray_icon?: boolean; 
+silent_mic_warning?: boolean; 
+/**
+ * Run AI cleanup on every dictation made with the main `transcribe`
+ * binding (the post-process binding keeps working as before).
+ */
+post_process_every_dictation?: boolean; 
+/**
+ * Cleanup deadline in ms, measured from when the LLM request is sent.
+ * On a miss the original text is pasted and the cleaned-up version is
+ * saved to History when it arrives. 0 = no limit (always wait).
+ */
+post_process_timeout_ms?: number; 
+/**
+ * Tap / double-tap on the main binding pastes / swaps the last dictation.
+ * Only active with push-to-talk (Hold) activation.
+ */
+tap_gestures_enabled?: boolean; 
+/**
+ * A press shorter than this with no speech is a tap.
+ */
+tap_max_duration_ms?: number; 
+/**
+ * A second tap must start this soon after the first tap's release.
+ */
+double_tap_window_ms?: number; append_trailing_space?: boolean; app_language?: string; theme?: Theme; experimental_enabled?: boolean; lazy_stream_close?: boolean; keyboard_implementation?: KeyboardImplementation; show_tray_icon?: boolean; 
 /**
  * Lists the last few dictations in a tray submenu. Users who share their
  * screen can turn it off so dictated text is not exposed.
@@ -1132,6 +1196,19 @@ export type ChineseScript =
  * Keep whatever script the model produced.
  */
 "as_transcribed" | "simplified" | "traditional"
+/**
+ * Where a deadline-missed cleanup stands. `None` on an entry means cleanup
+ * either finished in time, failed, or never ran (see `post_process_requested`).
+ */
+export type CleanupState = 
+/**
+ * Missed the deadline; the original was pasted and the request is still running.
+ */
+"pending" | 
+/**
+ * The cleaned-up text arrived after the deadline and was saved here.
+ */
+"late"
 export type ClipboardHandling = "dont_modify" | "copy_to_clipboard"
 export type CustomSounds = { start: boolean; stop: boolean }
 export type EngineType = 
@@ -1142,7 +1219,7 @@ export type EngineType =
  */
 "TranscribeCpp" | "Parakeet" | "Moonshine" | "MoonshineStreaming" | "SenseVoice" | "GigaAM" | "Canary" | "Cohere"
 export type GpuDeviceOption = { id: string; name: string; total_vram_mb: number }
-export type HistoryEntry = { id: number; file_name: string; timestamp: number; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; post_process_requested: boolean }
+export type HistoryEntry = { id: number; file_name: string; timestamp: number; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; post_process_requested: boolean; cleanup_state: CleanupState | null }
 export type HistoryUpdatePayload = { action: "added"; entry: HistoryEntry } | { action: "updated"; entry: HistoryEntry } | { action: "deleted"; id: number } | { action: "toggled"; id: number }
 /**
  * Result of changing keyboard implementation

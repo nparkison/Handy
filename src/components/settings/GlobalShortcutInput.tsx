@@ -17,6 +17,7 @@ interface GlobalShortcutInputProps {
   grouped?: boolean;
   shortcutId: string;
   disabled?: boolean;
+  descriptionOverride?: string;
 }
 
 export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
@@ -24,6 +25,7 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
   grouped = false,
   shortcutId,
   disabled = false,
+  descriptionOverride,
 }) => {
   const { t } = useTranslation();
   const { getSetting, updateBinding, resetBinding, isUpdating, isLoading } =
@@ -34,6 +36,9 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
     null,
   );
   const [originalBinding, setOriginalBinding] = useState<string>("");
+  // Set when a non-primary mouse button is pressed while recording: the
+  // Tauri implementation can only bind keyboard keys.
+  const [showMouseHint, setShowMouseHint] = useState(false);
   const shortcutRefs = useRef<Map<string, HTMLDivElement | null>>(new Map());
   const osType = useOsType();
 
@@ -159,15 +164,22 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
       }
     };
 
+    const handleMouseDown = (e: MouseEvent) => {
+      if (cleanup) return;
+      if (e.button !== 0) setShowMouseHint(true);
+    };
+
     window.addEventListener("keydown", handleKeyDown);
     window.addEventListener("keyup", handleKeyUp);
     window.addEventListener("click", handleClickOutside);
+    window.addEventListener("mousedown", handleMouseDown);
 
     return () => {
       cleanup = true;
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
       window.removeEventListener("click", handleClickOutside);
+      window.removeEventListener("mousedown", handleMouseDown);
     };
   }, [
     keyPressed,
@@ -189,6 +201,7 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
 
     // Store the original binding to restore if canceled
     setOriginalBinding(bindings[id]?.current_binding || "");
+    setShowMouseHint(false);
     setEditingShortcutId(id);
     setKeyPressed([]);
     setRecordedKeys([]);
@@ -261,10 +274,16 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
     `settings.general.shortcut.bindings.${shortcutId}.name`,
     binding.name,
   );
-  const translatedDescription = t(
-    `settings.general.shortcut.bindings.${shortcutId}.description`,
-    binding.description,
-  );
+  const translatedDescription =
+    descriptionOverride ??
+    t(
+      `settings.general.shortcut.bindings.${shortcutId}.description`,
+      binding.description,
+    );
+  // Optional shortcuts (paste_last, swap_last) default to unbound: "" means
+  // "not set", and resetting them clears the binding.
+  const isOptional = binding.default_binding === "";
+  const isUnbound = binding.current_binding === "";
 
   return (
     <SettingContainer
@@ -275,26 +294,44 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
       disabled={disabled}
       layout="horizontal"
     >
-      <div className="flex items-center space-x-1">
-        {editingShortcutId === shortcutId ? (
-          <div
-            ref={(ref) => setShortcutRef(shortcutId, ref)}
-            className="px-2 py-1 text-sm font-semibold border border-logo-primary bg-logo-primary/30 rounded-md"
-          >
-            {formatCurrentKeys()}
-          </div>
-        ) : (
-          <div
-            className="px-2 py-1 text-sm font-semibold bg-mid-gray/10 border border-mid-gray/80 hover:bg-logo-primary/10 rounded-md cursor-pointer hover:border-logo-primary"
-            onClick={() => startRecording(shortcutId)}
-          >
-            {formatKeyCombination(binding.current_binding, osType)}
-          </div>
+      <div className="flex flex-col items-end gap-1">
+        <div className="flex items-center space-x-1">
+          {editingShortcutId === shortcutId ? (
+            <div
+              ref={(ref) => setShortcutRef(shortcutId, ref)}
+              className="px-2 py-1 text-sm font-semibold border border-logo-primary bg-logo-primary/30 rounded-md"
+            >
+              {formatCurrentKeys()}
+            </div>
+          ) : (
+            <div
+              className="px-2 py-1 text-sm font-semibold bg-mid-gray/10 border border-mid-gray/80 hover:bg-logo-primary/10 rounded-md cursor-pointer hover:border-logo-primary"
+              onClick={() => startRecording(shortcutId)}
+            >
+              {isUnbound ? (
+                <span className="font-normal text-mid-gray">
+                  {t("settings.general.shortcut.notSet")}
+                </span>
+              ) : (
+                formatKeyCombination(binding.current_binding, osType)
+              )}
+            </div>
+          )}
+          <ResetButton
+            onClick={() => resetBinding(shortcutId)}
+            disabled={
+              isUpdating(`binding_${shortcutId}`) || (isOptional && isUnbound)
+            }
+            ariaLabel={
+              isOptional ? t("settings.general.shortcut.clear") : undefined
+            }
+          />
+        </div>
+        {showMouseHint && (
+          <p className="text-xs text-mid-gray" role="status">
+            {t("settings.general.shortcut.mouseNeedsHandyKeys")}
+          </p>
         )}
-        <ResetButton
-          onClick={() => resetBinding(shortcutId)}
-          disabled={isUpdating(`binding_${shortcutId}`)}
-        />
       </div>
     </SettingContainer>
   );

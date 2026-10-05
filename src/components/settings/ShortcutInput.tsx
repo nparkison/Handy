@@ -8,6 +8,8 @@ interface ShortcutInputProps {
   grouped?: boolean;
   shortcutId: string;
   disabled?: boolean;
+  /** Replaces the binding's translated description (e.g. context-dependent copy). */
+  descriptionOverride?: string;
 }
 
 /**

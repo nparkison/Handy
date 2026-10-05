@@ -3,10 +3,18 @@ import type { HistoryEntry } from "@/bindings";
 /**
  * Cleanup state shown as a badge on a history entry.
  * - cleanedUp: post-processing produced polished text
+ * - cleanedUpLate: polished text arrived after the cleanup time limit
+ *   (the original was pasted)
+ * - cleaningUp: the cleanup missed its time limit and is still running
  * - cleanupFailed: post-processing was requested but produced nothing
  * - original: no post-processing ran
  */
-export type EntryStatus = "cleanedUp" | "original" | "cleanupFailed";
+export type EntryStatus =
+  | "cleanedUp"
+  | "cleanedUpLate"
+  | "cleaningUp"
+  | "original"
+  | "cleanupFailed";
 
 export interface EntryTexts {
   /** What the entry is used as: polished text when present, else the raw text. */
@@ -22,7 +30,8 @@ export interface EntryTexts {
 type EntryTextFields = Pick<
   HistoryEntry,
   "transcription_text" | "post_processed_text" | "post_process_requested"
->;
+> &
+  Partial<Pick<HistoryEntry, "cleanup_state">>;
 
 export const getEntryTexts = (entry: EntryTextFields): EntryTexts => {
   const originalText = entry.transcription_text;
@@ -34,8 +43,11 @@ export const getEntryTexts = (entry: EntryTextFields): EntryTexts => {
   const hasTranscription = originalText.trim().length > 0;
 
   let status: EntryStatus | null = null;
-  if (polished !== null) {
-    status = "cleanedUp";
+  if (entry.cleanup_state === "pending" && hasTranscription) {
+    // A late cleanup is still running; this wins over "cleanup failed".
+    status = "cleaningUp";
+  } else if (polished !== null) {
+    status = entry.cleanup_state === "late" ? "cleanedUpLate" : "cleanedUp";
   } else if (hasTranscription) {
     status = entry.post_process_requested ? "cleanupFailed" : "original";
   }
