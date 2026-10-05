@@ -2,7 +2,6 @@ import React, { useEffect, useState } from "react";
 import { Trans, useTranslation } from "react-i18next";
 import { RefreshCcw } from "lucide-react";
 import { commands } from "@/bindings";
-import { ToggleSwitch } from "../../ui/ToggleSwitch";
 
 import { Alert } from "../../ui/Alert";
 import {
@@ -22,6 +21,7 @@ import { ModelSelect } from "../PostProcessingSettingsApi/ModelSelect";
 import { usePostProcessProviderState } from "../PostProcessingSettingsApi/usePostProcessProviderState";
 import { ShortcutInput } from "../ShortcutInput";
 import { CleanUpEveryDictation, CleanupTimeLimit } from "./CleanupSettings";
+import { AppRules, ShareAppInfo } from "./AppContextSettings";
 import { useSettings } from "../../../hooks/useSettings";
 
 const PostProcessingSettingsApiComponent: React.FC = () => {
@@ -428,12 +428,7 @@ PostProcessingSettingsPrompts.displayName = "PostProcessingSettingsPrompts";
 
 export const PostProcessingSettings: React.FC = () => {
   const { t } = useTranslation();
-  const { getSetting, updateSetting, isUpdating, settings } = useSettings();
-
-  const provider = settings?.post_process_providers?.find(
-    (p: { id: string }) => p.id === settings?.post_process_provider_id,
-  );
-  const supportsVision = provider?.supports_vision ?? false;
+  const { getSetting } = useSettings();
   const everyDictation = getSetting("post_process_every_dictation") ?? false;
 
   return (
@@ -457,29 +452,13 @@ export const PostProcessingSettings: React.FC = () => {
         <PostProcessingSettingsApi />
       </SettingsGroup>
 
-      <SettingsGroup title={t("settings.postProcessing.prompts.title")}>
-        <PostProcessingSettingsPrompts />
+      <SettingsGroup title={t("settings.postProcessing.context.title")}>
+        <ShareAppInfo />
+        <AppRules />
       </SettingsGroup>
 
-      <SettingsGroup title={t("settings.screenContext.title")}>
-        <ToggleSwitch
-          checked={
-            (getSetting("screen_context_enabled") || false) && supportsVision
-          }
-          onChange={(enabled) =>
-            updateSetting("screen_context_enabled", enabled)
-          }
-          isUpdating={isUpdating("screen_context_enabled")}
-          label={t("settings.screenContext.enabled")}
-          description={
-            !supportsVision
-              ? t("settings.screenContext.providerWarning")
-              : t("settings.screenContext.description")
-          }
-          descriptionMode="inline"
-          grouped={true}
-          disabled={!supportsVision}
-        />
+      <SettingsGroup title={t("settings.postProcessing.prompts.title")}>
+        <PostProcessingSettingsPrompts />
       </SettingsGroup>
     </div>
   );
