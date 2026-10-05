@@ -1109,6 +1109,21 @@ pub fn change_app_rules_setting(
             rule
         })
         .collect();
+    // A rule with a screenshot means the user found the new home of the old
+    // global screen-context toggle.
+    if settings.app_rules.iter().any(|rule| rule.screenshot) {
+        settings.show_screen_context_moved_note = false;
+    }
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+/// Hide the one-time "screenshots moved to app rules" note.
+#[tauri::command]
+#[specta::specta]
+pub fn dismiss_screen_context_moved_note(app: AppHandle) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.show_screen_context_moved_note = false;
     settings::write_settings(&app, settings);
     Ok(())
 }
@@ -1419,7 +1434,7 @@ pub fn change_tap_gestures_enabled_setting(app: AppHandle, enabled: bool) -> Res
 #[specta::specta]
 pub fn change_tap_max_duration_ms_setting(app: AppHandle, ms: u64) -> Result<(), String> {
     let mut settings = settings::get_settings(&app);
-    settings.tap_max_duration_ms = ms;
+    settings.tap_max_duration_ms = crate::cockpit::gestures::clamp_tap_max_ms(ms);
     settings::write_settings(&app, settings);
     Ok(())
 }
@@ -1428,7 +1443,7 @@ pub fn change_tap_max_duration_ms_setting(app: AppHandle, ms: u64) -> Result<(),
 #[specta::specta]
 pub fn change_double_tap_window_ms_setting(app: AppHandle, ms: u64) -> Result<(), String> {
     let mut settings = settings::get_settings(&app);
-    settings.double_tap_window_ms = ms;
+    settings.double_tap_window_ms = crate::cockpit::gestures::clamp_double_tap_ms(ms);
     settings::write_settings(&app, settings);
     Ok(())
 }

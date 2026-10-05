@@ -8,6 +8,7 @@ import { SettingContainer } from "../../ui/SettingContainer";
 import { Button } from "../../ui/Button";
 import { Input } from "../../ui/Input";
 import { useSettings } from "../../../hooks/useSettings";
+import { useSettingsStore } from "../../../stores/settingsStore";
 
 const DEFAULT_MODE: AppContextMode = "app_and_title";
 
@@ -67,7 +68,8 @@ interface RuleRowProps {
   index: number;
   count: number;
   promptOptions: { value: string; label: string }[];
-  supportsVision: boolean;
+  /** Why screenshots can't be used right now, if they can't. */
+  screenshotBlocked: "noVision" | "shareOff" | null;
   autoFocus: boolean;
   onChange: (patch: Partial<AppRule>) => void;
   onMove: (delta: -1 | 1) => void;
@@ -79,7 +81,7 @@ const RuleRow: React.FC<RuleRowProps> = ({
   index,
   count,
   promptOptions,
-  supportsVision,
+  screenshotBlocked,
   autoFocus,
   onChange,
   onMove,
@@ -114,6 +116,7 @@ const RuleRow: React.FC<RuleRowProps> = ({
     (option) => option.value === rule.prompt_id,
   );
   const screenshot = rule.screenshot ?? false;
+  const canScreenshot = screenshotBlocked === null;
   const ruleLabel = t("settings.postProcessing.context.rules.ruleLabel", {
     number: index + 1,
   });
@@ -226,14 +229,16 @@ const RuleRow: React.FC<RuleRowProps> = ({
         <label
           htmlFor={`${baseId}-screenshot`}
           className={`flex items-center gap-2 text-sm ${
-            supportsVision ? "cursor-pointer" : "text-text/50 cursor-default"
+            canScreenshot ? "cursor-pointer" : "text-text/50 cursor-default"
           }`}
         >
           <input
             id={`${baseId}-screenshot`}
             type="checkbox"
-            checked={screenshot}
-            disabled={!supportsVision}
+            // Shown unchecked while screenshots can't be taken, so the
+            // checkbox never claims something that won't happen.
+            checked={screenshot && canScreenshot}
+            disabled={!canScreenshot}
             aria-describedby={`${baseId}-screenshot-note`}
             onChange={(event) => onChange({ screenshot: event.target.checked })}
             className="accent-logo-primary"
@@ -241,11 +246,13 @@ const RuleRow: React.FC<RuleRowProps> = ({
           {t("settings.postProcessing.context.rules.screenshot")}
         </label>
         <p id={`${baseId}-screenshot-note`} className="text-xs text-text/60">
-          {!supportsVision
-            ? t("settings.postProcessing.context.rules.screenshotNoVision")
-            : screenshot
-              ? t("settings.postProcessing.context.rules.screenshotLatency")
-              : null}
+          {screenshotBlocked === "shareOff"
+            ? t("settings.postProcessing.context.rules.screenshotShareOff")
+            : screenshotBlocked === "noVision"
+              ? t("settings.postProcessing.context.rules.screenshotNoVision")
+              : screenshot
+                ? t("settings.postProcessing.context.rules.screenshotLatency")
+                : null}
         </p>
       </div>
     </li>
@@ -261,7 +268,16 @@ export const AppRules: React.FC = () => {
     (p) => p.id === settings?.post_process_provider_id,
   );
   const supportsVision = provider?.supports_vision ?? false;
+  const shareOff = (getSetting("app_context_mode") ?? DEFAULT_MODE) === "off";
+  const screenshotBlocked = shareOff
+    ? "shareOff"
+    : !supportsVision
+      ? "noVision"
+      : null;
+  const showMovedNote = getSetting("show_screen_context_moved_note") ?? false;
   const [picking, setPicking] = useState(false);
+  const [openingPicker, setOpeningPicker] = useState(false);
+  const lastAddRef = useRef(0);
   const [recentApps, setRecentApps] = useState<string[]>([]);
   const [focusRuleId, setFocusRuleId] = useState<string | null>(null);
 
@@ -273,8 +289,16 @@ export const AppRules: React.FC = () => {
     settings?.post_process_selected_prompt_id ?? prompts[0]?.id ?? "";
 
   const save = (next: AppRule[]) => updateSetting("app_rules", next);
+  // Always edit the newest list: a save or reload may have landed since
+  // this render (e.g. while the recent-apps lookup was awaited).
+  const latestRules = (): AppRule[] =>
+    useSettingsStore.getState().settings?.app_rules ?? [];
 
   const addRule = (pattern: string) => {
+    // A double click must not add the rule twice.
+    const now = Date.now();
+    if (now - lastAddRef.current < 400) return;
+    lastAddRef.current = now;
     const rule: AppRule = {
       id: newRuleId(),
       match_on: "app",
@@ -284,19 +308,23 @@ export const AppRules: React.FC = () => {
     };
     setPicking(false);
     setFocusRuleId(pattern ? null : rule.id);
-    save([...rules, rule]);
+    save([...latestRules(), rule]);
   };
 
   const openPicker = async () => {
+    if (openingPicker) return;
+    setOpeningPicker(true);
     let apps: string[] = [];
     try {
       const result = await commands.getRecentContextApps();
       if (result.status === "ok") apps = result.data;
     } catch (error) {
       console.warn("Failed to load recent apps:", error);
+    } finally {
+      setOpeningPicker(false);
     }
     const covered = new Set(
-      rules
+      latestRules()
         .filter((rule) => (rule.match_on ?? "app") === "app")
         .map((rule) => (rule.pattern ?? "").toLowerCase()),
     );
@@ -310,19 +338,24 @@ export const AppRules: React.FC = () => {
   };
 
   const updateRule = (index: number, patch: Partial<AppRule>) => {
-    save(rules.map((rule, i) => (i === index ? { ...rule, ...patch } : rule)));
+    save(
+      latestRules().map((rule, i) =>
+        i === index ? { ...rule, ...patch } : rule,
+      ),
+    );
   };
 
   const moveRule = (index: number, delta: -1 | 1) => {
+    const current = latestRules();
     const target = index + delta;
-    if (target < 0 || target >= rules.length) return;
-    const next = [...rules];
+    if (target < 0 || target >= current.length) return;
+    const next = [...current];
     [next[index], next[target]] = [next[target], next[index]];
     save(next);
   };
 
   const deleteRule = (index: number) => {
-    save(rules.filter((_, i) => i !== index));
+    save(latestRules().filter((_, i) => i !== index));
   };
 
   return (
@@ -334,6 +367,22 @@ export const AppRules: React.FC = () => {
       layout="stacked"
     >
       <div className="flex flex-col gap-3">
+        {showMovedNote && (
+          <div className="flex items-start justify-between gap-2 rounded-md border border-logo-primary/40 bg-logo-primary/10 p-3">
+            <p className="text-sm">
+              {t("settings.postProcessing.context.screenContextMoved")}
+            </p>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() =>
+                updateSetting("show_screen_context_moved_note", false)
+              }
+            >
+              {t("settings.postProcessing.context.dismiss")}
+            </Button>
+          </div>
+        )}
         {rules.length === 0 ? (
           <p className="text-sm text-text/60">
             {t("settings.postProcessing.context.rules.empty")}
@@ -347,7 +396,7 @@ export const AppRules: React.FC = () => {
                 index={index}
                 count={rules.length}
                 promptOptions={promptOptions}
-                supportsVision={supportsVision}
+                screenshotBlocked={screenshotBlocked}
                 autoFocus={focusRuleId === rule.id}
                 onChange={(patch) => updateRule(index, patch)}
                 onMove={(delta) => moveRule(index, delta)}
@@ -397,6 +446,7 @@ export const AppRules: React.FC = () => {
             size="sm"
             className="self-start flex items-center gap-1"
             onClick={openPicker}
+            disabled={openingPicker}
           >
             <Plus width={14} height={14} aria-hidden="true" />
             {t("settings.postProcessing.context.rules.add")}

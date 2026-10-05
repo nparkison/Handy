@@ -6,7 +6,9 @@
 //! latency to starting the recording, and screenshots stay in memory: they are
 //! never written to disk or History.
 
-use crate::app_context::{capture_app_info, match_rule, screenshot_wanted, AppInfo};
+#[cfg(windows)]
+use crate::app_context::capture_app_info;
+use crate::app_context::{match_rule, screenshot_wanted, AppInfo};
 use crate::settings::AppSettings;
 use base64::Engine;
 use image::codecs::jpeg::JpegEncoder;
@@ -81,23 +83,49 @@ fn encode_screenshot(capture: RgbaImage) -> Option<Screenshot> {
     })
 }
 
-/// Screenshot of the focused window only (never the full screen).
-fn capture_active_window() -> Option<Screenshot> {
-    let windows = match xcap::Window::all() {
-        Ok(windows) => windows,
+/// Largest window side captured (before downscaling); bigger windows are
+/// skipped rather than decoding a huge bitmap.
+const MAX_CAPTURE_EDGE: u32 = 8_192;
+
+/// The focused window, found by enumerating all windows (macOS/Linux).
+#[cfg(not(windows))]
+pub fn focused_window() -> Option<xcap::Window> {
+    match xcap::Window::all() {
+        Ok(windows) => windows
+            .into_iter()
+            .find(|w| w.is_focused().unwrap_or(false)),
         Err(e) => {
             warn!("Screen context: failed to enumerate windows: {}", e);
-            return None;
+            None
         }
-    };
-    let Some(focused) = windows
-        .into_iter()
-        .find(|w| w.is_focused().unwrap_or(false))
-    else {
-        debug!("Screen context: no focused window found");
+    }
+}
+
+/// The xcap window with this id (on Windows, the HWND the rule matched).
+#[cfg(windows)]
+fn window_by_id(id: isize) -> Option<xcap::Window> {
+    let target = u32::try_from(id).ok()?;
+    match xcap::Window::all() {
+        Ok(windows) => windows.into_iter().find(|w| w.id().ok() == Some(target)),
+        Err(e) => {
+            warn!("Screen context: failed to enumerate windows: {}", e);
+            None
+        }
+    }
+}
+
+/// Screenshot of one window only (never the full screen).
+fn capture_window(window: &xcap::Window) -> Option<Screenshot> {
+    if window.is_minimized().unwrap_or(false) {
+        debug!("Screen context: window is minimized; no screenshot");
         return None;
-    };
-    match focused.capture_image() {
+    }
+    let (width, height) = (window.width().unwrap_or(0), window.height().unwrap_or(0));
+    if width == 0 || height == 0 || width > MAX_CAPTURE_EDGE || height > MAX_CAPTURE_EDGE {
+        debug!("Screen context: window size {width}x{height} not captured");
+        return None;
+    }
+    match window.capture_image() {
         Ok(capture) => encode_screenshot(capture),
         Err(e) => {
             warn!("Screen context: failed to capture focused window: {}", e);
@@ -182,7 +210,16 @@ impl PressContextSlot {
             .name("press-context-capture".to_string())
             .spawn(move || {
                 let started = Instant::now();
+                // One window lookup per press: the screenshot uses the same
+                // window the rule matched, never whatever is focused later.
+                #[cfg(windows)]
                 let info = capture_app_info();
+                #[cfg(not(windows))]
+                let focused = focused_window();
+                #[cfg(not(windows))]
+                let info = focused
+                    .as_ref()
+                    .and_then(crate::app_context::app_info_from_window);
                 let wants_shot = screenshot_settings.as_ref().is_some_and(|settings| {
                     screenshot_wanted(settings, match_rule(&settings.app_rules, info.as_ref()))
                 });
@@ -194,9 +231,21 @@ impl PressContextSlot {
                         .and_then(|i| i.window_title.as_ref())
                         .map_or(0, |t| t.chars().count())
                 );
+                #[cfg(windows)]
+                let window_id = info.as_ref().and_then(|i| i.window);
                 let _ = app_tx.send(info);
                 if wants_shot {
-                    let shot = capture_active_window();
+                    #[cfg(windows)]
+                    let window = window_id.and_then(window_by_id);
+                    #[cfg(not(windows))]
+                    let window = focused;
+                    let shot = match window {
+                        Some(window) => capture_window(&window),
+                        None => {
+                            debug!("Screen context: matched window not found; no screenshot");
+                            None
+                        }
+                    };
                     debug!("Screen context: {:?} in {:?}", shot, started.elapsed());
                     let _ = shot_tx.send(shot);
                 }

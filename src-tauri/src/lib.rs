@@ -701,6 +701,7 @@ pub fn run(cli_args: CliArgs) {
             shortcut::change_post_process_enabled_setting,
             shortcut::change_app_context_mode_setting,
             shortcut::change_app_rules_setting,
+            shortcut::dismiss_screen_context_moved_note,
             shortcut::change_experimental_enabled_setting,
             shortcut::change_post_process_base_url_setting,
             shortcut::change_post_process_api_key_setting,

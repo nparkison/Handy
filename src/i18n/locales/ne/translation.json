@@ -447,7 +447,7 @@
     },
     "postProcessing": {
       "hotkey": {
-        "title": "हटकी"
+        "title": "Cleanup"
       },
       "api": {
         "title": "API (OpenAI अनुकूल)",
@@ -552,8 +552,12 @@
           "screenshotLatency": "Adds about 0.5–1 s; may exceed your cleanup time limit.",
           "moveUp": "Move rule up",
           "moveDown": "Move rule down",
-          "delete": "Delete rule"
-        }
+          "delete": "Delete rule",
+          "screenshotShareOff": "Share app info is Off, so no screenshots are taken.",
+          "saveFailed": "Couldn't save app rules"
+        },
+        "screenContextMoved": "Screenshots are now set per app: add an app rule and turn on Include screenshot.",
+        "dismiss": "Dismiss"
       }
     },
     "history": {
@@ -933,7 +937,8 @@
       "cleanupStillRunning": "Cleanup still running",
       "noCleanedUpVersion": "No cleaned-up version for this one",
       "nothingToSwap": "Nothing to swap yet",
-      "swapCopied": "Can't swap here - copied instead"
+      "swapCopied": "Can't swap here - copied instead",
+      "releaseKeys": "Release Ctrl, Alt, Shift and Win, then try again"
     }
   },
   "secureInput": {

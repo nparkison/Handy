@@ -14,6 +14,7 @@ import type {
 } from "@/bindings";
 import { commands } from "@/bindings";
 import { toast } from "sonner";
+import i18n from "@/i18n";
 
 interface SettingsStore {
   settings: Settings | null;
@@ -164,10 +165,14 @@ const settingUpdaters: {
   app_rules: async (value) => {
     const result = await commands.changeAppRulesSetting(value as AppRule[]);
     if (result.status === "error") {
-      toast.error(result.error);
+      // The backend error is English-only; show a translated message.
+      console.warn("Failed to save app rules:", result.error);
+      toast.error(i18n.t("settings.postProcessing.context.rules.saveFailed"));
       throw new Error(result.error);
     }
   },
+  show_screen_context_moved_note: () =>
+    commands.dismissScreenContextMovedNote(),
   post_process_selected_prompt_id: (value) =>
     commands.setPostProcessSelectedPrompt(value as string),
   mute_while_recording: (value) =>

@@ -28,6 +28,9 @@ pub struct AppInfo {
     /// Process / executable name used for matching, e.g. `slack.exe`.
     pub process_name: String,
     pub window_title: Option<String>,
+    /// The focused window (Windows HWND), so a screenshot captures exactly
+    /// the window the rule matched. Never shared or stored.
+    pub window: Option<isize>,
 }
 
 impl AppInfo {
@@ -43,7 +46,34 @@ impl AppInfo {
             app_name: stem.to_string(),
             process_name: file.to_string(),
             window_title: window_title.filter(|t| !t.trim().is_empty()),
+            window: None,
         }
+    }
+
+    /// Rebuild the app from what History stored (the shared display name and
+    /// title) for a retry. On Windows the display name is the executable
+    /// stem, so the executable name rules match on (`slack.exe`) is restored.
+    pub fn from_history(app: Option<String>, title: Option<String>) -> Option<Self> {
+        let app = app.filter(|a| !a.trim().is_empty());
+        let title = title.filter(|t| !t.trim().is_empty());
+        if app.is_none() && title.is_none() {
+            return None;
+        }
+        let app_name = app.unwrap_or_default();
+        let process_name = if cfg!(windows)
+            && !app_name.is_empty()
+            && !app_name.to_ascii_lowercase().ends_with(".exe")
+        {
+            format!("{app_name}.exe")
+        } else {
+            app_name.clone()
+        };
+        Some(Self {
+            app_name,
+            process_name,
+            window_title: title,
+            window: None,
+        })
     }
 
     fn is_empty(&self) -> bool {
@@ -56,6 +86,7 @@ impl AppInfo {
 /// The focused app right now. Cheap on Windows (a few Win32 calls); a window
 /// enumeration elsewhere, so callers run it off the hot path. `None` when it
 /// cannot be determined (e.g. some Wayland compositors).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn capture_app_info() -> Option<AppInfo> {
     let info = capture_app_info_impl()?;
     (!info.is_empty()).then_some(info)
@@ -66,28 +97,36 @@ fn capture_app_info_impl() -> Option<AppInfo> {
     use crate::cockpit::platform::{foreground_app, window_title};
     let foreground = foreground_app()?;
     let title = window_title(foreground.window);
-    Some(match foreground.process_path.as_deref() {
+    let mut info = match foreground.process_path.as_deref() {
         Some(path) => AppInfo::from_process_path(path, title),
         None => AppInfo {
             window_title: title,
             ..AppInfo::default()
         },
-    })
+    };
+    info.window = Some(foreground.window);
+    Some(info)
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 fn capture_app_info_impl() -> Option<AppInfo> {
-    let windows = xcap::Window::all().ok()?;
-    let focused = windows
-        .into_iter()
-        .find(|w| w.is_focused().unwrap_or(false))?;
-    let app_name = focused.app_name().unwrap_or_default();
-    let title = focused.title().ok().filter(|t| !t.trim().is_empty());
-    Some(AppInfo {
+    app_info_from_window(&crate::screen_context::focused_window()?)
+}
+
+/// App info of an xcap window (macOS/Linux, where the focused window is found
+/// by enumeration).
+#[cfg(not(windows))]
+pub fn app_info_from_window(window: &xcap::Window) -> Option<AppInfo> {
+    let app_name = window.app_name().unwrap_or_default();
+    let title = window.title().ok().filter(|t| !t.trim().is_empty());
+    let info = AppInfo {
         process_name: app_name.clone(),
         app_name,
         window_title: title,
-    })
+        window: window.id().ok().map(|id| id as isize),
+    };
+    (!info.is_empty()).then_some(info)
 }
 
 /// Does `rule` match `info`? Case-insensitive "contains"; a blank pattern
@@ -131,7 +170,14 @@ pub fn resolve_prompt<'a>(
             ),
         }
     }
-    find(settings.post_process_selected_prompt_id.as_deref()?)
+    let usable = |p: &&LLMPrompt| !p.prompt.trim().is_empty();
+    // No (or a deleted) selected prompt: use the first usable one rather than
+    // silently skipping cleanup (fresh installs have no selection yet).
+    settings
+        .post_process_selected_prompt_id
+        .as_deref()
+        .and_then(find)
+        .or_else(|| settings.post_process_prompts.iter().find(usable))
 }
 
 /// What the share mode allows the cleanup model to learn about the app.
@@ -164,10 +210,46 @@ impl SharedContext {
     }
 }
 
-/// Collapse whitespace/control characters to single spaces and cap the
-/// length. `None` when nothing is left.
+/// Invisible characters that can smuggle hidden text or reorder what the
+/// model reads: format characters (Unicode Cf: zero-width, bidi controls,
+/// soft hyphen, Unicode tag characters) and variation selectors.
+pub fn is_invisible_format_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFE00..=0xFE0F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+            | 0xE0100..=0xE01EF
+    )
+}
+
+/// Drop invisible format characters, collapse whitespace/control characters
+/// to single spaces and cap the length. `None` when nothing is left.
 fn single_line(text: &str, max_chars: usize) -> Option<String> {
-    let collapsed = text
+    let visible: String = text
+        .chars()
+        .filter(|&c| !is_invisible_format_char(c))
+        .collect();
+    let collapsed = visible
         .split(|c: char| c.is_whitespace() || c.is_control())
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
@@ -292,10 +374,12 @@ impl CleanupRequest {
     }
 }
 
-/// A screenshot is captured only for a matched rule that opted in, and only
-/// when the active provider accepts images.
+/// A screenshot is captured only for a matched rule that opted in, only
+/// when the active provider accepts images, and never while "Share app info"
+/// is Off (Off means nothing about the app leaves the machine).
 pub fn screenshot_wanted(settings: &AppSettings, rule: Option<&AppRule>) -> bool {
-    rule.is_some_and(|rule| rule.screenshot)
+    settings.app_context_mode != AppContextMode::Off
+        && rule.is_some_and(|rule| rule.screenshot)
         && settings
             .active_post_process_provider()
             .is_some_and(|provider| provider.supports_vision)
@@ -422,9 +506,15 @@ mod tests {
             "default_improve_transcriptions"
         );
 
+        // No selection: the first usable prompt, never a silent skip.
         settings.post_process_selected_prompt_id = None;
-        assert!(resolve_prompt(&settings, Some(&deleted)).is_none());
+        assert_eq!(
+            resolve_prompt(&settings, Some(&deleted)).unwrap().id,
+            settings.post_process_prompts[0].id
+        );
         assert_eq!(resolve_prompt(&settings, Some(&chat)).unwrap().id, "chat");
+        settings.post_process_prompts.clear();
+        assert!(resolve_prompt(&settings, None).is_none());
     }
 
     #[test]
@@ -467,6 +557,38 @@ mod tests {
     }
 
     #[test]
+    fn invisible_characters_never_reach_the_model() {
+        let hidden: String = "\u{E0049}\u{E0067}\u{E006E}".into(); // tag chars
+        let info = AppInfo::from_process_path(
+            "mail\u{200B}.exe",
+            Some(format!("Inbox\u{202E}evil{hidden}\u{FEFF} - Mail\u{00AD}")),
+        );
+        let ctx = SharedContext::new(Some(&info), AppContextMode::AppAndTitle).unwrap();
+        assert_eq!(ctx.app_name.as_deref(), Some("mail"));
+        assert_eq!(ctx.window_title.as_deref(), Some("Inboxevil - Mail"));
+        // Only invisible characters: nothing is shared.
+        let blank = AppInfo::from_process_path("x.exe", Some("\u{200B}\u{E0041}".into()));
+        let ctx = SharedContext::new(Some(&blank), AppContextMode::AppAndTitle).unwrap();
+        assert_eq!(ctx.window_title, None);
+    }
+
+    #[test]
+    fn retry_restores_the_matchable_executable_name() {
+        let info = AppInfo::from_history(Some("slack".into()), Some("#general".into())).unwrap();
+        let rule = rule("r", AppRuleMatch::App, "slack.exe", "p");
+        if cfg!(windows) {
+            assert_eq!(info.process_name, "slack.exe");
+            assert!(rule_matches(&rule, &info));
+        } else {
+            assert_eq!(info.process_name, "slack");
+        }
+        assert_eq!(info.app_name, "slack");
+        assert!(AppInfo::from_history(None, Some(" ".into())).is_none());
+        let title_only = AppInfo::from_history(None, Some("Inbox".into())).unwrap();
+        assert_eq!(title_only.process_name, "");
+    }
+
+    #[test]
     fn long_titles_are_truncated_to_one_line() {
         let info = AppInfo::from_process_path("a.exe", Some("x".repeat(500)));
         let ctx = SharedContext::new(Some(&info), AppContextMode::AppAndTitle).unwrap();
@@ -495,10 +617,15 @@ mod tests {
             .clone();
 
         settings.post_process_provider_id = vision;
+        settings.app_context_mode = AppContextMode::AppName;
         assert!(!screenshot_wanted(&settings, Some(&r)));
         r.screenshot = true;
         assert!(screenshot_wanted(&settings, Some(&r)));
         assert!(!screenshot_wanted(&settings, None));
+        // Share app info = Off also means no screenshots.
+        settings.app_context_mode = AppContextMode::Off;
+        assert!(!screenshot_wanted(&settings, Some(&r)));
+        settings.app_context_mode = AppContextMode::AppName;
         settings.post_process_provider_id = text_only;
         assert!(!screenshot_wanted(&settings, Some(&r)));
     }

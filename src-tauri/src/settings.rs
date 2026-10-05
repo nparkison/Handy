@@ -533,6 +533,10 @@ pub struct AppSettings {
     /// saved to History when it arrives. 0 = no limit (always wait).
     #[serde(default = "default_post_process_timeout_ms")]
     pub post_process_timeout_ms: u64,
+    /// Show a one-time note in the Context settings that screenshots moved
+    /// from a global toggle to app rules (set for upgraders who had it on).
+    #[serde(default)]
+    pub show_screen_context_moved_note: bool,
     /// Tap / double-tap on the main binding pastes / swaps the last dictation.
     /// Only active with push-to-talk (Hold) activation.
     #[serde(default)]
@@ -961,8 +965,10 @@ fn ensure_post_process_defaults(settings: &mut AppSettings) -> bool {
                     existing.supports_structured_output = provider.supports_structured_output;
                     changed = true;
                 }
-                // Sync supports_vision field for existing providers (migration)
-                if existing.supports_vision != provider.supports_vision {
+                // Sync supports_vision field for existing providers (migration).
+                // The custom endpoint can serve any model, so the user's own
+                // choice for it is kept (it only defaults on when added).
+                if provider.id != "custom" && existing.supports_vision != provider.supports_vision {
                     debug!(
                         "Updating supports_vision for provider '{}' from {} to {}",
                         provider.id, existing.supports_vision, provider.supports_vision
@@ -1131,6 +1137,7 @@ pub fn get_default_settings() -> AppSettings {
         silent_mic_warning: default_silent_mic_warning(),
         post_process_every_dictation: false,
         post_process_timeout_ms: default_post_process_timeout_ms(),
+        show_screen_context_moved_note: false,
         tap_gestures_enabled: false,
         tap_max_duration_ms: default_tap_max_duration_ms(),
         double_tap_window_ms: default_double_tap_window_ms(),
@@ -1272,6 +1279,7 @@ pub fn get_settings(app: &AppHandle) -> AppSettings {
         store.set("settings", serde_json::to_value(&settings).unwrap());
     }
 
+    crate::cockpit::sync_settings(&settings);
     settings
 }
 
@@ -1350,6 +1358,27 @@ fn apply_settings_migrations(
             };
             updated = true;
         }
+    }
+
+    // One-time cleanup deadline migration: before the deadline existed,
+    // cleanup always waited for the model. Upgrading users keep that ("No
+    // limit"); only fresh installs (whose store is written with the key) get
+    // the 1.5 s default.
+    if settings_value.get("post_process_timeout_ms").is_none() {
+        settings.post_process_timeout_ms = 0;
+        updated = true;
+    }
+
+    // One-time note for users of the retired global screen-context toggle:
+    // screenshots are now per app rule, so point them there (Context group).
+    if settings_value.get("app_rules").is_none()
+        && settings_value
+            .get("screen_context_enabled")
+            .and_then(|v| v.as_bool())
+            == Some(true)
+    {
+        settings.show_screen_context_moved_note = true;
+        updated = true;
     }
 
     // One-time Chinese script migration: the script used to be chosen through
@@ -1471,6 +1500,7 @@ pub fn update_checks_effectively_enabled(settings: &AppSettings) -> bool {
 }
 
 pub fn write_settings(app: &AppHandle, settings: AppSettings) {
+    crate::cockpit::sync_settings(&settings);
     let store = app
         .store(crate::portable::store_path(SETTINGS_STORE_PATH))
         .expect("Failed to initialize store");
@@ -2041,6 +2071,29 @@ mod tests {
     }
 
     #[test]
+    fn upgraders_keep_waiting_for_cleanup_and_get_the_screenshot_note() {
+        // A store from before the cleanup deadline and per-app screenshots.
+        let raw = serde_json::json!({
+            "screen_context_enabled": true
+        });
+        let mut settings = get_default_settings();
+        assert_eq!(settings.post_process_timeout_ms, 1_500);
+        assert!(apply_settings_migrations(&mut settings, &raw));
+        assert_eq!(settings.post_process_timeout_ms, 0, "no limit, as before");
+        assert!(settings.show_screen_context_moved_note);
+
+        // A store that already has the keys is left alone.
+        let raw = serde_json::json!({
+            "post_process_timeout_ms": 1500,
+            "app_rules": []
+        });
+        let mut settings = get_default_settings();
+        apply_settings_migrations(&mut settings, &raw);
+        assert_eq!(settings.post_process_timeout_ms, 1_500);
+        assert!(!settings.show_screen_context_moved_note);
+    }
+
+    #[test]
     fn gpu_device_migration_keeps_current_stable_selection() {
         let mut settings = get_default_settings();
         settings.transcribe_accelerator = TranscribeAcceleratorSetting::Gpu;
@@ -2054,7 +2107,8 @@ mod tests {
             "chinese_script": "as_transcribed",
             "transcribe_accelerator": "gpu",
             "transcribe_gpu_device": settings.transcribe_gpu_device,
-            "app_rules": []
+            "app_rules": [],
+            "post_process_timeout_ms": 1500
         });
 
         assert!(!apply_settings_migrations(&mut settings, &raw));
