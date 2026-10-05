@@ -7,7 +7,10 @@
     "model": "Model",
     "quit": "Çıkış",
     "cancel": "İptal",
-    "secureInputWarning": "⚠ Kısayollar Secure Input tarafından engelleniyor"
+    "secureInputWarning": "⚠ Kısayollar Secure Input tarafından engelleniyor",
+    "recentDictations": "Recent Dictations",
+    "noDictationsYet": "No dictations yet",
+    "openHistory": "Open History..."
   },
   "sidebar": {
     "general": "Genel",
@@ -407,6 +410,10 @@
           "simplified": "Basitleştirilmiş",
           "traditional": "Geleneksel"
         }
+      },
+      "showRecentDictationsInTray": {
+        "label": "Show recent dictations in tray",
+        "description": "Lists your last 5 dictations in the tray menu. Turn off if you share your screen."
       }
     },
     "postProcessing": {
@@ -483,7 +490,22 @@
       "retranscribe": "Yeniden transkribe et",
       "retranscribeError": "Yeniden transkripsiyon başarısız oldu. Lütfen tekrar deneyin.",
       "transcribing": "Transkribe ediliyor...",
-      "transcriptionFailed": "Transkripsiyon başarısız oldu. Yeniden deneme simgesini kullanarak tekrar transkribe edebilirsiniz."
+      "transcriptionFailed": "Transkripsiyon başarısız oldu. Yeniden deneme simgesini kullanarak tekrar transkribe edebilirsiniz.",
+      "copy": "Copy",
+      "copyPolished": "Copy cleaned-up text",
+      "copyOriginal": "Copy original",
+      "showOriginal": "Show original",
+      "hideOriginal": "Hide original",
+      "originalText": "Original transcription",
+      "searchPlaceholder": "Search history",
+      "noMatches": "No dictations match \"{{query}}\".",
+      "clearSearch": "Clear search",
+      "searching": "Searching...",
+      "status": {
+        "cleanedUp": "Cleaned up",
+        "original": "Original",
+        "cleanupFailed": "Cleanup failed"
+      }
     },
     "debug": {
       "title": "Hata Ayıklama",

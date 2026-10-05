@@ -7,7 +7,10 @@
     "model": "模型",
     "quit": "結束",
     "cancel": "取消",
-    "secureInputWarning": "⚠ 快捷鍵被 Secure Input 阻擋"
+    "secureInputWarning": "⚠ 快捷鍵被 Secure Input 阻擋",
+    "recentDictations": "Recent Dictations",
+    "noDictationsYet": "No dictations yet",
+    "openHistory": "Open History..."
   },
   "sidebar": {
     "general": "一般",
@@ -407,6 +410,10 @@
           "simplified": "簡體",
           "traditional": "繁體"
         }
+      },
+      "showRecentDictationsInTray": {
+        "label": "Show recent dictations in tray",
+        "description": "Lists your last 5 dictations in the tray menu. Turn off if you share your screen."
       }
     },
     "postProcessing": {
@@ -483,7 +490,22 @@
       "retranscribe": "重新轉錄",
       "retranscribeError": "重新轉錄失敗，請重試。",
       "transcribing": "轉錄中...",
-      "transcriptionFailed": "轉錄失敗。您可以使用重試圖示重新轉錄。"
+      "transcriptionFailed": "轉錄失敗。您可以使用重試圖示重新轉錄。",
+      "copy": "Copy",
+      "copyPolished": "Copy cleaned-up text",
+      "copyOriginal": "Copy original",
+      "showOriginal": "Show original",
+      "hideOriginal": "Hide original",
+      "originalText": "Original transcription",
+      "searchPlaceholder": "Search history",
+      "noMatches": "No dictations match \"{{query}}\".",
+      "clearSearch": "Clear search",
+      "searching": "Searching...",
+      "status": {
+        "cleanedUp": "Cleaned up",
+        "original": "Original",
+        "cleanupFailed": "Cleanup failed"
+      }
     },
     "debug": {
       "title": "偵錯",

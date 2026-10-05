@@ -7,7 +7,10 @@
     "model": "Modell",
     "quit": "Avsluta",
     "cancel": "Avbryt",
-    "secureInputWarning": "⚠ Kortkommandon blockeras av Secure Input"
+    "secureInputWarning": "⚠ Kortkommandon blockeras av Secure Input",
+    "recentDictations": "Recent Dictations",
+    "noDictationsYet": "No dictations yet",
+    "openHistory": "Open History..."
   },
   "sidebar": {
     "general": "Allmänt",
@@ -407,6 +410,10 @@
           "simplified": "Förenklad",
           "traditional": "Traditionell"
         }
+      },
+      "showRecentDictationsInTray": {
+        "label": "Show recent dictations in tray",
+        "description": "Lists your last 5 dictations in the tray menu. Turn off if you share your screen."
       }
     },
     "postProcessing": {
@@ -483,7 +490,22 @@
       "retranscribe": "Transkribera igen",
       "retranscribeError": "Misslyckades med att transkribera igen. Försök igen.",
       "transcribing": "Transkriberar...",
-      "transcriptionFailed": "Transkribering misslyckades. Du kan transkribera igen med hjälp av ikonen för nytt försök."
+      "transcriptionFailed": "Transkribering misslyckades. Du kan transkribera igen med hjälp av ikonen för nytt försök.",
+      "copy": "Copy",
+      "copyPolished": "Copy cleaned-up text",
+      "copyOriginal": "Copy original",
+      "showOriginal": "Show original",
+      "hideOriginal": "Hide original",
+      "originalText": "Original transcription",
+      "searchPlaceholder": "Search history",
+      "noMatches": "No dictations match \"{{query}}\".",
+      "clearSearch": "Clear search",
+      "searching": "Searching...",
+      "status": {
+        "cleanedUp": "Cleaned up",
+        "original": "Original",
+        "cleanupFailed": "Cleanup failed"
+      }
     },
     "debug": {
       "title": "Felsökning",

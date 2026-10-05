@@ -7,7 +7,10 @@
     "model": "Модел",
     "quit": "Изход",
     "cancel": "Отказ",
-    "secureInputWarning": "⚠ Бързите клавиши са блокирани от Secure Input"
+    "secureInputWarning": "⚠ Бързите клавиши са блокирани от Secure Input",
+    "recentDictations": "Recent Dictations",
+    "noDictationsYet": "No dictations yet",
+    "openHistory": "Open History..."
   },
   "sidebar": {
     "general": "Общи",
@@ -407,6 +410,10 @@
           "simplified": "Опростени",
           "traditional": "Традиционни"
         }
+      },
+      "showRecentDictationsInTray": {
+        "label": "Show recent dictations in tray",
+        "description": "Lists your last 5 dictations in the tray menu. Turn off if you share your screen."
       }
     },
     "postProcessing": {
@@ -483,7 +490,22 @@
       "retranscribe": "Повторна транскрипция",
       "retranscribeError": "Повторната транскрипция не бе успешна. Опитайте отново.",
       "transcribing": "Транскрибиране...",
-      "transcriptionFailed": "Транскрипцията не бе успешна. Можете да опитате отново с иконата за повторен опит."
+      "transcriptionFailed": "Транскрипцията не бе успешна. Можете да опитате отново с иконата за повторен опит.",
+      "copy": "Copy",
+      "copyPolished": "Copy cleaned-up text",
+      "copyOriginal": "Copy original",
+      "showOriginal": "Show original",
+      "hideOriginal": "Hide original",
+      "originalText": "Original transcription",
+      "searchPlaceholder": "Search history",
+      "noMatches": "No dictations match \"{{query}}\".",
+      "clearSearch": "Clear search",
+      "searching": "Searching...",
+      "status": {
+        "cleanedUp": "Cleaned up",
+        "original": "Original",
+        "cleanupFailed": "Cleanup failed"
+      }
     },
     "debug": {
       "title": "Отстраняване",

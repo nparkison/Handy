@@ -7,7 +7,10 @@
     "model": "Model",
     "quit": "Afsluiten",
     "cancel": "Annuleren",
-    "secureInputWarning": "⚠ Sneltoetsen geblokkeerd door Secure Input"
+    "secureInputWarning": "⚠ Sneltoetsen geblokkeerd door Secure Input",
+    "recentDictations": "Recent Dictations",
+    "noDictationsYet": "No dictations yet",
+    "openHistory": "Open History..."
   },
   "sidebar": {
     "general": "Algemeen",
@@ -407,6 +410,10 @@
           "simplified": "Vereenvoudigd",
           "traditional": "Traditioneel"
         }
+      },
+      "showRecentDictationsInTray": {
+        "label": "Show recent dictations in tray",
+        "description": "Lists your last 5 dictations in the tray menu. Turn off if you share your screen."
       }
     },
     "postProcessing": {
@@ -483,7 +490,22 @@
       "retranscribe": "Opnieuw transcriberen",
       "retranscribeError": "Opnieuw transcriberen mislukt. Probeer het opnieuw.",
       "transcribing": "Transcriberen...",
-      "transcriptionFailed": "Transcriptie mislukt. Je kunt het opnieuw proberen via het herlaad-pictogram."
+      "transcriptionFailed": "Transcriptie mislukt. Je kunt het opnieuw proberen via het herlaad-pictogram.",
+      "copy": "Copy",
+      "copyPolished": "Copy cleaned-up text",
+      "copyOriginal": "Copy original",
+      "showOriginal": "Show original",
+      "hideOriginal": "Hide original",
+      "originalText": "Original transcription",
+      "searchPlaceholder": "Search history",
+      "noMatches": "No dictations match \"{{query}}\".",
+      "clearSearch": "Clear search",
+      "searching": "Searching...",
+      "status": {
+        "cleanedUp": "Cleaned up",
+        "original": "Original",
+        "cleanupFailed": "Cleanup failed"
+      }
     },
     "debug": {
       "title": "Probleemoplossing",

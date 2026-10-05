@@ -275,6 +275,7 @@ impl HistoryManager {
         {
             error!("Failed to emit history-updated event: {}", e);
         }
+        crate::tray::refresh_recent_dictations(&self.app_handle);
 
         Ok(entry)
     }
@@ -323,6 +324,7 @@ impl HistoryManager {
         {
             error!("Failed to emit history-updated event: {}", e);
         }
+        crate::tray::refresh_recent_dictations(&self.app_handle);
 
         Ok(entry)
     }
@@ -453,48 +455,55 @@ impl HistoryManager {
         limit: Option<usize>,
     ) -> Result<PaginatedHistory> {
         let conn = self.get_connection()?;
-        let limit = limit.map(|l| l.min(100));
+        Self::query_history_page(&conn, cursor, limit, None)
+    }
 
-        let mut entries: Vec<HistoryEntry> = match (cursor, limit) {
-            (Some(cursor_id), Some(lim)) => {
-                let fetch_count = (lim + 1) as i64;
-                let mut stmt = conn.prepare(
-                    "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
-                     FROM transcription_history
-                     WHERE id < ?1
-                     ORDER BY id DESC
-                     LIMIT ?2",
-                )?;
-                let result = stmt
-                    .query_map(params![cursor_id, fetch_count], Self::map_history_entry)?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                result
-            }
-            (None, Some(lim)) => {
-                let fetch_count = (lim + 1) as i64;
-                let mut stmt = conn.prepare(
-                    "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
-                     FROM transcription_history
-                     ORDER BY id DESC
-                     LIMIT ?1",
-                )?;
-                let result = stmt
-                    .query_map(params![fetch_count], Self::map_history_entry)?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                result
-            }
-            (_, None) => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
-                     FROM transcription_history
-                     ORDER BY id DESC",
-                )?;
-                let result = stmt
-                    .query_map([], Self::map_history_entry)?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                result
-            }
-        };
+    /// Page through entries whose raw or polished text contains `query`
+    /// (case-insensitive for ASCII, per SQLite `LIKE`). Searches every retained
+    /// entry, not just the page the UI has loaded.
+    pub async fn search_history_entries(
+        &self,
+        query: &str,
+        cursor: Option<i64>,
+        limit: Option<usize>,
+    ) -> Result<PaginatedHistory> {
+        let conn = self.get_connection()?;
+        let query = query.trim();
+        let search = (!query.is_empty()).then_some(query);
+        Self::query_history_page(&conn, cursor, limit, search)
+    }
+
+    /// Shared cursor-paginated query. `cursor` is the id of the last entry of
+    /// the previous page (entries are returned newest-first by id), `limit`
+    /// is capped at 100, and `search` filters on both text columns.
+    fn query_history_page(
+        conn: &Connection,
+        cursor: Option<i64>,
+        limit: Option<usize>,
+        search: Option<&str>,
+    ) -> Result<PaginatedHistory> {
+        let limit = limit.map(|l| l.min(100));
+        // Fetch one extra row to learn whether another page exists.
+        // SQLite treats a negative LIMIT as "no limit".
+        let fetch_count: i64 = limit.map_or(-1, |lim| lim as i64 + 1);
+        let pattern = search.map(like_contains_pattern);
+
+        let mut stmt = conn.prepare(
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
+             FROM transcription_history
+             WHERE (?1 IS NULL OR id < ?1)
+               AND (?2 IS NULL
+                    OR transcription_text LIKE ?2 ESCAPE '\\'
+                    OR COALESCE(post_processed_text, '') LIKE ?2 ESCAPE '\\')
+             ORDER BY id DESC
+             LIMIT ?3",
+        )?;
+        let mut entries = stmt
+            .query_map(
+                params![cursor, pattern, fetch_count],
+                Self::map_history_entry,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let has_more = limit.is_some_and(|lim| entries.len() > lim);
         if has_more {
@@ -502,6 +511,30 @@ impl HistoryManager {
         }
 
         Ok(PaginatedHistory { entries, has_more })
+    }
+
+    /// The newest `limit` entries that have transcription text (failed
+    /// recordings are skipped), newest first. Used by the tray's recent list.
+    pub fn get_recent_completed_entries(&self, limit: usize) -> Result<Vec<HistoryEntry>> {
+        let conn = self.get_connection()?;
+        Self::get_recent_completed_entries_with_conn(&conn, limit)
+    }
+
+    fn get_recent_completed_entries_with_conn(
+        conn: &Connection,
+        limit: usize,
+    ) -> Result<Vec<HistoryEntry>> {
+        let mut stmt = conn.prepare(
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
+             FROM transcription_history
+             WHERE transcription_text != ''
+             ORDER BY id DESC
+             LIMIT ?1",
+        )?;
+        let entries = stmt
+            .query_map(params![limit as i64], Self::map_history_entry)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(entries)
     }
 
     #[cfg(test)]
@@ -586,6 +619,11 @@ impl HistoryManager {
     }
 
     pub async fn get_entry_by_id(&self, id: i64) -> Result<Option<HistoryEntry>> {
+        self.find_entry(id)
+    }
+
+    /// Synchronous lookup by id, for callers outside an async context (tray).
+    pub fn find_entry(&self, id: i64) -> Result<Option<HistoryEntry>> {
         let conn = self.get_connection()?;
         let mut stmt = conn.prepare(
             "SELECT
@@ -634,6 +672,7 @@ impl HistoryManager {
         if let Err(e) = (HistoryUpdatePayload::Deleted { id }).emit(&self.app_handle) {
             error!("Failed to emit history-updated event: {}", e);
         }
+        crate::tray::refresh_recent_dictations(&self.app_handle);
 
         Ok(())
     }
@@ -647,6 +686,22 @@ impl HistoryManager {
             format!("Recording {}", timestamp)
         }
     }
+}
+
+/// Builds a `LIKE ... ESCAPE '\'` pattern matching `query` anywhere in the
+/// text. `%`, `_` and the escape character itself are escaped so user input is
+/// always matched literally.
+fn like_contains_pattern(query: &str) -> String {
+    let mut pattern = String::with_capacity(query.len() + 2);
+    pattern.push('%');
+    for ch in query.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
 }
 
 #[cfg(test)]
@@ -733,5 +788,141 @@ mod tests {
 
         assert_eq!(entry.timestamp, 100);
         assert_eq!(entry.transcription_text, "completed");
+    }
+
+    fn page_texts(page: &PaginatedHistory) -> Vec<&str> {
+        page.entries
+            .iter()
+            .map(|e| e.transcription_text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn like_pattern_escapes_wildcards() {
+        assert_eq!(like_contains_pattern("abc"), "%abc%");
+        assert_eq!(like_contains_pattern("50%"), "%50\\%%");
+        assert_eq!(like_contains_pattern("a_b"), "%a\\_b%");
+        assert_eq!(like_contains_pattern("c:\\x"), "%c:\\\\x%");
+    }
+
+    #[test]
+    fn query_page_without_search_paginates_newest_first() {
+        let conn = setup_conn();
+        for i in 1..=5 {
+            insert_entry(&conn, i * 100, &format!("entry {i}"), None);
+        }
+
+        let first = HistoryManager::query_history_page(&conn, None, Some(2), None).unwrap();
+        assert_eq!(page_texts(&first), vec!["entry 5", "entry 4"]);
+        assert!(first.has_more);
+
+        let cursor = first.entries.last().map(|e| e.id);
+        let second = HistoryManager::query_history_page(&conn, cursor, Some(2), None).unwrap();
+        assert_eq!(page_texts(&second), vec!["entry 3", "entry 2"]);
+        assert!(second.has_more);
+
+        let cursor = second.entries.last().map(|e| e.id);
+        let last = HistoryManager::query_history_page(&conn, cursor, Some(2), None).unwrap();
+        assert_eq!(page_texts(&last), vec!["entry 1"]);
+        assert!(!last.has_more);
+
+        let all = HistoryManager::query_history_page(&conn, None, None, None).unwrap();
+        assert_eq!(all.entries.len(), 5);
+        assert!(!all.has_more);
+    }
+
+    #[test]
+    fn search_matches_raw_and_polished_text_case_insensitively() {
+        let conn = setup_conn();
+        insert_entry(&conn, 100, "meeting notes for Tuesday", None);
+        insert_entry(
+            &conn,
+            200,
+            "uh so the budget",
+            Some("The Budget is approved."),
+        );
+        insert_entry(&conn, 300, "unrelated", Some("Also unrelated."));
+
+        let page =
+            HistoryManager::query_history_page(&conn, None, Some(30), Some("BUDGET")).unwrap();
+        assert_eq!(page_texts(&page), vec!["uh so the budget"]);
+
+        let page =
+            HistoryManager::query_history_page(&conn, None, Some(30), Some("approved")).unwrap();
+        assert_eq!(page_texts(&page), vec!["uh so the budget"]);
+
+        let page =
+            HistoryManager::query_history_page(&conn, None, Some(30), Some("tuesday")).unwrap();
+        assert_eq!(page_texts(&page), vec!["meeting notes for Tuesday"]);
+
+        let page =
+            HistoryManager::query_history_page(&conn, None, Some(30), Some("nothing")).unwrap();
+        assert!(page.entries.is_empty());
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn search_treats_wildcards_and_quotes_literally() {
+        let conn = setup_conn();
+        insert_entry(&conn, 100, "growth was 50% this year", None);
+        insert_entry(&conn, 200, "growth was 500 units", None);
+        insert_entry(&conn, 300, "snake_case name", None);
+        insert_entry(&conn, 400, "snakeXcase name", None);
+        insert_entry(&conn, 500, "it's Bobby'); DROP TABLE x;--", None);
+
+        let page = HistoryManager::query_history_page(&conn, None, None, Some("50%")).unwrap();
+        assert_eq!(page_texts(&page), vec!["growth was 50% this year"]);
+
+        let page =
+            HistoryManager::query_history_page(&conn, None, None, Some("snake_case")).unwrap();
+        assert_eq!(page_texts(&page), vec!["snake_case name"]);
+
+        let page = HistoryManager::query_history_page(&conn, None, None, Some("'); DROP")).unwrap();
+        assert_eq!(page.entries.len(), 1);
+        let all = HistoryManager::query_history_page(&conn, None, None, None).unwrap();
+        assert_eq!(all.entries.len(), 5);
+    }
+
+    #[test]
+    fn search_paginates_over_matches_only() {
+        let conn = setup_conn();
+        for i in 1..=6 {
+            let text = if i % 2 == 0 {
+                format!("match {i}")
+            } else {
+                format!("other {i}")
+            };
+            insert_entry(&conn, i * 100, &text, None);
+        }
+
+        let first =
+            HistoryManager::query_history_page(&conn, None, Some(2), Some("match")).unwrap();
+        assert_eq!(page_texts(&first), vec!["match 6", "match 4"]);
+        assert!(first.has_more);
+
+        let cursor = first.entries.last().map(|e| e.id);
+        let second =
+            HistoryManager::query_history_page(&conn, cursor, Some(2), Some("match")).unwrap();
+        assert_eq!(page_texts(&second), vec!["match 2"]);
+        assert!(!second.has_more);
+    }
+
+    #[test]
+    fn recent_completed_entries_skip_failed_and_respect_limit() {
+        let conn = setup_conn();
+        for i in 1..=7 {
+            insert_entry(&conn, i * 100, &format!("entry {i}"), None);
+        }
+        insert_entry(&conn, 800, "", None);
+
+        let recent = HistoryManager::get_recent_completed_entries_with_conn(&conn, 5).unwrap();
+        let texts: Vec<&str> = recent
+            .iter()
+            .map(|e| e.transcription_text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["entry 7", "entry 6", "entry 5", "entry 4", "entry 3"]
+        );
     }
 }

@@ -489,6 +489,10 @@ pub struct AppSettings {
     pub keyboard_implementation: KeyboardImplementation,
     #[serde(default = "default_show_tray_icon")]
     pub show_tray_icon: bool,
+    /// Lists the last few dictations in a tray submenu. Users who share their
+    /// screen can turn it off so dictated text is not exposed.
+    #[serde(default = "default_show_recent_dictations_in_tray")]
+    pub show_recent_dictations_in_tray: bool,
     #[serde(default = "default_paste_delay_ms")]
     pub paste_delay_ms: u64,
     #[serde(default = "default_paste_delay_after_ms")]
@@ -635,8 +639,15 @@ fn default_auto_submit() -> bool {
     false
 }
 
+/// Text is tiny, so keep a useful amount of history by default. Recordings
+/// follow the separate retention setting.
+pub(crate) const DEFAULT_HISTORY_LIMIT: usize = 200;
+
+/// The pre-0.10 default, used to migrate users who never changed it.
+const LEGACY_DEFAULT_HISTORY_LIMIT: usize = 5;
+
 fn default_history_limit() -> usize {
-    5
+    DEFAULT_HISTORY_LIMIT
 }
 
 fn default_recording_retention_period() -> RecordingRetentionPeriod {
@@ -666,6 +677,10 @@ fn default_app_language() -> String {
 }
 
 fn default_show_tray_icon() -> bool {
+    true
+}
+
+fn default_show_recent_dictations_in_tray() -> bool {
     true
 }
 
@@ -1001,6 +1016,7 @@ pub fn get_default_settings() -> AppSettings {
         lazy_stream_close: false,
         keyboard_implementation: KeyboardImplementation::default(),
         show_tray_icon: default_show_tray_icon(),
+        show_recent_dictations_in_tray: default_show_recent_dictations_in_tray(),
         paste_delay_ms: default_paste_delay_ms(),
         paste_delay_after_ms: default_paste_delay_after_ms(),
         reliable_paste: false,
@@ -1227,6 +1243,20 @@ fn apply_settings_migrations(
         && settings.transcribe_gpu_device.is_none()
     {
         settings.transcribe_accelerator = TranscribeAcceleratorSetting::Auto;
+        updated = true;
+    }
+
+    // One-time history limit migration. The default went from 5 to 200, but a
+    // stored 5 can't be told apart from a deliberate choice of 5. Raise it once,
+    // keyed on the first load by a build that knows the recent-dictations tray
+    // setting (added in the same release): after that the key is persisted, so
+    // a user who sets 5 again keeps it.
+    if settings_value
+        .get("show_recent_dictations_in_tray")
+        .is_none()
+        && settings.history_limit == LEGACY_DEFAULT_HISTORY_LIMIT
+    {
+        settings.history_limit = DEFAULT_HISTORY_LIMIT;
         updated = true;
     }
 
@@ -1588,6 +1618,46 @@ mod tests {
     fn default_overlay_style_is_live_when_overlay_defaults_on() {
         let settings = get_default_settings();
         assert_eq!(settings.overlay_style, OverlayStyle::Live);
+    }
+
+    #[test]
+    fn history_limit_migration_raises_legacy_default_once() {
+        let mut raw = default_settings_json();
+        let map = raw.as_object_mut().unwrap();
+        map.remove("show_recent_dictations_in_tray");
+        map.insert("history_limit".into(), serde_json::json!(5));
+        let mut settings: AppSettings = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(settings.history_limit, 5);
+
+        assert!(apply_settings_migrations(&mut settings, &raw));
+        assert_eq!(settings.history_limit, DEFAULT_HISTORY_LIMIT);
+        assert!(settings.show_recent_dictations_in_tray);
+
+        // Once the new key is stored, a deliberate 5 is left alone.
+        let mut raw = serde_json::to_value(&settings).unwrap();
+        raw["history_limit"] = serde_json::json!(5);
+        let mut settings: AppSettings = serde_json::from_value(raw.clone()).unwrap();
+        apply_settings_migrations(&mut settings, &raw);
+        assert_eq!(settings.history_limit, 5);
+    }
+
+    #[test]
+    fn history_limit_migration_keeps_custom_values() {
+        let mut raw = default_settings_json();
+        let map = raw.as_object_mut().unwrap();
+        map.remove("show_recent_dictations_in_tray");
+        map.insert("history_limit".into(), serde_json::json!(50));
+        let mut settings: AppSettings = serde_json::from_value(raw.clone()).unwrap();
+
+        apply_settings_migrations(&mut settings, &raw);
+        assert_eq!(settings.history_limit, 50);
+    }
+
+    #[test]
+    fn new_installs_default_to_large_history_and_tray_list() {
+        let settings = get_default_settings();
+        assert_eq!(settings.history_limit, DEFAULT_HISTORY_LIMIT);
+        assert!(settings.show_recent_dictations_in_tray);
     }
 
     #[test]
