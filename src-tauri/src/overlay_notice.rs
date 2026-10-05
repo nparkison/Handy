@@ -48,7 +48,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 /// Default on-screen time of an info notice.
 pub const INFO_DURATION: Duration = Duration::from_millis(1_500);
@@ -184,6 +184,10 @@ static NEXT_NOTICE_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_NOTICE: Mutex<Option<ActiveNotice>> = Mutex::new(None);
 /// True while a warning's tray-tooltip fallback is displayed.
 static TRAY_FALLBACK_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The notice the overlay shows, while it shows one (0 = none). Unlike
+/// `ACTIVE_NOTICE` it survives the action being taken, so a stale notice
+/// can always be dismissed.
+static SHOWN_NOTICE: AtomicU64 = AtomicU64::new(0);
 
 fn active_notice() -> std::sync::MutexGuard<'static, Option<ActiveNotice>> {
     ACTIVE_NOTICE.lock().unwrap_or_else(|e| e.into_inner())
@@ -217,6 +221,7 @@ pub fn show_overlay_notice(app: &AppHandle, notice: Notice) -> Option<u64> {
         action: notice.action.map(|a| a.run),
     });
     debug!("overlay notice {id}: {}", payload.message.key);
+    SHOWN_NOTICE.store(id, Ordering::Release);
     crate::overlay::show_notice_overlay(app, payload);
 
     // The overlay webview owns the visible timer (it pauses on hover) and
@@ -235,6 +240,7 @@ pub fn show_overlay_notice(app: &AppHandle, notice: Notice) -> Option<u64> {
 /// wins, so the current notice (and its pending action) is dropped.
 pub(crate) fn forget_active_notice() {
     active_notice().take();
+    SHOWN_NOTICE.store(0, Ordering::Release);
 }
 
 /// Called at the start of every dictation press. Clears a warning's tray
@@ -253,10 +259,13 @@ fn dismiss_notice(app: &AppHandle, id: u64) {
             active.take();
             true
         } else {
-            false
+            // Its action already ran (or was dropped) but the overlay may
+            // still show it: hide only if nothing replaced it since.
+            active.is_none() && SHOWN_NOTICE.load(Ordering::Acquire) == id
         }
     };
     if still_showing {
+        SHOWN_NOTICE.store(0, Ordering::Release);
         crate::overlay::hide_recording_overlay(app);
     }
 }
@@ -272,15 +281,25 @@ pub fn dismiss_overlay_notice(app: AppHandle, id: u64) {
 #[tauri::command]
 #[specta::specta]
 pub fn run_overlay_notice_action(app: AppHandle, id: u64) {
-    let handler = {
+    let (handler, running) = {
         let mut active = active_notice();
         match active.as_mut() {
-            Some(notice) if notice.id == id => notice.action.take(),
-            _ => None,
+            Some(notice) if notice.id == id => {
+                let handler = notice.action.take();
+                let running = handler.is_none();
+                (handler, running)
+            }
+            _ => (None, false),
         }
     };
     let Some(handler) = handler else {
         debug!("overlay notice {id}: action no longer available");
+        if !running {
+            // Nothing will ever finish this notice: un-freeze the overlay
+            // (its timer resumes) and hide it if it is still showing.
+            let _ = app.emit_to("recording_overlay", "overlay-notice-action-done", id);
+            dismiss_notice(&app, id);
+        }
         return;
     };
     // Handlers may block (device switches, settings I/O); keep them off the

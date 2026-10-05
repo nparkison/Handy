@@ -11,7 +11,8 @@
 use crate::audio_toolkit::audio::{CaptureStats, NOISE_FLOOR_PEAK, NOISE_FLOOR_RMS};
 use crate::settings::{get_settings, AppSettings};
 use log::debug;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ops::RangeInclusive;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::AppHandle;
@@ -20,6 +21,28 @@ use tauri::AppHandle;
 /// forgotten after this long so it cannot block the first tap forever.
 const STALE_SECOND_PRESS: Duration = Duration::from_secs(30);
 
+/// Allowed tap length (ms), matching the settings slider.
+pub const TAP_MAX_RANGE_MS: RangeInclusive<u64> = 100..=400;
+/// Allowed double-tap window (ms), matching the settings slider.
+pub const DOUBLE_TAP_RANGE_MS: RangeInclusive<u64> = 150..=600;
+
+fn clamp_ms(ms: u64, range: &RangeInclusive<u64>) -> u64 {
+    ms.clamp(*range.start(), *range.end())
+}
+
+pub fn clamp_tap_max_ms(ms: u64) -> u64 {
+    clamp_ms(ms, &TAP_MAX_RANGE_MS)
+}
+
+pub fn clamp_double_tap_ms(ms: u64) -> u64 {
+    clamp_ms(ms, &DOUBLE_TAP_RANGE_MS)
+}
+
+/// `at + d`, saturating instead of panicking on overflow.
+fn after(at: Instant, d: Duration) -> Instant {
+    at.checked_add(d).unwrap_or(at)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GestureTiming {
     pub tap_max: Duration,
@@ -27,10 +50,16 @@ pub struct GestureTiming {
 }
 
 impl GestureTiming {
+    /// Timing from settings, clamped to the supported ranges (a hand-edited
+    /// settings file can never overflow the timer arithmetic).
     pub fn from_settings(settings: &AppSettings) -> Self {
+        Self::from_ms(settings.tap_max_duration_ms, settings.double_tap_window_ms)
+    }
+
+    fn from_ms(tap_max_ms: u64, double_window_ms: u64) -> Self {
         Self {
-            tap_max: Duration::from_millis(settings.tap_max_duration_ms),
-            double_window: Duration::from_millis(settings.double_tap_window_ms),
+            tap_max: Duration::from_millis(clamp_tap_max_ms(tap_max_ms)),
+            double_window: Duration::from_millis(clamp_double_tap_ms(double_window_ms)),
         }
     }
 }
@@ -60,6 +89,9 @@ pub struct GestureMachine {
     second_press: Option<Instant>,
     /// Taps that begin before this instant are ignored (3rd+ taps).
     ignore_until: Option<Instant>,
+    /// A busy-pipeline tap that arrived before the previous tap was
+    /// classified; it may still complete a double-tap with it.
+    early_second: Option<Tap>,
 }
 
 impl GestureMachine {
@@ -71,6 +103,14 @@ impl GestureMachine {
     /// A press of the main binding started.
     pub fn on_press(&mut self, at: Instant, timing: GestureTiming) -> Option<GestureAction> {
         let first = self.first_tap?;
+        if self.second_press.is_some() {
+            // The previous second press never resolved (cancelled, failed to
+            // start): the whole gesture is void. Never paste long after.
+            debug!("Dropping an unresolved tap gesture");
+            self.first_tap = None;
+            self.second_press = None;
+            return None;
+        }
         if at.saturating_duration_since(first.released_at) <= timing.double_window {
             self.second_press = Some(at);
             None
@@ -92,16 +132,30 @@ impl GestureMachine {
     ) -> Option<GestureAction> {
         if self.ignore_until.is_some_and(|until| pressed_at <= until) {
             debug!("Ignoring extra tap after a double-tap");
-            self.ignore_until = Some(released_at + timing.double_window);
+            self.ignore_until = Some(after(released_at, timing.double_window));
+            self.early_second = None;
             return None;
         }
         self.ignore_until = None;
+
+        if let Some(second) = self.early_second.take() {
+            if second.pressed_at >= released_at
+                && second.pressed_at.saturating_duration_since(released_at) <= timing.double_window
+            {
+                self.first_tap = None;
+                self.second_press = None;
+                self.ignore_until = Some(after(second.released_at, timing.double_window));
+                return Some(GestureAction::SwapLast {
+                    first_press: pressed_at,
+                });
+            }
+        }
 
         if let Some(first) = self.first_tap {
             if pressed_at.saturating_duration_since(first.released_at) <= timing.double_window {
                 self.first_tap = None;
                 self.second_press = None;
-                self.ignore_until = Some(released_at + timing.double_window);
+                self.ignore_until = Some(after(released_at, timing.double_window));
                 return Some(GestureAction::SwapLast {
                     first_press: first.pressed_at,
                 });
@@ -117,14 +171,22 @@ impl GestureMachine {
     }
 
     /// A tap that never reached the pipeline (released while the previous
-    /// tap was still being torn down). It can only complete a double-tap.
+    /// tap was still being torn down). It can only complete a double-tap:
+    /// with the waiting first tap, or with the previous press once that is
+    /// classified as a tap.
     pub fn on_busy_tap(
         &mut self,
         pressed_at: Instant,
         released_at: Instant,
         timing: GestureTiming,
     ) -> Option<GestureAction> {
-        self.first_tap?;
+        if self.first_tap.is_none() {
+            self.early_second = Some(Tap {
+                pressed_at,
+                released_at,
+            });
+            return None;
+        }
         self.on_tap(pressed_at, released_at, timing)
     }
 
@@ -133,14 +195,23 @@ impl GestureMachine {
     pub fn on_dictation(&mut self) -> Option<GestureAction> {
         self.second_press = None;
         self.ignore_until = None;
+        self.early_second = None;
         self.first_tap.take().map(|_| GestureAction::PasteLast)
+    }
+
+    /// A press was cancelled or never became a recording (start failed, the
+    /// pipeline dropped it). Any gesture in progress is void: nothing fires.
+    pub fn on_abandoned(&mut self) {
+        self.first_tap = None;
+        self.second_press = None;
+        self.early_second = None;
     }
 
     /// When [`GestureMachine::on_timer`] should run next.
     pub fn next_deadline(&self, timing: GestureTiming) -> Option<Instant> {
         match (self.first_tap, self.second_press) {
-            (Some(_), Some(pressed)) => Some(pressed + STALE_SECOND_PRESS),
-            (Some(first), None) => Some(first.released_at + timing.double_window),
+            (Some(_), Some(pressed)) => Some(after(pressed, STALE_SECOND_PRESS)),
+            (Some(first), None) => Some(after(first.released_at, timing.double_window)),
             _ => None,
         }
     }
@@ -155,7 +226,7 @@ impl GestureMachine {
                 }
                 None
             }
-            None if now >= first.released_at + timing.double_window => {
+            None if now >= after(first.released_at, timing.double_window) => {
                 self.first_tap = None;
                 Some(GestureAction::PasteLast)
             }
@@ -188,20 +259,50 @@ fn with_machine<T>(f: impl FnOnce(&mut GestureMachine) -> T) -> T {
     f(guard.get_or_insert_with(GestureMachine::default))
 }
 
-/// Whether the delayed recording overlay was shown for the current press
-/// (a tap must not hide a notice it never replaced).
-static PRESS_OVERLAY_SHOWN: AtomicBool = AtomicBool::new(false);
+/// The held-back recording overlay of the current press: still pending, shown,
+/// or closed (stop began; it must not appear any more).
+const OVERLAY_PENDING: u8 = 0;
+const OVERLAY_SHOWN: u8 = 1;
+const OVERLAY_CLOSED: u8 = 2;
+static PRESS_OVERLAY: Mutex<u8> = Mutex::new(OVERLAY_SHOWN);
 
-pub fn reset_press_overlay() {
-    PRESS_OVERLAY_SHOWN.store(false, Ordering::Release);
+fn press_overlay() -> std::sync::MutexGuard<'static, u8> {
+    PRESS_OVERLAY.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub fn mark_press_overlay_shown() {
-    PRESS_OVERLAY_SHOWN.store(true, Ordering::Release);
+/// A press started; `held_back` when its overlay waits for the tap window
+/// (otherwise it was shown right away).
+pub fn reset_press_overlay(held_back: bool) {
+    *press_overlay() = if held_back {
+        OVERLAY_PENDING
+    } else {
+        OVERLAY_SHOWN
+    };
 }
 
-pub fn press_overlay_shown() -> bool {
-    PRESS_OVERLAY_SHOWN.load(Ordering::Acquire)
+/// Show the held-back overlay via `show` (which returns `None` when it
+/// decided not to), unless stop already began. Serialised with
+/// [`close_press_overlay`], so the recording overlay can never land on top of
+/// the working state.
+pub fn try_show_press_overlay(show: impl FnOnce() -> Option<()>) -> bool {
+    let mut state = press_overlay();
+    if *state != OVERLAY_PENDING {
+        return false;
+    }
+    if show().is_some() {
+        *state = OVERLAY_SHOWN;
+        return true;
+    }
+    false
+}
+
+/// Stop began: the held-back overlay may no longer appear. Returns whether
+/// the recording overlay is on screen for this press.
+pub fn close_press_overlay() -> bool {
+    let mut state = press_overlay();
+    let shown = *state == OVERLAY_SHOWN;
+    *state = OVERLAY_CLOSED;
+    shown
 }
 
 /// Gestures apply to this binding with the current settings.
@@ -209,19 +310,65 @@ pub fn active_for(binding_id: &str, settings: &AppSettings) -> bool {
     binding_id == "transcribe" && settings.tap_gestures_active()
 }
 
-/// Coordinator: a raw press edge of a transcribe binding.
+/* Settings cache: the press path runs on every key press, so it must not
+ * deserialize the full settings. Refreshed on every settings read/write
+ * (see `cockpit::sync_settings`). */
+
+const CACHE_UNKNOWN: u8 = 0;
+const CACHE_OFF: u8 = 1;
+const CACHE_ON: u8 = 2;
+static CACHED_ACTIVE: AtomicU8 = AtomicU8::new(CACHE_UNKNOWN);
+static CACHED_TAP_MAX_MS: AtomicU64 = AtomicU64::new(0);
+static CACHED_DOUBLE_MS: AtomicU64 = AtomicU64::new(0);
+
+pub fn cache_settings(settings: &AppSettings) {
+    CACHED_TAP_MAX_MS.store(settings.tap_max_duration_ms, Ordering::Relaxed);
+    CACHED_DOUBLE_MS.store(settings.double_tap_window_ms, Ordering::Relaxed);
+    let active = if settings.tap_gestures_active() {
+        CACHE_ON
+    } else {
+        CACHE_OFF
+    };
+    CACHED_ACTIVE.store(active, Ordering::Release);
+}
+
+/// Gesture timing when gestures are active (from the cache).
+fn cached_timing(app: &AppHandle) -> Option<GestureTiming> {
+    if CACHED_ACTIVE.load(Ordering::Acquire) == CACHE_UNKNOWN {
+        cache_settings(&get_settings(app));
+    }
+    (CACHED_ACTIVE.load(Ordering::Acquire) == CACHE_ON).then(|| {
+        GestureTiming::from_ms(
+            CACHED_TAP_MAX_MS.load(Ordering::Relaxed),
+            CACHED_DOUBLE_MS.load(Ordering::Relaxed),
+        )
+    })
+}
+
+/// Coordinator: a confirmed press of a transcribe binding (auto-repeat and
+/// debounced presses filtered out).
 pub fn on_main_press(app: &AppHandle, binding_id: &str, at: Instant) {
-    let settings = get_settings(app);
-    if !active_for(binding_id, &settings) {
+    if binding_id != "transcribe" {
         return;
     }
-    let timing = GestureTiming::from_settings(&settings);
+    let Some(timing) = cached_timing(app) else {
+        return;
+    };
     if let Some(action) = with_machine(|m| m.on_press(at, timing)) {
         execute(app, action);
     }
 }
 
-/// Coordinator: a raw release edge of a transcribe binding.
+/// A press was cancelled or never turned into a classified recording.
+pub fn abandon() {
+    let mut guard = MACHINE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(machine) = guard.as_mut() {
+        machine.on_abandoned();
+    }
+}
+
+/// Coordinator: a confirmed release of a transcribe binding (after the
+/// auto-repeat grace).
 pub fn on_main_release(binding_id: &str, at: Instant) {
     if binding_id == "transcribe" {
         *LAST_RELEASE.lock().unwrap_or_else(|e| e.into_inner()) = Some(at);
@@ -255,12 +402,16 @@ pub fn on_busy_release(
     pressed_at: Instant,
     released_at: Instant,
 ) {
-    let settings = get_settings(app);
-    if !active_for(binding_id, &settings) {
+    if binding_id != "transcribe" {
         return;
     }
-    let timing = GestureTiming::from_settings(&settings);
+    let Some(timing) = cached_timing(app) else {
+        return;
+    };
     if released_at.saturating_duration_since(pressed_at) >= timing.tap_max {
+        // A long hold that never recorded: whatever gesture was in progress
+        // is void.
+        abandon();
         return;
     }
     if let Some(action) = with_machine(|m| m.on_busy_tap(pressed_at, released_at, timing)) {
@@ -270,7 +421,8 @@ pub fn on_busy_release(
 
 /// Pipeline: the finished press was a tap.
 pub fn on_tap(app: &AppHandle, pressed_at: Instant, released_at: Instant) {
-    let timing = GestureTiming::from_settings(&get_settings(app));
+    let timing =
+        cached_timing(app).unwrap_or_else(|| GestureTiming::from_settings(&get_settings(app)));
     let action = with_machine(|m| m.on_tap(pressed_at, released_at, timing));
     match action {
         Some(action) => execute(app, action),
@@ -292,7 +444,7 @@ fn schedule_timer(app: &AppHandle, timing: GestureTiming) {
     let app = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
-        let timing = GestureTiming::from_settings(&get_settings(&app));
+        let timing = cached_timing(&app).unwrap_or(timing);
         let action = with_machine(|m| m.on_timer(Instant::now(), timing));
         match action {
             Some(action) => execute(&app, action),
@@ -447,6 +599,53 @@ mod tests {
             m.on_busy_tap(ms(t, 1_200), ms(t, 1_260), TIMING),
             Some(GestureAction::SwapLast { .. })
         ));
+    }
+
+    #[test]
+    fn busy_tap_before_first_tap_is_classified_still_swaps() {
+        let t = Instant::now();
+        let mut m = GestureMachine::default();
+        // Tap 2 is released while tap 1 is still in the pipeline.
+        assert_eq!(m.on_busy_tap(ms(t, 200), ms(t, 260), TIMING), None);
+        assert_eq!(
+            m.on_tap(t, ms(t, 100), TIMING),
+            Some(GestureAction::SwapLast { first_press: t })
+        );
+        assert_eq!(m.next_deadline(TIMING), None);
+    }
+
+    #[test]
+    fn abandoned_press_voids_the_gesture() {
+        let t = Instant::now();
+        let mut m = GestureMachine::default();
+        m.on_tap(t, ms(t, 100), TIMING);
+        m.on_press(ms(t, 200), TIMING);
+        m.on_abandoned();
+        assert_eq!(m.next_deadline(TIMING), None);
+        assert_eq!(m.on_timer(ms(t, 5_000), TIMING), None);
+    }
+
+    #[test]
+    fn unresolved_second_press_never_pastes_on_a_later_press() {
+        let t = Instant::now();
+        let mut m = GestureMachine::default();
+        m.on_tap(t, ms(t, 100), TIMING);
+        assert_eq!(m.on_press(ms(t, 200), TIMING), None);
+        // That press never resolved; much later the user presses again.
+        assert_eq!(m.on_press(ms(t, 20_000), TIMING), None);
+        assert_eq!(m.next_deadline(TIMING), None);
+    }
+
+    #[test]
+    fn timing_is_clamped_to_supported_ranges() {
+        let wild = GestureTiming::from_ms(u64::MAX, 0);
+        assert_eq!(wild.tap_max, Duration::from_millis(400));
+        assert_eq!(wild.double_window, Duration::from_millis(150));
+        let t = Instant::now();
+        let mut m = GestureMachine::default();
+        // No overflow panic even with extreme instants.
+        m.on_tap(t, t, wild);
+        assert!(m.next_deadline(wild).is_some());
     }
 
     #[test]

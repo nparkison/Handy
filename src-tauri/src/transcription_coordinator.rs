@@ -11,7 +11,19 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
 const DEBOUNCE: Duration = Duration::from_millis(30);
-const RELEASE_GRACE: Duration = Duration::from_millis(50);
+/// How long a key-up waits for an X11 auto-repeat key-down that cancels it.
+pub const RELEASE_GRACE: Duration = Duration::from_millis(50);
+
+/// A confirmed edge of a key for tap gestures: auto-repeat pairs, debounced
+/// presses and repeats of a held key never show up here, and releases only
+/// once [`RELEASE_GRACE`] has confirmed them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GestureEdge {
+    Press(String, Instant),
+    Release(String, Instant),
+    /// The press will never be classified (cancelled, failed to start).
+    Abandoned,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PttAction {
@@ -230,6 +242,8 @@ struct CoordinatorState {
     /// A remembered press released while busy and forgotten, as
     /// (binding, pressed, released): may be the second tap of a double-tap.
     forgotten_press: Option<(String, Instant, Instant)>,
+    /// Edges for tap gestures, drained by the coordinator thread.
+    gesture_edges: Vec<GestureEdge>,
 }
 
 impl CoordinatorState {
@@ -242,6 +256,7 @@ impl CoordinatorState {
             pending_press: None,
             last_hold: None,
             forgotten_press: None,
+            gesture_edges: Vec::new(),
         }
     }
 
@@ -282,6 +297,7 @@ impl CoordinatorState {
             held_binding,
         ) {
             PttAction::CancelRelease => {
+                // An auto-repeat pair: the key never went up.
                 self.pending_release = None;
                 return None;
             }
@@ -312,6 +328,12 @@ impl CoordinatorState {
             }
             self.last_press = Some(now);
         }
+        if !input.is_pressed && !input.external {
+            // A release that was not deferred (toggle, locked session, or a
+            // key that is not held as far as we know): already final.
+            self.gesture_edges
+                .push(GestureEdge::Release(input.binding_id.clone(), now));
+        }
 
         // A busy pipeline can't accept lifecycle changes now: classify the
         // input against any already-remembered press instead of dropping it
@@ -337,6 +359,10 @@ impl CoordinatorState {
                         "Remembering press for '{}': pipeline busy",
                         input.binding_id
                     );
+                    if !input.external {
+                        self.gesture_edges
+                            .push(GestureEdge::Press(input.binding_id.clone(), now));
+                    }
                     self.pending_press = Some(PendingPress {
                         // Toggle never ends on a release: locked from the start.
                         locked: input.mode == ShortcutActivation::Toggle,
@@ -359,6 +385,10 @@ impl CoordinatorState {
         if input.is_pressed {
             match &self.stage {
                 Stage::Idle => {
+                    if !input.external {
+                        self.gesture_edges
+                            .push(GestureEdge::Press(input.binding_id.clone(), now));
+                    }
                     // Toggle never ends on a release: locked from the start.
                     let locked = input.mode == ShortcutActivation::Toggle;
                     return Some(self.begin_recording(
@@ -405,6 +435,10 @@ impl CoordinatorState {
     /// holding — the live recording, or a press remembered while busy.
     fn on_grace_expired(&mut self) -> Option<Effect> {
         let pending = self.pending_release.take()?;
+        self.gesture_edges.push(GestureEdge::Release(
+            pending.binding_id.clone(),
+            pending.released_at,
+        ));
         match &self.stage {
             Stage::Recording(id) if *id == pending.binding_id => self.finish_hold(
                 pending.binding_id,
@@ -484,7 +518,13 @@ impl CoordinatorState {
     }
 
     fn on_cancel(&mut self, recording_was_active: bool) {
-        self.pending_release = None;
+        if let Some(pending) = self.pending_release.take() {
+            self.gesture_edges.push(GestureEdge::Release(
+                pending.binding_id,
+                pending.released_at,
+            ));
+        }
+        self.gesture_edges.push(GestureEdge::Abandoned);
         // An explicit cancel abandons any remembered start too — the user
         // asked for silence, not a deferred recording.
         self.pending_press = None;
@@ -516,6 +556,9 @@ impl CoordinatorState {
     /// Reconcile the optimistic `Stage::Recording` after the executor reports
     /// whether recording actually began (microphone access can be denied).
     fn on_start_result(&mut self, binding_id: &str, started: bool) {
+        if !started {
+            self.gesture_edges.push(GestureEdge::Abandoned);
+        }
         if !started && matches!(&self.stage, Stage::Recording(id) if id == binding_id) {
             self.stage = Stage::Idle;
             self.hold = None;
@@ -588,7 +631,9 @@ impl TranscriptionCoordinator {
                         match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                             Ok(cmd) => cmd,
                             Err(mpsc::RecvTimeoutError::Timeout) => {
-                                if let Some(effect) = state.on_grace_expired() {
+                                let effect = state.on_grace_expired();
+                                dispatch_gesture_edges(&app, &mut state);
+                                if let Some(effect) = effect {
                                     run_effect(&app, &mut state, effect);
                                 }
                                 if let Some((binding, pressed, released)) =
@@ -610,21 +655,18 @@ impl TranscriptionCoordinator {
                     match cmd {
                         Command::Input(input) => {
                             let now = Instant::now();
-                            // Raw edges for tap gestures (before debounce/grace).
-                            if !input.external {
-                                if input.is_pressed {
-                                    gestures::on_main_press(&app, &input.binding_id, now);
-                                } else {
-                                    gestures::on_main_release(&input.binding_id, now);
-                                }
-                            }
-                            if let Some(effect) = state.on_input(input, now) {
+                            let effect = state.on_input(input, now);
+                            dispatch_gesture_edges(&app, &mut state);
+                            if let Some(effect) = effect {
                                 run_effect(&app, &mut state, effect);
                             }
                         }
                         Command::Cancel {
                             recording_was_active,
-                        } => state.on_cancel(recording_was_active),
+                        } => {
+                            state.on_cancel(recording_was_active);
+                            dispatch_gesture_edges(&app, &mut state);
+                        }
                         Command::ProcessingFinished => {
                             if let Some(effect) = state.on_processing_finished() {
                                 run_effect(&app, &mut state, effect);
@@ -725,6 +767,17 @@ impl TranscriptionCoordinator {
     }
 }
 
+/// Hand the confirmed gesture edges to the tap-gesture machine.
+fn dispatch_gesture_edges(app: &AppHandle, state: &mut CoordinatorState) {
+    for edge in state.gesture_edges.drain(..) {
+        match edge {
+            GestureEdge::Press(binding, at) => gestures::on_main_press(app, &binding, at),
+            GestureEdge::Release(binding, at) => gestures::on_main_release(&binding, at),
+            GestureEdge::Abandoned => gestures::abandon(),
+        }
+    }
+}
+
 fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
     match effect {
         Effect::Start {
@@ -733,6 +786,7 @@ fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
         } => {
             let started = start(app, &binding_id, &hotkey_string);
             state.on_start_result(&binding_id, started);
+            dispatch_gesture_edges(app, state);
         }
         Effect::Stop {
             binding_id,
@@ -1020,6 +1074,55 @@ mod tests {
             Stage::Recording(BINDING.to_string()),
             "recording must remain active across the entire auto-repeat burst"
         );
+    }
+
+    /// Tap gestures only see confirmed edges: an X11 auto-repeat burst is one
+    /// press, and the release reaches them only after the grace confirmed it,
+    /// stamped with the real key-up time.
+    #[test]
+    fn autorepeat_burst_yields_one_gesture_press_and_a_confirmed_release() {
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        let mut clock = t0;
+        for ev in autorepeat_burst() {
+            clock += Duration::from_millis(5);
+            state.on_input(ptt_input(matches!(ev, Ev::Press)), clock);
+        }
+        let presses = state
+            .gesture_edges
+            .iter()
+            .filter(|e| matches!(e, GestureEdge::Press(..)))
+            .count();
+        assert_eq!(presses, 1);
+        assert!(!state
+            .gesture_edges
+            .iter()
+            .any(|e| matches!(e, GestureEdge::Release(..))));
+        state.gesture_edges.clear();
+
+        let released = clock + Duration::from_millis(5);
+        state.on_input(ptt_input(false), released);
+        assert!(
+            state.gesture_edges.is_empty(),
+            "release waits for the grace"
+        );
+        state.on_grace_expired();
+        assert_eq!(
+            state.gesture_edges,
+            vec![GestureEdge::Release(BINDING.to_string(), released)]
+        );
+    }
+
+    #[test]
+    fn cancel_and_failed_start_abandon_the_gesture() {
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        state.on_input(ptt_input(true), t0);
+        state.on_start_result(BINDING, false);
+        assert!(state.gesture_edges.contains(&GestureEdge::Abandoned));
+        state.gesture_edges.clear();
+        state.on_cancel(true);
+        assert_eq!(state.gesture_edges, vec![GestureEdge::Abandoned]);
     }
 
     /// Complements the burst test: once the key is genuinely released and the

@@ -6,11 +6,11 @@
 //! text right away and keeps the task handle: the request continues in the
 //! background (bounded by [`BACKGROUND_CAP`]) and only ever writes to History.
 
-use futures_util::future::{select, Either};
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
-use tokio::sync::oneshot;
+use tokio::sync::mpsc;
 
 /// After a miss, the background request is abandoned after this long.
 pub const BACKGROUND_CAP: Duration = Duration::from_secs(30);
@@ -39,24 +39,57 @@ impl CleanupOutcome {
 }
 
 /// Fired by the cleanup task right before its first LLM request goes out.
-/// Later calls are no-ops. Dropping it unfired means "no request was made".
-pub struct RequestSent(Mutex<Option<oneshot::Sender<()>>>);
+/// Later [`RequestSent::mark`] calls are no-ops. Dropping it unfired means
+/// "no request was made".
+pub struct RequestSent {
+    tx: Mutex<Option<mpsc::UnboundedSender<()>>>,
+    marked: AtomicBool,
+}
+
+/// The receiving half of [`RequestSent`], consumed by [`race_with_deadline`].
+pub struct SentSignal(mpsc::UnboundedReceiver<()>);
 
 impl RequestSent {
-    pub fn new() -> (Self, oneshot::Receiver<()>) {
-        let (tx, rx) = oneshot::channel();
-        (Self(Mutex::new(Some(tx))), rx)
+    pub fn new() -> (Self, SentSignal) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                tx: Mutex::new(Some(tx)),
+                marked: AtomicBool::new(false),
+            },
+            SentSignal(rx),
+        )
     }
 
     /// A signal nobody listens to, for callers without a deadline.
     pub fn detached() -> Self {
-        Self(Mutex::new(None))
+        Self {
+            tx: Mutex::new(None),
+            marked: AtomicBool::new(false),
+        }
+    }
+
+    fn send(&self) {
+        if let Some(tx) = self.tx.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let _ = tx.send(());
+        }
     }
 
     pub fn mark(&self) {
-        let sender = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(sender) = sender {
-            let _ = sender.send(());
+        if !self.marked.swap(true, Ordering::AcqRel) {
+            self.send();
+        }
+    }
+
+    /// The first request failed fast and a fallback request is going out
+    /// (e.g. the model rejected the screenshot): give the fallback a fresh
+    /// deadline. Only possible while the deadline has not been missed yet,
+    /// so the total wait is at most twice the limit.
+    pub fn restart(&self) {
+        if self.marked.load(Ordering::Acquire) {
+            self.send();
+        } else {
+            self.mark();
         }
     }
 }
@@ -79,7 +112,7 @@ impl<T> Drop for AbortOnDrop<T> {
 /// the caller still owns it.
 pub async fn race_with_deadline<F>(
     task: &mut F,
-    sent: oneshot::Receiver<()>,
+    sent: SentSignal,
     deadline: Option<Duration>,
 ) -> Option<F::Output>
 where
@@ -88,18 +121,30 @@ where
     let Some(deadline) = deadline else {
         return Some(task.await);
     };
+    let SentSignal(mut sent) = sent;
 
     // Phase 1: until the request goes out there is no clock running.
-    match select(&mut *task, sent).await {
-        Either::Left((output, _)) => return Some(output),
-        // Sent, or the signal was dropped unfired (the task is finishing
-        // without a request): either way only the task is left to wait for.
-        Either::Right((Ok(()), _)) => {}
-        Either::Right((Err(_), _)) => return Some(task.await),
+    tokio::select! {
+        output = &mut *task => return Some(output),
+        signal = sent.recv() => {
+            if signal.is_none() {
+                // Dropped unfired: the task is finishing without a request.
+                return Some(task.await);
+            }
+        }
     }
 
-    // Phase 2: the request is in flight; the clock runs.
-    tokio::time::timeout(deadline, &mut *task).await.ok()
+    // Phase 2: the request is in flight; the clock runs. A restart (a
+    // fallback request) starts it over.
+    loop {
+        let sleep = tokio::time::sleep(deadline);
+        tokio::pin!(sleep);
+        tokio::select! {
+            output = &mut *task => return Some(output),
+            _ = &mut sleep => return None,
+            Some(()) = sent.recv() => continue,
+        }
+    }
 }
 
 /// Whether a late cleanup result should offer "Cleanup ready · Swap".
@@ -206,6 +251,25 @@ mod tests {
             signal.mark();
             let mut task = after(30, "slow");
             assert_eq!(race_with_deadline(&mut task, rx, None).await, Some("slow"));
+        });
+    }
+
+    #[test]
+    fn fallback_request_gets_a_fresh_deadline() {
+        run(async {
+            let (signal, rx) = RequestSent::new();
+            // A 100 ms rejected image request, then a 100 ms text request:
+            // 200 ms in total, over the 150 ms limit, but each attempt is in
+            // time, so it is not a miss.
+            let mut task: Boxed<&str> = Box::pin(async move {
+                signal.mark();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                signal.restart();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                "cleaned"
+            });
+            let out = race_with_deadline(&mut task, rx, Some(Duration::from_millis(150))).await;
+            assert_eq!(out, Some("cleaned"));
         });
     }
 

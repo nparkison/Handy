@@ -361,6 +361,9 @@ pub struct StoppedRecording {
     pub samples: Vec<f32>,
     /// Pre-VAD signal statistics of the capture.
     pub stats: CaptureStats,
+    /// The same statistics for post-press audio only (no pre-roll): what a
+    /// tap gesture is judged on.
+    pub live_stats: CaptureStats,
     /// Device the audio came from, when the backend could name it.
     pub device_name: Option<String>,
     /// Wall-clock time between the recording request and the stop request.
@@ -1060,18 +1063,23 @@ impl AudioRecordingManager {
 
                 // A failed stop is the device-error path, not dead air: report
                 // empty stats with no wall time so the guard stays out of it.
-                let (samples, stats, device_name, wall_ms) =
+                let (samples, (stats, live_stats), device_name, wall_ms) =
                     if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
                         match rec.stop() {
-                            Ok(buf) => (buf, rec.last_capture_stats(), rec.device_name(), wall_ms),
+                            Ok(buf) => (
+                                buf,
+                                (rec.last_capture_stats(), rec.last_live_capture_stats()),
+                                rec.device_name(),
+                                wall_ms,
+                            ),
                             Err(e) => {
                                 error!("stop() failed: {e}");
-                                (Vec::new(), CaptureStats::default(), rec.device_name(), 0)
+                                (Vec::new(), Default::default(), rec.device_name(), 0)
                             }
                         }
                     } else {
                         error!("Recorder not available");
-                        (Vec::new(), CaptureStats::default(), None, 0)
+                        (Vec::new(), Default::default(), None, 0)
                     };
 
                 *self.is_recording.lock().unwrap() = false;
@@ -1104,6 +1112,7 @@ impl AudioRecordingManager {
                 Some(StoppedRecording {
                     samples,
                     stats,
+                    live_stats,
                     device_name,
                     wall_ms,
                 })
