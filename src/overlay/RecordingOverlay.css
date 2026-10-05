@@ -466,3 +466,84 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* ============================================================
+   Notice (overlay_notice.rs): icon + one short line + optional action. Grows
+   to its content up to --ov-notice-w; the native window (OVERLAY_NOTICE_*
+   in overlay.rs) is sized for that maximum.
+   ============================================================ */
+:root {
+  --ov-notice-w: 420px;
+}
+.scard.notice {
+  width: auto;
+  min-width: var(--ov-rest-w);
+  max-width: min(var(--ov-notice-w), calc(100vw - 2px));
+  min-height: var(--ov-base-h);
+  box-sizing: border-box;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 6px 6px 14px;
+  border-radius: 20px;
+  /* Fade only (via .ov-fade), so reduced-motion users get no pop or slide. */
+  animation: none;
+}
+.scard.notice .nicon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  display: flex;
+  color: var(--s-accent);
+}
+.scard.notice.warning .nicon {
+  color: var(--color-warning);
+}
+.scard.notice .nicon svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+.scard.notice .nmsg {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 3px 4px 3px 0;
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--color-text);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow-wrap: anywhere;
+}
+.scard.notice .naction {
+  flex: none;
+  max-width: 150px;
+  min-height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--s-border);
+  border-radius: 14px;
+  background: var(--s-accent-soft);
+  color: var(--color-text);
+  font: 600 12px var(--s-font);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease;
+}
+.scard.notice .naction:hover {
+  border-color: var(--s-accent);
+}
+.scard.notice .naction:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+/* Single-line notices without an action keep the right padding symmetric. */
+.scard.notice .nmsg:last-child {
+  padding-right: 8px;
+}

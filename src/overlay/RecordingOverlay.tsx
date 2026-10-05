@@ -11,8 +11,14 @@ import type {
 } from "@/bindings";
 import i18n, { syncLanguageFromSettings } from "@/i18n";
 import { getLanguageDirection } from "@/lib/utils/rtl";
+import { type OverlayNotice, truncateParams } from "./notice";
 
-type OverlayState = "recording" | "streaming" | "transcribing" | "processing";
+type OverlayState =
+  | "recording"
+  | "streaming"
+  | "transcribing"
+  | "processing"
+  | "notice";
 
 // Number of reactive bars in the waveform (the simple, smoothed style shared by
 // every overlay form). Mic levels arrive as 16 FFT buckets; we take the first N.
@@ -52,10 +58,40 @@ const RecordingOverlay: React.FC = () => {
   const pinnedRef = useRef(true);
   const direction = getLanguageDirection(i18n.language);
 
+  // Transient notice (see overlay_notice.rs). The backend hides the overlay
+  // when we report the timer ran out; hovering pauses the timer.
+  const [notice, setNotice] = useState<OverlayNotice | null>(null);
+  const [noticeHovered, setNoticeHovered] = useState(false);
+  const [noticeActionPending, setNoticeActionPending] = useState(false);
+  // Time left on the current notice, keyed by id so a pausing cleanup can't
+  // eat into the next notice's budget.
+  const noticeRemainingRef = useRef({ id: 0, ms: 0 });
+  // Show events finish asynchronously (settings I/O); only the newest one may
+  // apply its state, so a slow notice can never override a newer press.
+  const showSeqRef = useRef(0);
+
   useEffect(() => {
+    const readPlacement = async () => {
+      // The Live panel flows downward from a top overlay and upward from a
+      // bottom one; read the placement so the layout can flip to match.
+      try {
+        const settings = await commands.getAppSettings();
+        if (settings.status === "ok") {
+          setPosition(
+            settings.data.overlay_position === "top" ? "top" : "bottom",
+          );
+        }
+      } catch {
+        // Keep the previous/default placement if settings can't be read.
+      }
+    };
+
     const setupEventListeners = async () => {
       const unlistenShow = await listen("show-overlay", async (event) => {
         const overlayState = event.payload as OverlayState;
+        const seq = ++showSeqRef.current;
+        // A dictation state always replaces a notice.
+        setNotice(null);
         // Reset synchronously before settings I/O. A fast microphone can emit
         // recording-ready while the awaits below are in flight; resetting after
         // them would overwrite that event and leave the overlay stuck arming.
@@ -67,18 +103,8 @@ const RecordingOverlay: React.FC = () => {
         }
 
         await syncLanguageFromSettings();
-        // The Live panel flows downward from a top overlay and upward from a
-        // bottom one; read the placement so the layout can flip to match.
-        try {
-          const settings = await commands.getAppSettings();
-          if (settings.status === "ok") {
-            setPosition(
-              settings.data.overlay_position === "top" ? "top" : "bottom",
-            );
-          }
-        } catch {
-          // Keep the previous/default placement if settings can't be read.
-        }
+        await readPlacement();
+        if (seq !== showSeqRef.current) return;
         setState(overlayState);
         if (overlayState === "streaming") {
           setPhase("listening");
@@ -93,6 +119,25 @@ const RecordingOverlay: React.FC = () => {
         setIsVisible(false);
         setCaptureReady(false);
       });
+
+      const unlistenNotice = await listen<OverlayNotice>(
+        "overlay-notice",
+        async (event) => {
+          const seq = ++showSeqRef.current;
+          await syncLanguageFromSettings();
+          await readPlacement();
+          if (seq !== showSeqRef.current) return;
+          noticeRemainingRef.current = {
+            id: event.payload.id,
+            ms: event.payload.duration_ms,
+          };
+          setNoticeHovered(false);
+          setNoticeActionPending(false);
+          setNotice(event.payload);
+          setState("notice");
+          setIsVisible(true);
+        },
+      );
 
       const unlistenReady = await listen("recording-ready", () => {
         setElapsed(0);
@@ -124,6 +169,7 @@ const RecordingOverlay: React.FC = () => {
       return () => {
         unlistenShow();
         unlistenHide();
+        unlistenNotice();
         unlistenReady();
         unlistenLevel();
         unlistenStream();
@@ -140,6 +186,30 @@ const RecordingOverlay: React.FC = () => {
     const id = setInterval(() => setElapsed((e) => e + 1), 1000);
     return () => clearInterval(id);
   }, [state, isVisible, captureReady]);
+
+  // Notice timer: counts down only while the notice is shown, not hovered and
+  // no action is running; pausing keeps the remaining time.
+  useEffect(() => {
+    if (state !== "notice" || !notice || !isVisible) return;
+    if (noticeHovered || noticeActionPending) return;
+    const started = Date.now();
+    const remaining = noticeRemainingRef.current;
+    const timer = setTimeout(
+      () => {
+        commands.dismissOverlayNotice(notice.id).catch((e) => {
+          console.warn("Failed to dismiss overlay notice:", e);
+        });
+      },
+      remaining.id === notice.id ? remaining.ms : notice.duration_ms,
+    );
+    return () => {
+      clearTimeout(timer);
+      const current = noticeRemainingRef.current;
+      if (current.id === notice.id) {
+        current.ms = Math.max(0, current.ms - (Date.now() - started));
+      }
+    };
+  }, [state, notice, isVisible, noticeHovered, noticeActionPending]);
 
   // Stick to the bottom as text streams in — but only while pinned, so a user who
   // has scrolled up to read history isn't yanked back down by the next chunk.
@@ -226,6 +296,100 @@ const RecordingOverlay: React.FC = () => {
       <div className="sbase-r">{showCancel && cancelBtn}</div>
     </div>
   );
+
+  // ---- Notice: icon + one short line + optional action button ----
+  if (state === "notice" && notice) {
+    const isWarning = notice.kind === "warning";
+    const message = t(
+      notice.message.key,
+      truncateParams(notice.message.params),
+    );
+    const fullMessage = t(notice.message.key, notice.message.params);
+    const action = notice.action;
+    const runAction = () => {
+      if (noticeActionPending) return;
+      setNoticeActionPending(true);
+      commands.runOverlayNoticeAction(notice.id).catch((e) => {
+        console.warn("Failed to run overlay notice action:", e);
+      });
+    };
+
+    return (
+      <div
+        dir={direction}
+        className={`ov-stage ${position} ov-fade ${isVisible ? "show" : ""}`}
+      >
+        <div
+          className={`scard notice ${notice.kind}`}
+          onMouseEnter={() => setNoticeHovered(true)}
+          onMouseLeave={() => setNoticeHovered(false)}
+        >
+          <span
+            className="nicon"
+            role="img"
+            aria-label={
+              isWarning ? t("overlay.notice.warning") : t("overlay.notice.info")
+            }
+          >
+            {isWarning ? (
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <path
+                  d="M8 2.2 L14.4 13.4 H1.6 Z"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinejoin="round"
+                />
+                <path
+                  d="M8 6.4 V9.4"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                />
+                <circle cx="8" cy="11.4" r="0.85" fill="currentColor" />
+              </svg>
+            ) : (
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <circle
+                  cx="8"
+                  cy="8"
+                  r="6.2"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                />
+                <path
+                  d="M8 7.2 V11.2"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                />
+                <circle cx="8" cy="4.9" r="0.85" fill="currentColor" />
+              </svg>
+            )}
+          </span>
+          <span
+            className="nmsg"
+            role={notice.urgent ? "alert" : "status"}
+            aria-live={notice.urgent ? "assertive" : "polite"}
+            title={fullMessage !== message ? fullMessage : undefined}
+          >
+            {message}
+          </span>
+          {action && (
+            <button
+              className="naction"
+              onClick={runAction}
+              disabled={noticeActionPending}
+              title={t(action.key, action.params)}
+            >
+              {t(action.key, truncateParams(action.params))}
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   // ---- Live overlay: a pill that sculpts open into a panel ----
   if (state === "streaming") {

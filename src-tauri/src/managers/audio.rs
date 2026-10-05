@@ -4,7 +4,7 @@ use crate::audio_toolkit::{
         frames_for_duration_ms, EarshotVad, SmoothedVad, VAD_OFFLINE_HANGOVER_MS, VAD_ONSET_MS,
         VAD_PREFILL_MS, VAD_STREAMING_HANGOVER_MS,
     },
-    AudioRecorder, SileroVad, VadPolicy, VoiceActivityDetector, MAX_PRE_ROLL_MS,
+    AudioRecorder, CaptureStats, SileroVad, VadPolicy, VoiceActivityDetector, MAX_PRE_ROLL_MS,
 };
 use crate::helpers::clamshell;
 use crate::managers::transcription::StreamRouter;
@@ -355,6 +355,18 @@ fn create_audio_recorder(
 
 /* ──────────────────────────────────────────────────────────────── */
 
+/// A finished recording plus what the dead-air guard needs to judge it.
+pub struct StoppedRecording {
+    /// Captured audio (VAD-filtered when VAD is on; padded when very short).
+    pub samples: Vec<f32>,
+    /// Pre-VAD signal statistics of the capture.
+    pub stats: CaptureStats,
+    /// Device the audio came from, when the backend could name it.
+    pub device_name: Option<String>,
+    /// Wall-clock time between the recording request and the stop request.
+    pub wall_ms: u64,
+}
+
 /// One recording session's first-sample notification. Waiting on this never
 /// blocks the shortcut coordinator: callers hand it to a dedicated worker.
 pub struct RecordingReadiness {
@@ -407,6 +419,9 @@ pub struct AudioRecordingManager {
     /// Press-time pre-roll length (ms), shared with every recorder this
     /// manager creates so the setting applies to a warm stream immediately.
     pre_roll_ms: Arc<AtomicU64>,
+    /// When the active recording was requested; read at stop for the
+    /// dead-air guard's "no samples at all" check.
+    recording_started_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl AudioRecordingManager {
@@ -439,6 +454,7 @@ impl AudioRecordingManager {
             capture_generation: Arc::new(AtomicU64::new(0)),
             cached_device: Arc::new(Mutex::new(None)),
             pre_roll_ms: Arc::new(AtomicU64::new(settings.pre_roll_ms.min(MAX_PRE_ROLL_MS))),
+            recording_started_at: Arc::new(Mutex::new(None)),
         };
 
         // Always-on?  Open immediately.
@@ -853,6 +869,7 @@ impl AudioRecordingManager {
                     Ok(receiver) => {
                         let generation = self.capture_generation.fetch_add(1, Ordering::AcqRel) + 1;
                         *self.is_recording.lock().unwrap() = true;
+                        *self.recording_started_at.lock().unwrap() = Some(Instant::now());
                         self.set_state(
                             &mut state,
                             RecordingState::Recording {
@@ -994,7 +1011,14 @@ impl AudioRecordingManager {
         self.cancel_generation.load(Ordering::Acquire) != generation
     }
 
-    pub fn stop_recording(&self, binding_id: &str, cancel_generation: u64) -> Option<Vec<f32>> {
+    /// Stop the active recording and hand back its audio together with the
+    /// capture's signal statistics and source device (for the dead-air guard).
+    /// `None` when nothing was recording for `binding_id` or it was cancelled.
+    pub fn stop_recording(
+        &self,
+        binding_id: &str,
+        cancel_generation: u64,
+    ) -> Option<StoppedRecording> {
         self.invalidate_recording_readiness();
         let mut state = self.state.lock().unwrap();
 
@@ -1004,6 +1028,13 @@ impl AudioRecordingManager {
             } if active == binding_id => {
                 self.set_state(&mut state, RecordingState::Stopping);
                 drop(state);
+                let wall_ms = self
+                    .recording_started_at
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .map(|started| started.elapsed().as_millis() as u64)
+                    .unwrap_or(0);
 
                 // Optionally keep recording for a bit longer to capture trailing audio.
                 // This is only the explicit user setting; streaming VAD must not add
@@ -1027,18 +1058,21 @@ impl AudioRecordingManager {
                     }
                 }
 
-                let samples = if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
-                    match rec.stop() {
-                        Ok(buf) => buf,
-                        Err(e) => {
-                            error!("stop() failed: {e}");
-                            Vec::new()
+                // A failed stop is the device-error path, not dead air: report
+                // empty stats with no wall time so the guard stays out of it.
+                let (samples, stats, device_name, wall_ms) =
+                    if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
+                        match rec.stop() {
+                            Ok(buf) => (buf, rec.last_capture_stats(), rec.device_name(), wall_ms),
+                            Err(e) => {
+                                error!("stop() failed: {e}");
+                                (Vec::new(), CaptureStats::default(), rec.device_name(), 0)
+                            }
                         }
-                    }
-                } else {
-                    error!("Recorder not available");
-                    Vec::new()
-                };
+                    } else {
+                        error!("Recorder not available");
+                        (Vec::new(), CaptureStats::default(), None, 0)
+                    };
 
                 *self.is_recording.lock().unwrap() = false;
                 self.set_state(&mut self.state.lock().unwrap(), RecordingState::Idle);
@@ -1060,13 +1094,19 @@ impl AudioRecordingManager {
                 // Pad if very short
                 let s_len = samples.len();
                 // debug!("Got {} samples", s_len);
-                if s_len < WHISPER_SAMPLE_RATE && s_len > 0 {
+                let samples = if s_len < WHISPER_SAMPLE_RATE && s_len > 0 {
                     let mut padded = samples;
                     padded.resize(WHISPER_SAMPLE_RATE * 5 / 4, 0.0);
-                    Some(padded)
+                    padded
                 } else {
-                    Some(samples)
-                }
+                    samples
+                };
+                Some(StoppedRecording {
+                    samples,
+                    stats,
+                    device_name,
+                    wall_ms,
+                })
             }
             _ => None,
         }

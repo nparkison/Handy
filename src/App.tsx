@@ -172,7 +172,8 @@ function App() {
     };
   }, [t]);
 
-  // The tray's "Open History..." item asks the window to switch sections.
+  // The backend can ask the window to switch sections: the tray's "Open
+  // History..." item, and the dead-air notice's "Mic settings" (General).
   useEffect(() => {
     const unlisten = listen<string>("navigate-to-section", (event) => {
       const section = event.payload;

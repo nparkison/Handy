@@ -222,6 +222,8 @@ pub async fn set_selected_microphone(app: AppHandle, device_name: String) -> Res
         Some(device_name)
     };
     write_settings(&app, settings);
+    // A different device starts a fresh silent streak.
+    crate::dead_air::reset(&app);
 
     // Update the audio manager to use the new device. update_selected_device
     // can restart the cpal stream (blocking CoreAudio) — run it on a blocking

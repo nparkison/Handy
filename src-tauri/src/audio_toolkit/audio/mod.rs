@@ -1,4 +1,5 @@
 // Re-export all audio components
+mod clip_stats;
 mod device;
 mod pre_roll;
 mod recorder;
@@ -6,6 +7,7 @@ mod resampler;
 mod utils;
 mod visualizer;
 
+pub use clip_stats::{classify_clip, CaptureStats, ClipVerdict};
 pub use device::{list_input_devices, list_output_devices, CpalDeviceInfo};
 pub use pre_roll::MAX_PRE_ROLL_MS;
 pub use recorder::{

@@ -475,6 +475,9 @@ pub struct AppSettings {
     pub screen_context_enabled: bool,
     #[serde(default)]
     pub mute_while_recording: bool,
+    /// Dead-air guard: skip silent recordings and say which mic to check.
+    #[serde(default = "default_silent_mic_warning")]
+    pub silent_mic_warning: bool,
     #[serde(default)]
     pub append_trailing_space: bool,
     #[serde(default = "default_app_language")]
@@ -690,6 +693,10 @@ fn default_show_tray_icon() -> bool {
 }
 
 fn default_show_recent_dictations_in_tray() -> bool {
+    true
+}
+
+fn default_silent_mic_warning() -> bool {
     true
 }
 
@@ -1018,6 +1025,7 @@ pub fn get_default_settings() -> AppSettings {
         post_process_selected_prompt_id: None,
         screen_context_enabled: false,
         mute_while_recording: false,
+        silent_mic_warning: default_silent_mic_warning(),
         append_trailing_space: false,
         app_language: default_app_language(),
         theme: default_theme(),
