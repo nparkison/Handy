@@ -594,6 +594,11 @@
         "title": "Enganxament fiable (beta)",
         "description": "Restaura el porta-retalls només quan l'aplicació de destinació ha llegit la transcripció, en lloc de fer-ho després d'un retard fix. Pensat per evitar que s'enganxi el contingut antic del porta-retalls quan el sistema està carregat. Requereix un mètode d'enganxament amb el porta-retalls; només al macOS i al Windows."
       },
+      "prePressBuffer": {
+        "title": "Pre-Press Buffer",
+        "description": "Keep this much audio from just before you press the shortcut, so your first word isn't clipped. Only works while the microphone is already open. 0 = off.",
+        "needsWarmMic": "Needs Always-On Microphone or Keep Mic Open Between Transcriptions."
+      },
       "recordingBuffer": {
         "title": "Marge addicional d'enregistrament",
         "description": "Temps addicional (en mil·lisegons) durant el qual es continua enregistrant després de deixar anar la tecla per capturar l'àudio final. 0 = sense marge addicional."

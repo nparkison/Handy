@@ -580,6 +580,11 @@
         "title": "Collage fiable (Beta)",
         "description": "Restaure le presse-papiers uniquement après que l'application cible a réellement lu la transcription, au lieu d'attendre un délai fixe. Vise à corriger le collage de l'ancien contenu du presse-papiers lorsque le système est chargé. Nécessite une méthode de collage par presse-papiers ; macOS et Windows uniquement."
       },
+      "prePressBuffer": {
+        "title": "Pre-Press Buffer",
+        "description": "Keep this much audio from just before you press the shortcut, so your first word isn't clipped. Only works while the microphone is already open. 0 = off.",
+        "needsWarmMic": "Needs Always-On Microphone or Keep Mic Open Between Transcriptions."
+      },
       "recordingBuffer": {
         "title": "Tampon d'enregistrement supplémentaire",
         "description": "Temps supplémentaire (en millisecondes) pour continuer l'enregistrement après avoir relâché la touche, pour capturer l'audio restant. 0 = pas de tampon supplémentaire."

@@ -594,6 +594,11 @@
         "title": "Betrouwbaar plakken (Beta)",
         "description": "Herstel het klembord pas nadat de doelapp de transcriptie daadwerkelijk heeft gelezen, in plaats van na een vaste vertraging. Bedoeld om te verhelpen dat bij systeembelasting de oude klembordinhoud wordt geplakt. Vereist een plakmethode via het klembord; alleen macOS en Windows."
       },
+      "prePressBuffer": {
+        "title": "Pre-Press Buffer",
+        "description": "Keep this much audio from just before you press the shortcut, so your first word isn't clipped. Only works while the microphone is already open. 0 = off.",
+        "needsWarmMic": "Needs Always-On Microphone or Keep Mic Open Between Transcriptions."
+      },
       "recordingBuffer": {
         "title": "Extra opnamebuffer",
         "description": "Extra tijd (in milliseconden) om te blijven opnemen nadat je de toets loslaat, om naloopaudio op te vangen. 0 = geen extra buffer."

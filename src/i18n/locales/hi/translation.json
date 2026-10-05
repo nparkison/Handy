@@ -594,6 +594,11 @@
         "title": "भरोसेमंद पेस्ट (Beta)",
         "description": "क्लिपबोर्ड को तय देरी के बाद नहीं, बल्कि टारगेट ऐप असल में ट्रांसक्रिप्शन पढ़ लेने के बाद ही वापस लाएं. यह सिस्टम पर लोड होने के दौरान पुराना क्लिपबोर्ड कॉन्टेंट पेस्ट होने की समस्या ठीक करने के लिए है. इसके लिए क्लिपबोर्ड वाला पेस्ट तरीका ज़रूरी है; सिर्फ़ macOS और Windows पर."
       },
+      "prePressBuffer": {
+        "title": "Pre-Press Buffer",
+        "description": "Keep this much audio from just before you press the shortcut, so your first word isn't clipped. Only works while the microphone is already open. 0 = off.",
+        "needsWarmMic": "Needs Always-On Microphone or Keep Mic Open Between Transcriptions."
+      },
       "recordingBuffer": {
         "title": "अतिरिक्त रिकॉर्डिंग बफ़र",
         "description": "बटन छोड़ने के बाद भी रिकॉर्डिंग जारी रखने का अतिरिक्त समय (मिलीसेकंड में), ताकि आखिरी हिस्से का ऑडियो कैप्चर हो सके. 0 = कोई अतिरिक्त बफ़र नहीं."

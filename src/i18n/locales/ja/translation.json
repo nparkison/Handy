@@ -580,6 +580,11 @@
         "title": "確実な貼り付け(Beta)",
         "description": "固定の遅延ではなく、対象アプリが実際に文字起こしを読み取った後にのみクリップボードを復元します。システム負荷が高いときに古いクリップボードの内容が貼り付けられる問題を解決するための設定です。クリップボードを使う貼り付け方法が必要です。macOS と Windows のみ。"
       },
+      "prePressBuffer": {
+        "title": "Pre-Press Buffer",
+        "description": "Keep this much audio from just before you press the shortcut, so your first word isn't clipped. Only works while the microphone is already open. 0 = off.",
+        "needsWarmMic": "Needs Always-On Microphone or Keep Mic Open Between Transcriptions."
+      },
       "recordingBuffer": {
         "title": "追加録音バッファ",
         "description": "キーを離した後に録音を続ける追加時間(ミリ秒)。末尾の音声を捕捉するため。0 = 追加バッファなし。"

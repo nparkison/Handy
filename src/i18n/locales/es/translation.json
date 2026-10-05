@@ -580,6 +580,11 @@
         "title": "Pegado fiable (Beta)",
         "description": "Restaura el portapapeles solo después de que la aplicación de destino lea realmente la transcripción, en lugar de tras un retraso fijo. Pensado para corregir que se pegue el contenido antiguo del portapapeles cuando el sistema está cargado. Requiere un método de pegado por portapapeles; solo macOS y Windows."
       },
+      "prePressBuffer": {
+        "title": "Pre-Press Buffer",
+        "description": "Keep this much audio from just before you press the shortcut, so your first word isn't clipped. Only works while the microphone is already open. 0 = off.",
+        "needsWarmMic": "Needs Always-On Microphone or Keep Mic Open Between Transcriptions."
+      },
       "recordingBuffer": {
         "title": "Búfer de grabación adicional",
         "description": "Tiempo adicional (en milisegundos) para seguir grabando después de soltar la tecla, para capturar el audio restante. 0 = sin búfer adicional."

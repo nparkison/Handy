@@ -580,6 +580,11 @@
         "title": "Niezawodne wklejanie (Beta)",
         "description": "Przywracaj schowek dopiero po tym, jak docelowa aplikacja faktycznie odczyta transkrypcję, a nie po ustalonym opóźnieniu. Ma naprawić wklejanie starej zawartości schowka przy obciążeniu systemu. Wymaga metody wklejania przez schowek; tylko macOS i Windows."
       },
+      "prePressBuffer": {
+        "title": "Pre-Press Buffer",
+        "description": "Keep this much audio from just before you press the shortcut, so your first word isn't clipped. Only works while the microphone is already open. 0 = off.",
+        "needsWarmMic": "Needs Always-On Microphone or Keep Mic Open Between Transcriptions."
+      },
       "recordingBuffer": {
         "title": "Dodatkowy bufor nagrywania",
         "description": "Dodatkowy czas (w milisekundach) na kontynuowanie nagrywania po zwolnieniu klawisza, aby przechwycić końcowy dźwięk. 0 = brak dodatkowego bufora."

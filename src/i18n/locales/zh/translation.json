@@ -580,6 +580,11 @@
         "title": "可靠粘贴（Beta）",
         "description": "在目标应用程序真正读取转录文本之后再恢复剪贴板，而不是等待固定延迟。用于解决系统负载较高时粘贴旧剪贴板内容的问题。需要使用剪贴板类的粘贴方式；仅支持 macOS 和 Windows。"
       },
+      "prePressBuffer": {
+        "title": "Pre-Press Buffer",
+        "description": "Keep this much audio from just before you press the shortcut, so your first word isn't clipped. Only works while the microphone is already open. 0 = off.",
+        "needsWarmMic": "Needs Always-On Microphone or Keep Mic Open Between Transcriptions."
+      },
       "recordingBuffer": {
         "title": "额外录音缓冲",
         "description": "放开按键后继续录音的额外时间（毫秒），以捕捉尾音。0 = 无额外缓冲。"

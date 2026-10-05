@@ -13,6 +13,7 @@ use cpal::{
 };
 use rtrb::{Consumer, Producer, RingBuffer};
 
+use super::pre_roll::{pre_roll_capacity_samples, PreRollBuffer};
 use crate::audio_toolkit::{
     audio::{AudioVisualiser, FrameResampler},
     constants,
@@ -103,6 +104,9 @@ pub struct AudioRecorder {
     config_cache: Arc<Mutex<Option<(String, cpal::SupportedStreamConfig)>>>,
     /// Set by cpal when the active input stream can no longer capture.
     stream_error: Arc<AtomicBool>,
+    /// Press-time pre-roll length in milliseconds (0 = off), shared with the
+    /// consumer thread so setting changes apply without reopening the stream.
+    pre_roll_ms: Arc<AtomicU64>,
 }
 
 impl AudioRecorder {
@@ -117,7 +121,16 @@ impl AudioRecorder {
             selected_channel: None,
             config_cache: Arc::new(Mutex::new(None)),
             stream_error: Arc::new(AtomicBool::new(false)),
+            pre_roll_ms: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Share a pre-roll length handle (milliseconds, 0 = off). While the stream
+    /// is open and idle, the consumer keeps that much recent audio in memory
+    /// and prepends it when the next recording starts.
+    pub fn with_pre_roll_ms(mut self, pre_roll_ms: Arc<AtomicU64>) -> Self {
+        self.pre_roll_ms = pre_roll_ms;
+        self
     }
 
     /// Attach a single VAD engine, reconfigured per session for the offline vs
@@ -200,6 +213,7 @@ impl AudioRecorder {
         let selected_channel = self.selected_channel;
         let config_cache = Arc::clone(&self.config_cache);
         let stream_error = Arc::clone(&self.stream_error);
+        let pre_roll_ms = Arc::clone(&self.pre_roll_ms);
 
         let worker = std::thread::spawn(move || {
             let transport = Arc::new(CaptureTransportState::default());
@@ -327,7 +341,8 @@ impl AudioRecorder {
                         level_cb,
                         audio_cb,
                         stream_running_at,
-                    );
+                    )
+                    .with_pre_roll(pre_roll_ms);
                     run_consumer(
                         processor,
                         sample_consumer,
@@ -692,7 +707,8 @@ fn drain_available_samples(
 enum ChunkDisposition {
     /// Process as active recording audio, including during the final stop drain.
     Capture,
-    /// Consume idle audio without processing it.
+    /// Consume idle audio without processing it (it only feeds the
+    /// press-time pre-roll window).
     Discard,
 }
 
@@ -709,6 +725,13 @@ struct CaptureProcessor {
     frame_resampler: FrameResampler,
     max_drain_samples: usize,
     first_chunk_logged: bool,
+    /// Requested pre-roll length (ms), re-read on every idle chunk.
+    pre_roll_ms: Arc<AtomicU64>,
+    /// Most recent idle audio at the device rate. Lives only as long as this
+    /// stream's consumer, so closing or switching the microphone flushes it.
+    pre_roll: PreRollBuffer,
+    /// Reused scratch space for handing the pre-roll to the resampler.
+    pre_roll_scratch: Vec<f32>,
 
     // ---- recording-scoped: reset by `begin_recording` ------------------- //
     vad_policy: VadPolicy,
@@ -762,6 +785,9 @@ impl CaptureProcessor {
             frame_resampler,
             max_drain_samples,
             first_chunk_logged: false,
+            pre_roll_ms: Arc::new(AtomicU64::new(0)),
+            pre_roll: PreRollBuffer::new(),
+            pre_roll_scratch: Vec::new(),
             vad_policy: VadPolicy::Offline,
             processed_samples: Vec::new(),
             awaiting_first_captured_chunk: None,
@@ -769,6 +795,19 @@ impl CaptureProcessor {
             total_dropped_samples: 0,
             overrun_warning_logged: false,
         }
+    }
+
+    fn with_pre_roll(mut self, pre_roll_ms: Arc<AtomicU64>) -> Self {
+        self.pre_roll_ms = pre_roll_ms;
+        self
+    }
+
+    /// Track the configured pre-roll length; a change takes effect on the
+    /// next idle chunk.
+    fn sync_pre_roll_capacity(&mut self) {
+        let ms = self.pre_roll_ms.load(Ordering::Relaxed);
+        self.pre_roll
+            .set_capacity(pre_roll_capacity_samples(self.in_sample_rate, ms));
     }
 
     /// Reset per-recording state and arm the first-sample acknowledgement.
@@ -788,6 +827,39 @@ impl CaptureProcessor {
                 detector.reset();
             }
         }
+        self.prepend_pre_roll();
+    }
+
+    /// Feed the idle window through the same resample -> VAD -> output path
+    /// as live audio, ahead of the first live chunk. Going through VAD means
+    /// leading silence is trimmed exactly as usual while onset speech is kept
+    /// (with the detector's own prefill), and the streaming callback receives
+    /// the same frames as the final recording, in order. The visualizer and
+    /// the first-sample acknowledgement are deliberately skipped: both
+    /// describe live capture, not buffered history.
+    fn prepend_pre_roll(&mut self) {
+        self.sync_pre_roll_capacity();
+        if self.pre_roll.is_empty() {
+            return;
+        }
+        let mut pre_roll = std::mem::take(&mut self.pre_roll_scratch);
+        self.pre_roll.drain_into(&mut pre_roll);
+        log::debug!(
+            "Prepending {:.0}ms of pre-press audio",
+            pre_roll.len() as f64 * 1000.0 / f64::from(self.in_sample_rate)
+        );
+        let vad_policy = self.vad_policy;
+        self.frame_resampler.push(&pre_roll, |frame: &[f32]| {
+            handle_frame(
+                frame,
+                vad_policy,
+                &self.vad,
+                &self.audio_cb,
+                &mut self.processed_samples,
+            )
+        });
+        pre_roll.clear();
+        self.pre_roll_scratch = pre_roll;
     }
 
     /// Drop a pending first-sample acknowledgement. If Stop was queued before
@@ -818,6 +890,8 @@ impl CaptureProcessor {
         }
 
         if disposition == ChunkDisposition::Discard {
+            self.sync_pre_roll_capacity();
+            self.pre_roll.push(raw);
             return;
         }
 

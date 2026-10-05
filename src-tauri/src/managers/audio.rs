@@ -4,7 +4,7 @@ use crate::audio_toolkit::{
         frames_for_duration_ms, EarshotVad, SmoothedVad, VAD_OFFLINE_HANGOVER_MS, VAD_ONSET_MS,
         VAD_PREFILL_MS, VAD_STREAMING_HANGOVER_MS,
     },
-    AudioRecorder, SileroVad, VadPolicy, VoiceActivityDetector,
+    AudioRecorder, SileroVad, VadPolicy, VoiceActivityDetector, MAX_PRE_ROLL_MS,
 };
 use crate::helpers::clamshell;
 use crate::managers::transcription::StreamRouter;
@@ -282,6 +282,7 @@ fn create_audio_recorder(
     app_handle: &tauri::AppHandle,
     selected_channel: Option<u16>,
     stream_router: Arc<StreamRouter>,
+    pre_roll_ms: Arc<AtomicU64>,
 ) -> Result<AudioRecorder, anyhow::Error> {
     let detector: Box<dyn VoiceActivityDetector> = match backend {
         VadBackend::Silero => {
@@ -335,6 +336,7 @@ fn create_audio_recorder(
             streaming_hangover_frames,
         )
         .with_selected_channel(selected_channel)
+        .with_pre_roll_ms(pre_roll_ms)
         .with_level_callback({
             let app_handle = app_handle.clone();
             move |levels| {
@@ -402,6 +404,9 @@ pub struct AudioRecordingManager {
     /// so the retry re-enumerates. The system-default case is never cached —
     /// the recorder resolves the current default itself, cheaply.
     cached_device: Arc<Mutex<Option<(String, cpal::Device)>>>,
+    /// Press-time pre-roll length (ms), shared with every recorder this
+    /// manager creates so the setting applies to a warm stream immediately.
+    pre_roll_ms: Arc<AtomicU64>,
 }
 
 impl AudioRecordingManager {
@@ -433,6 +438,7 @@ impl AudioRecordingManager {
             recording_active: Arc::new(AtomicBool::new(false)),
             capture_generation: Arc::new(AtomicU64::new(0)),
             cached_device: Arc::new(Mutex::new(None)),
+            pre_roll_ms: Arc::new(AtomicU64::new(settings.pre_roll_ms.min(MAX_PRE_ROLL_MS))),
         };
 
         // Always-on?  Open immediately.
@@ -465,6 +471,12 @@ impl AudioRecordingManager {
             Some(name) => DesiredMicrophone::Selected(name.clone()),
             None => DesiredMicrophone::Default,
         }
+    }
+
+    /// Update the press-time pre-roll length used by the open (or next) stream.
+    pub fn set_pre_roll_ms(&self, ms: u64) {
+        self.pre_roll_ms
+            .store(ms.min(MAX_PRE_ROLL_MS), Ordering::Relaxed);
     }
 
     pub fn invalidate_device_cache(&self) {
@@ -629,6 +641,7 @@ impl AudioRecordingManager {
                 &self.app_handle,
                 settings.selected_channel,
                 Arc::clone(&self.stream_router),
+                Arc::clone(&self.pre_roll_ms),
             )?);
         }
         Ok(())
@@ -879,6 +892,7 @@ impl AudioRecordingManager {
             &self.app_handle,
             settings.selected_channel,
             Arc::clone(&self.stream_router),
+            Arc::clone(&self.pre_roll_ms),
         )?;
         let was_open = *self.is_open.lock().unwrap();
 

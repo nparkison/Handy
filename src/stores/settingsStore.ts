@@ -199,6 +199,7 @@ const settingUpdaters: {
     commands.changeTranscribeGpuDevice(value as string | null),
   extra_recording_buffer_ms: (value) =>
     commands.changeExtraRecordingBufferSetting(value as number),
+  pre_roll_ms: (value) => commands.changePreRollSetting(value as number),
 };
 
 export const useSettingsStore = create<SettingsStore>()(
