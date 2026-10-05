@@ -1,4 +1,5 @@
 use crate::actions::ACTION_MAP;
+use crate::cockpit::gestures;
 use crate::managers::audio::AudioRecordingManager;
 use crate::settings::ShortcutActivation;
 use log::{debug, error, warn};
@@ -223,6 +224,12 @@ struct CoordinatorState {
     last_press: Option<Instant>,
     pending_release: Option<PendingRelease>,
     pending_press: Option<PendingPress>,
+    /// (pressed, released) of the hold that the last Stop effect ended; read
+    /// by tap-gesture classification.
+    last_hold: Option<(Instant, Instant)>,
+    /// A remembered press released while busy and forgotten, as
+    /// (binding, pressed, released): may be the second tap of a double-tap.
+    forgotten_press: Option<(String, Instant, Instant)>,
 }
 
 impl CoordinatorState {
@@ -233,6 +240,8 @@ impl CoordinatorState {
             last_press: None,
             pending_release: None,
             pending_press: None,
+            last_hold: None,
+            forgotten_press: None,
         }
     }
 
@@ -365,7 +374,11 @@ impl CoordinatorState {
                     // hold mode (the setting changed mid-recording) — otherwise
                     // nothing but Escape could stop it.
                     if self.is_locked() || input.mode == ShortcutActivation::Toggle {
-                        return Some(self.begin_processing(input.binding_id, input.hotkey_string));
+                        return Some(self.begin_processing(
+                            input.binding_id,
+                            input.hotkey_string,
+                            None,
+                        ));
                     }
                     // The key is still held (its release will end this
                     // recording), so a repeated press means nothing.
@@ -433,6 +446,11 @@ impl CoordinatorState {
                 "Forgetting remembered press for '{}': released after a {held:?} hold while busy",
                 release.binding_id
             );
+            self.forgotten_press = Some((
+                release.binding_id.clone(),
+                pending.pressed_at,
+                release.released_at,
+            ));
             self.pending_press = None;
         }
     }
@@ -455,7 +473,8 @@ impl CoordinatorState {
             // stopping is the safe reading (it is what push-to-talk always did).
             .unwrap_or(Duration::MAX);
         if held >= threshold {
-            return Some(self.begin_processing(binding_id, hotkey_string));
+            let hold = self.hold.as_ref().map(|h| (h.pressed_at, released_at));
+            return Some(self.begin_processing(binding_id, hotkey_string, hold));
         }
         if let Some(hold) = &mut self.hold {
             debug!("Tap ({held:?}) for '{binding_id}': recording locked on until the next press");
@@ -521,7 +540,13 @@ impl CoordinatorState {
         }
     }
 
-    fn begin_processing(&mut self, binding_id: String, hotkey_string: String) -> Effect {
+    fn begin_processing(
+        &mut self,
+        binding_id: String,
+        hotkey_string: String,
+        hold: Option<(Instant, Instant)>,
+    ) -> Effect {
+        self.last_hold = hold;
         self.stage = Stage::Processing;
         self.hold = None;
         Effect::Stop {
@@ -566,6 +591,11 @@ impl TranscriptionCoordinator {
                                 if let Some(effect) = state.on_grace_expired() {
                                     run_effect(&app, &mut state, effect);
                                 }
+                                if let Some((binding, pressed, released)) =
+                                    state.forgotten_press.take()
+                                {
+                                    gestures::on_busy_release(&app, &binding, pressed, released);
+                                }
                                 continue;
                             }
                             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -579,7 +609,16 @@ impl TranscriptionCoordinator {
 
                     match cmd {
                         Command::Input(input) => {
-                            if let Some(effect) = state.on_input(input, Instant::now()) {
+                            let now = Instant::now();
+                            // Raw edges for tap gestures (before debounce/grace).
+                            if !input.external {
+                                if input.is_pressed {
+                                    gestures::on_main_press(&app, &input.binding_id, now);
+                                } else {
+                                    gestures::on_main_release(&input.binding_id, now);
+                                }
+                            }
+                            if let Some(effect) = state.on_input(input, now) {
                                 run_effect(&app, &mut state, effect);
                             }
                         }
@@ -698,7 +737,10 @@ fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
         Effect::Stop {
             binding_id,
             hotkey_string,
-        } => stop(app, &binding_id, &hotkey_string),
+        } => {
+            gestures::note_hold(state.last_hold.take());
+            stop(app, &binding_id, &hotkey_string)
+        }
     }
 }
 
@@ -1648,5 +1690,41 @@ mod tests {
             "held 400ms since the real key-down: must stop, not lock"
         );
         assert_eq!(state.stage, Stage::Processing);
+    }
+
+    #[test]
+    fn push_to_talk_stop_records_the_hold_for_tap_classification() {
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        assert!(state.on_input(ptt_input(true), t0).is_some());
+        let released = t0 + Duration::from_millis(120);
+        assert!(state.on_input(ptt_input(false), released).is_none());
+        assert!(matches!(
+            state.on_grace_expired(),
+            Some(Effect::Stop { .. })
+        ));
+        assert_eq!(state.last_hold, Some((t0, released)));
+    }
+
+    #[test]
+    fn short_press_forgotten_while_busy_is_reported() {
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        state.on_input(ptt_input(true), t0);
+        state.on_input(ptt_input(false), t0 + Duration::from_millis(100));
+        state.on_grace_expired();
+        assert_eq!(state.stage, Stage::Processing);
+
+        // A quick second press and release before the pipeline drains.
+        let pressed = t0 + Duration::from_millis(250);
+        let released = t0 + Duration::from_millis(320);
+        state.on_input(ptt_input(true), pressed);
+        state.on_input(ptt_input(false), released);
+        assert!(state.on_grace_expired().is_none());
+        assert_eq!(
+            state.forgotten_press,
+            Some((BINDING.to_string(), pressed, released))
+        );
+        assert!(state.on_processing_finished().is_none());
     }
 }

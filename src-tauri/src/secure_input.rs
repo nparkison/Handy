@@ -483,6 +483,10 @@ mod imp {
                 if id == "transcribe_with_post_process" && !settings.post_process_enabled {
                     continue;
                 }
+                // Unbound optional shortcuts have nothing to shadow.
+                if crate::settings::is_unbound(binding) {
+                    continue;
+                }
 
                 match plan_fallback_binding(id, binding) {
                     ShadowPlan::Immune => immune += 1,

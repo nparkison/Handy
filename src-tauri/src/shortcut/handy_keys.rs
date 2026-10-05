@@ -228,6 +228,9 @@ impl HandyKeysState {
 
     /// Register a shortcut binding
     pub fn register(&self, binding: &ShortcutBinding) -> Result<(), String> {
+        if settings::is_unbound(binding) {
+            return Ok(());
+        }
         let (tx, rx) = mpsc::channel();
         self.command_sender
             .lock()
@@ -245,6 +248,9 @@ impl HandyKeysState {
 
     /// Unregister a shortcut binding
     pub fn unregister(&self, binding: &ShortcutBinding) -> Result<(), String> {
+        if settings::is_unbound(binding) {
+            return Ok(());
+        }
         let (tx, rx) = mpsc::channel();
         self.command_sender
             .lock()

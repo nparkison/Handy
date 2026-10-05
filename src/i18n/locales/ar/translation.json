@@ -184,13 +184,24 @@
           "transcribe_with_post_process": {
             "name": "مفتاح المعالجة اللاحقة",
             "description": "اختياري: مفتاح اختصار مخصص يطبق دائماً المعالجة اللاحقة بالذكاء الاصطناعي على التفريغ الصوتي."
+          },
+          "paste_last": {
+            "name": "Paste Last Shortcut",
+            "description": "Pastes your most recent dictation again (cleaned-up version if available)."
+          },
+          "swap_last": {
+            "name": "Swap Last Shortcut",
+            "description": "Replaces the text Handy just pasted with the other version: original or cleaned-up."
           }
         },
         "errors": {
           "restore": "فشل استعادة الاختصار الأصلي",
           "set": "فشل تعيين الاختصار: {{error}}",
           "reset": "فشل إعادة تعيين الاختصار إلى قيمته الأصلية"
-        }
+        },
+        "notSet": "Not set",
+        "clear": "Clear shortcut",
+        "mouseNeedsHandyKeys": "Mouse buttons need the Handy Keys keyboard implementation (Debug)."
       },
       "language": {
         "title": "اللغة",
@@ -212,6 +223,11 @@
           "push_to_talk": "يسجّل أثناء الضغط على الاختصار",
           "toggle": "انقر على الاختصار لبدء التسجيل، وانقر مرة أخرى للإيقاف"
         }
+      },
+      "tapGestures": {
+        "label": "Tap gestures",
+        "description": "In Hold mode: tap quickly to paste your last dictation, double-tap to swap it between original and cleaned-up.",
+        "unavailable": "Available when Shortcut Behavior is set to Hold."
       }
     },
     "sound": {
@@ -458,7 +474,26 @@
         "cancel": "إلغاء",
         "selectToEdit": ".اختر مطالبة أعلاه لعرض وتعديل تفاصيلها",
         "createFirst": ".انقر على 'إنشاء مطالبة جديدة' أعلاه لإنشاء أول مطالبة معالجة لاحقة لك"
-      }
+      },
+      "everyDictation": {
+        "label": "Clean up every dictation",
+        "description": "Run AI cleanup on everything you dictate with your main shortcut. The separate post-processing hotkey becomes optional.",
+        "needsProvider": "Choose a provider and model below to turn this on."
+      },
+      "timeout": {
+        "title": "Cleanup time limit",
+        "description": "If cleanup takes longer than this, Handy pastes your original words right away and saves the cleaned-up version to History when it arrives.",
+        "options": {
+          "sec1": "1 s",
+          "sec1_5": "1.5 s",
+          "sec2": "2 s",
+          "sec3": "3 s",
+          "sec5": "5 s",
+          "noLimit": "No limit (always wait)",
+          "custom": "{{seconds}} s"
+        }
+      },
+      "hotkeyOptionalDescription": "Optional. Cleanup already runs on every dictation, so this hotkey does the same thing as Transcribe."
     },
     "screenContext": {
       "title": "Screen Context",
@@ -494,7 +529,9 @@
       "status": {
         "cleanedUp": "Cleaned up",
         "original": "Original",
-        "cleanupFailed": "Cleanup failed"
+        "cleanupFailed": "Cleanup failed",
+        "cleaningUp": "Cleaning up...",
+        "cleanedUpLate": "Cleaned up late"
       }
     },
     "debug": {
@@ -706,6 +743,14 @@
           "differsHint": "Differs is the share of words that disagree with the saved text. It is not accuracy: the saved text may itself be wrong.",
           "rtfHint": "RTF is transcribe time divided by audio length; lower is faster."
         }
+      },
+      "tapMaxDuration": {
+        "title": "Tap Max Duration",
+        "description": "Presses shorter than this with no speech count as a tap (Tap gestures)."
+      },
+      "doubleTapWindow": {
+        "title": "Double-Tap Window",
+        "description": "How soon a second tap must follow to count as a double-tap."
       }
     },
     "about": {
@@ -836,7 +881,20 @@
       "switchedMic": "Switched to {{mic}}",
       "switchFailed": "Couldn't switch to {{mic}}",
       "warning": "Warning",
-      "info": "Info"
+      "info": "Info",
+      "cleanupMissed": "Original pasted - cleanup still running",
+      "cleanupFailed": "Cleanup failed - original pasted",
+      "cleanupReady": "Cleanup ready",
+      "cleanupReadyDoubleTap": "Cleanup ready - or double-tap",
+      "swap": "Swap",
+      "pastedLast": "Pasted last dictation",
+      "nothingToPaste": "Nothing to paste yet",
+      "swappedToCleanedUp": "Swapped to cleaned-up",
+      "swappedToOriginal": "Swapped to original",
+      "cleanupStillRunning": "Cleanup still running",
+      "noCleanedUpVersion": "No cleaned-up version for this one",
+      "nothingToSwap": "Nothing to swap yet",
+      "swapCopied": "Can't swap here - copied instead"
     }
   },
   "whatsNew": {

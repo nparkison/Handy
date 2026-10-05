@@ -31,7 +31,36 @@ static MIGRATIONS: &[M] = &[
     M::up("ALTER TABLE transcription_history ADD COLUMN post_processed_text TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN post_process_prompt TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN post_process_requested BOOLEAN NOT NULL DEFAULT 0;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN cleanup_state TEXT;"),
 ];
+
+/// Where a deadline-missed cleanup stands. `None` on an entry means cleanup
+/// either finished in time, failed, or never ran (see `post_process_requested`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "lowercase")]
+pub enum CleanupState {
+    /// Missed the deadline; the original was pasted and the request is still running.
+    Pending,
+    /// The cleaned-up text arrived after the deadline and was saved here.
+    Late,
+}
+
+impl CleanupState {
+    fn as_db(self) -> &'static str {
+        match self {
+            CleanupState::Pending => "pending",
+            CleanupState::Late => "late",
+        }
+    }
+
+    fn from_db(value: Option<String>) -> Option<Self> {
+        match value.as_deref() {
+            Some("pending") => Some(CleanupState::Pending),
+            Some("late") => Some(CleanupState::Late),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
 pub struct PaginatedHistory {
@@ -63,6 +92,7 @@ pub struct HistoryEntry {
     pub post_processed_text: Option<String>,
     pub post_process_prompt: Option<String>,
     pub post_process_requested: bool,
+    pub cleanup_state: Option<CleanupState>,
 }
 
 pub struct HistoryManager {
@@ -119,6 +149,15 @@ impl HistoryManager {
 
         // Apply any pending migrations
         migrations.to_latest(&mut conn)?;
+
+        // A cleanup still pending from a previous run will never arrive.
+        let stale = conn.execute(
+            "UPDATE transcription_history SET cleanup_state = NULL WHERE cleanup_state = 'pending'",
+            [],
+        )?;
+        if stale > 0 {
+            debug!("Cleared {} stale pending cleanups", stale);
+        }
 
         // Get version after migration
         let version_after: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -207,6 +246,7 @@ impl HistoryManager {
             post_processed_text: row.get("post_processed_text")?,
             post_process_prompt: row.get("post_process_prompt")?,
             post_process_requested: row.get("post_process_requested")?,
+            cleanup_state: CleanupState::from_db(row.get("cleanup_state")?),
         })
     }
 
@@ -223,6 +263,7 @@ impl HistoryManager {
         post_process_requested: bool,
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
+        cleanup_state: Option<CleanupState>,
     ) -> Result<HistoryEntry> {
         let timestamp = Utc::now().timestamp();
         let title = self.format_timestamp_title(timestamp);
@@ -237,8 +278,9 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
-                post_process_requested
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                post_process_requested,
+                cleanup_state
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 &file_name,
                 timestamp,
@@ -248,6 +290,7 @@ impl HistoryManager {
                 &post_processed_text,
                 &post_process_prompt,
                 post_process_requested,
+                cleanup_state.map(CleanupState::as_db),
             ],
         )?;
 
@@ -261,6 +304,7 @@ impl HistoryManager {
             post_processed_text,
             post_process_prompt,
             post_process_requested,
+            cleanup_state,
         };
 
         debug!("Saved history entry with id {}", entry.id);
@@ -293,7 +337,8 @@ impl HistoryManager {
             "UPDATE transcription_history
              SET transcription_text = ?1,
                  post_processed_text = ?2,
-                 post_process_prompt = ?3
+                 post_process_prompt = ?3,
+                 cleanup_state = NULL
              WHERE id = ?4",
             params![
                 transcription_text,
@@ -309,7 +354,7 @@ impl HistoryManager {
 
         let entry = conn
             .query_row(
-                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
+                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, cleanup_state
                  FROM transcription_history WHERE id = ?1",
                 params![id],
                 Self::map_history_entry,
@@ -327,6 +372,68 @@ impl HistoryManager {
         crate::tray::refresh_recent_dictations(&self.app_handle);
 
         Ok(entry)
+    }
+
+    /// Resolve a deadline-missed cleanup: store the late cleaned-up text
+    /// (`Some`) or record that it never arrived (`None`, shown as "Cleanup
+    /// failed"). Only touches an entry that is still pending, so a re-transcribe
+    /// in the meantime is never overwritten. Returns the updated entry, or
+    /// `None` when it was deleted or no longer pending.
+    pub fn resolve_late_cleanup(
+        &self,
+        id: i64,
+        cleaned: Option<(String, Option<String>)>,
+    ) -> Result<Option<HistoryEntry>> {
+        let conn = self.get_connection()?;
+        let updated = Self::resolve_late_cleanup_with_conn(&conn, id, cleaned)?;
+        if let Some(entry) = &updated {
+            if let Err(e) = (HistoryUpdatePayload::Updated {
+                entry: entry.clone(),
+            })
+            .emit(&self.app_handle)
+            {
+                error!("Failed to emit history-updated event: {}", e);
+            }
+            crate::tray::refresh_recent_dictations(&self.app_handle);
+        }
+        Ok(updated)
+    }
+
+    fn resolve_late_cleanup_with_conn(
+        conn: &Connection,
+        id: i64,
+        cleaned: Option<(String, Option<String>)>,
+    ) -> Result<Option<HistoryEntry>> {
+        let changed = match cleaned {
+            Some((text, prompt)) => conn.execute(
+                "UPDATE transcription_history
+                 SET post_processed_text = ?1, post_process_prompt = ?2, cleanup_state = ?3
+                 WHERE id = ?4 AND cleanup_state = ?5",
+                params![
+                    text,
+                    prompt,
+                    CleanupState::Late.as_db(),
+                    id,
+                    CleanupState::Pending.as_db()
+                ],
+            )?,
+            None => conn.execute(
+                "UPDATE transcription_history SET cleanup_state = NULL
+                 WHERE id = ?1 AND cleanup_state = ?2",
+                params![id, CleanupState::Pending.as_db()],
+            )?,
+        };
+        if changed == 0 {
+            return Ok(None);
+        }
+        Ok(conn
+            .query_row(
+                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, cleanup_state
+                 FROM transcription_history WHERE id = ?1",
+                params![id],
+                Self::map_history_entry,
+            )
+            .optional()?)
     }
 
     pub fn cleanup_old_entries(&self) -> Result<()> {
@@ -489,7 +596,7 @@ impl HistoryManager {
         let pattern = search.map(like_contains_pattern);
 
         let mut stmt = conn.prepare(
-            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, cleanup_state
              FROM transcription_history
              WHERE (?1 IS NULL OR id < ?1)
                AND (?2 IS NULL
@@ -525,7 +632,7 @@ impl HistoryManager {
         limit: usize,
     ) -> Result<Vec<HistoryEntry>> {
         let mut stmt = conn.prepare(
-            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, cleanup_state
              FROM transcription_history
              WHERE transcription_text != ''
              ORDER BY id DESC
@@ -549,7 +656,8 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
-                post_process_requested
+                post_process_requested,
+                cleanup_state
              FROM transcription_history
              ORDER BY timestamp DESC
              LIMIT 1",
@@ -576,7 +684,8 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
-                post_process_requested
+                post_process_requested,
+                cleanup_state
              FROM transcription_history
              WHERE transcription_text != ''
              ORDER BY timestamp DESC
@@ -635,7 +744,8 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
-                post_process_requested
+                post_process_requested,
+                cleanup_state
              FROM transcription_history
              WHERE id = ?1",
         )?;
@@ -721,7 +831,8 @@ mod tests {
                 transcription_text TEXT NOT NULL,
                 post_processed_text TEXT,
                 post_process_prompt TEXT,
-                post_process_requested BOOLEAN NOT NULL DEFAULT 0
+                post_process_requested BOOLEAN NOT NULL DEFAULT 0,
+                cleanup_state TEXT
             );",
         )
         .expect("create transcription_history table");
@@ -924,5 +1035,70 @@ mod tests {
             texts,
             vec!["entry 7", "entry 6", "entry 5", "entry 4", "entry 3"]
         );
+    }
+
+    fn mark_pending(conn: &Connection, id: i64) {
+        conn.execute(
+            "UPDATE transcription_history SET cleanup_state = 'pending', post_process_requested = 1 WHERE id = ?1",
+            params![id],
+        )
+        .expect("mark pending");
+    }
+
+    #[test]
+    fn late_cleanup_saves_text_and_marks_late() {
+        let conn = setup_conn();
+        insert_entry(&conn, 1, "um hello", None);
+        mark_pending(&conn, 1);
+
+        let entry = HistoryManager::resolve_late_cleanup_with_conn(
+            &conn,
+            1,
+            Some(("Hello.".to_string(), Some("prompt".to_string()))),
+        )
+        .expect("resolve")
+        .expect("entry was pending");
+        assert_eq!(entry.post_processed_text.as_deref(), Some("Hello."));
+        assert_eq!(entry.post_process_prompt.as_deref(), Some("prompt"));
+        assert_eq!(entry.cleanup_state, Some(CleanupState::Late));
+
+        // Already resolved: a second result is ignored.
+        let again = HistoryManager::resolve_late_cleanup_with_conn(
+            &conn,
+            1,
+            Some(("Other.".to_string(), None)),
+        )
+        .expect("resolve");
+        assert!(again.is_none());
+    }
+
+    #[test]
+    fn late_cleanup_failure_clears_pending_state() {
+        let conn = setup_conn();
+        insert_entry(&conn, 1, "um hello", None);
+        mark_pending(&conn, 1);
+        let entry = HistoryManager::resolve_late_cleanup_with_conn(&conn, 1, None)
+            .expect("resolve")
+            .expect("entry was pending");
+        assert_eq!(entry.cleanup_state, None);
+        assert_eq!(entry.post_processed_text, None);
+        assert!(entry.post_process_requested);
+    }
+
+    #[test]
+    fn late_cleanup_skips_entries_that_are_not_pending() {
+        let conn = setup_conn();
+        insert_entry(&conn, 1, "um hello", Some("Hello."));
+        let result = HistoryManager::resolve_late_cleanup_with_conn(
+            &conn,
+            1,
+            Some(("Late.".to_string(), None)),
+        )
+        .expect("resolve");
+        assert!(result.is_none());
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("fetch")
+            .expect("entry");
+        assert_eq!(entry.post_processed_text.as_deref(), Some("Hello."));
     }
 }

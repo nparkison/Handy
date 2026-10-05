@@ -110,9 +110,11 @@ pub async fn retry_history_entry_transcription(
         return Err("Recording contains no speech".to_string());
     }
 
-    let processed =
-        process_transcription_output(&app, &transcription, entry.post_process_requested, None)
-            .await;
+    // Re-run cleanup when it ran originally, or when every dictation is
+    // cleaned up now.
+    let post_process = entry.post_process_requested
+        || crate::settings::get_settings(&app).cleans_up_every_dictation();
+    let processed = process_transcription_output(&app, &transcription, post_process, None).await;
     history_manager
         .update_transcription(
             id,

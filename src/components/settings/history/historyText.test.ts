@@ -40,6 +40,41 @@ assert.equal(getEntryTexts(entry("raw", null, true)).status, "cleanupFailed");
 assert.equal(getEntryTexts(entry("raw", "  ", true)).status, "cleanupFailed");
 assert.equal(getEntryTexts(entry("raw", "  ", true)).primaryText, "raw");
 
+// Cleanup missed its time limit and is still running: "cleaning up", which
+// wins over "cleanup failed" (requested, no polished text yet).
+{
+  const texts = getEntryTexts({
+    ...entry("raw words", null, true),
+    cleanup_state: "pending",
+  });
+  assert.equal(texts.status, "cleaningUp");
+  assert.equal(texts.primaryText, "raw words");
+}
+
+// Polished text arrived after the time limit: "cleaned up late".
+{
+  const texts = getEntryTexts({
+    ...entry("um raw", "Raw.", true),
+    cleanup_state: "late",
+  });
+  assert.equal(texts.status, "cleanedUpLate");
+  assert.equal(texts.primaryText, "Raw.");
+  assert.equal(texts.hasDistinctOriginal, true);
+}
+
+// "late" without polished text (a late request that then failed is reset to
+// null by the backend, but be defensive): treated as failed.
+assert.equal(
+  getEntryTexts({ ...entry("raw", null, true), cleanup_state: "late" }).status,
+  "cleanupFailed",
+);
+
+// A failed late request goes back to null: the existing "cleanup failed".
+assert.equal(
+  getEntryTexts({ ...entry("raw", null, true), cleanup_state: null }).status,
+  "cleanupFailed",
+);
+
 // Failed transcription: no badge.
 assert.equal(getEntryTexts(entry("", null, true)).status, null);
 

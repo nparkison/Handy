@@ -21,6 +21,7 @@ import { ApiKeyField } from "../PostProcessingSettingsApi/ApiKeyField";
 import { ModelSelect } from "../PostProcessingSettingsApi/ModelSelect";
 import { usePostProcessProviderState } from "../PostProcessingSettingsApi/usePostProcessProviderState";
 import { ShortcutInput } from "../ShortcutInput";
+import { CleanUpEveryDictation, CleanupTimeLimit } from "./CleanupSettings";
 import { useSettings } from "../../../hooks/useSettings";
 
 const PostProcessingSettingsApiComponent: React.FC = () => {
@@ -433,14 +434,22 @@ export const PostProcessingSettings: React.FC = () => {
     (p: { id: string }) => p.id === settings?.post_process_provider_id,
   );
   const supportsVision = provider?.supports_vision ?? false;
+  const everyDictation = getSetting("post_process_every_dictation") ?? false;
 
   return (
     <div className="max-w-3xl w-full mx-auto space-y-6">
       <SettingsGroup title={t("settings.postProcessing.hotkey.title")}>
+        <CleanUpEveryDictation descriptionMode="tooltip" grouped={true} />
+        <CleanupTimeLimit descriptionMode="tooltip" grouped={true} />
         <ShortcutInput
           shortcutId="transcribe_with_post_process"
           descriptionMode="tooltip"
           grouped={true}
+          descriptionOverride={
+            everyDictation
+              ? t("settings.postProcessing.hotkeyOptionalDescription")
+              : undefined
+          }
         />
       </SettingsGroup>
 

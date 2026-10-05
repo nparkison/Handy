@@ -165,6 +165,16 @@ const settingUpdaters: {
     commands.changeMuteWhileRecordingSetting(value as boolean),
   silent_mic_warning: (value) =>
     commands.changeSilentMicWarningSetting(value as boolean),
+  post_process_every_dictation: (value) =>
+    commands.changePostProcessEveryDictationSetting(value as boolean),
+  post_process_timeout_ms: (value) =>
+    commands.changePostProcessTimeoutMsSetting(value as number),
+  tap_gestures_enabled: (value) =>
+    commands.changeTapGesturesEnabledSetting(value as boolean),
+  tap_max_duration_ms: (value) =>
+    commands.changeTapMaxDurationMsSetting(value as number),
+  double_tap_window_ms: (value) =>
+    commands.changeDoubleTapWindowMsSetting(value as number),
   append_trailing_space: (value) =>
     commands.changeAppendTrailingSpaceSetting(value as boolean),
   log_level: (value) => commands.setLogLevel(value as any),
@@ -401,8 +411,9 @@ export const useSettingsStore = create<SettingsStore>()(
       } catch (error) {
         console.error(`Failed to update binding ${id}:`, error);
 
-        // Rollback on error
-        if (originalBinding && get().settings) {
+        // Rollback on error ("" is a valid original value for optional,
+        // unbound shortcuts)
+        if (originalBinding !== undefined && get().settings) {
           set((state) => ({
             settings: state.settings
               ? {

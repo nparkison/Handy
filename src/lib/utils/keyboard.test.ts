@@ -24,4 +24,7 @@ assert.equal(
   "audiovolumeup",
 );
 
+// Optional shortcuts (paste_last, swap_last) are unbound by default ("").
+assert.equal(formatKeyCombination("", "windows"), "");
+
 console.log("keyboard: all assertions passed");
