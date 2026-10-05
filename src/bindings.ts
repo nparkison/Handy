@@ -1162,6 +1162,13 @@ export type AppSettings = {
  */
 settings_schema_version?: number; 
 /**
+ * Marker for the fork's one-time migrations (see
+ * `apply_fork_migrations`). Fresh installs start at the current version;
+ * stores without the key (upstream, or fork builds before the marker)
+ * read as 0 and are migrated once.
+ */
+fork_migrations_version?: number; 
+/**
  * Defaults to empty on partial stores; the load path merges in the
  * default bindings for any missing keys before the settings are used.
  */
@@ -1308,8 +1315,25 @@ export type GpuDeviceOption = { id: string; name: string; total_vram_mb: number 
  * What app context was sent with an entry's cleanup request: never the
  * screenshot itself, only whether one was shared.
  */
-export type HistoryContext = { app: string | null; title: string | null; screenshot: boolean }
-export type HistoryEntry = { id: number; file_name: string; timestamp: number; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; post_process_requested: boolean; cleanup_state: CleanupState | null; 
+export type HistoryContext = { app: string | null; title: string | null; 
+/**
+ * The screenshot shaped the cleanup that was used.
+ */
+screenshot: boolean; 
+/**
+ * The screenshot was uploaded (it left the machine), used or not.
+ */
+screenshot_sent?: boolean }
+export type HistoryEntry = { id: number; file_name: string; timestamp: number; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; 
+/**
+ * The user asked for cleanup (post-process hotkey, or every dictation).
+ */
+post_process_requested: boolean; 
+/**
+ * A cleanup request was attempted. `None` on entries from before this
+ * was recorded, where `post_process_requested` meant "attempted".
+ */
+cleanup_attempted: boolean | null; cleanup_state: CleanupState | null; 
 /**
  * App context sent with the cleanup request (`None` when none was sent).
  */

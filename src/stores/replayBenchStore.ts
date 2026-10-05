@@ -45,8 +45,12 @@ interface ReplayBenchStore {
  */
 export const useReplayBenchStore = create<ReplayBenchStore>()((set, get) => {
   let initializing: Promise<void> | null = null;
+  // Bumped on every bench event, so a state query can tell whether an event
+  // (e.g. "finished") overtook it and its answer is already stale.
+  let eventSeq = 0;
 
   const handleEvent = (event: ReplayBenchEvent) => {
+    eventSeq += 1;
     switch (event.type) {
       case "started":
         set({
@@ -127,7 +131,11 @@ export const useReplayBenchStore = create<ReplayBenchStore>()((set, get) => {
           // Reconcile with the backend: a run may have started (or ended)
           // before the listener existed.
           try {
+            const seqBefore = eventSeq;
             const running = await commands.isReplayBenchRunning();
+            // Events that arrived while the query was in flight are newer
+            // than its answer; trust them instead.
+            if (eventSeq !== seqBefore) return;
             if (running) {
               set({ status: "running" });
             } else if (get().status === "running") {
@@ -160,7 +168,9 @@ export const useReplayBenchStore = create<ReplayBenchStore>()((set, get) => {
         await commands.stopReplayBench();
         // If the backend run already ended without a "finished" event
         // reaching us, don't leave the page stuck on "running".
-        if (!(await commands.isReplayBenchRunning())) {
+        const seqBefore = eventSeq;
+        const running = await commands.isReplayBenchRunning();
+        if (!running && eventSeq === seqBefore) {
           const { status } = get();
           if (status === "running" || status === "starting") {
             set({ status: "stopped", progress: null });

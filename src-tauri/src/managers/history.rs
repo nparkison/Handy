@@ -45,6 +45,12 @@ static MIGRATIONS: &[M] = &[
 /// touching `user_version`. Upstream builds ignore extra columns: their
 /// INSERTs name columns explicitly and every one of these is nullable or has
 /// a default.
+///
+/// Note: these names live in upstream's table, so a future upstream column
+/// with the same name (e.g. `cleanup_state`) would collide: upstream's
+/// `ADD COLUMN` would fail on a database the fork already extended. Check new
+/// upstream migrations against this list when merging; renaming a fork column
+/// means adding the new one here and copying the old one's data over.
 const FORK_COLUMNS: &[(&str, &str)] = &[
     ("cleanup_state", "TEXT"),
     ("context_app", "TEXT"),
@@ -53,35 +59,156 @@ const FORK_COLUMNS: &[(&str, &str)] = &[
     // Executable/app identifier rules match on (e.g. `slack.exe`), so a retry
     // re-selects the same app rule. Local only: never shared or shown.
     ("context_process", "TEXT"),
+    // The screenshot left the machine (uploaded with a vision request), even
+    // when that request failed and the cleanup didn't use it.
+    ("context_screenshot_sent", "BOOLEAN NOT NULL DEFAULT 0"),
+    // Whether a cleanup request was actually attempted, kept apart from the
+    // user's intent (`post_process_requested`): a dictation made while cleanup
+    // was misconfigured was requested but not attempted, so it isn't
+    // "Cleanup failed" and a retry still honors the intent. NULL on rows from
+    // before this column: those stored "attempted" in the requested column.
+    ("cleanup_attempted", "BOOLEAN"),
 ];
+
+/// `transcription_history` columns at upstream schema version 4.
+const UPSTREAM_V4_COLUMNS: &[&str] = &[
+    "id",
+    "file_name",
+    "timestamp",
+    "saved",
+    "title",
+    "transcription_text",
+    "post_processed_text",
+    "post_process_prompt",
+    "post_process_requested",
+];
+
+/// The upstream schema version legacy fork databases are put back to.
+const LEGACY_FORK_BASE_VERSION: i32 = 4;
+
+/// The history database was written by a newer Handy than this build knows
+/// (and is not a legacy fork database). It is left untouched.
+#[derive(Debug)]
+pub struct HistoryDbTooNew {
+    pub version: i32,
+    pub supported: i32,
+}
+
+impl std::fmt::Display for HistoryDbTooNew {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "history database schema version {} is newer than this build supports ({}); \
+             it was likely written by a newer Handy",
+            self.version, self.supported
+        )
+    }
+}
+
+impl std::error::Error for HistoryDbTooNew {}
+
+/// Tell the user why History is empty this session (non-blocking dialog).
+fn notify_history_unavailable(app_handle: &AppHandle, db_path: &std::path::Path) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+    app_handle
+        .dialog()
+        .message(format!(
+            "Your history database ({}) was created by a newer version of Handy, \
+             so this version can't open it. It has not been changed.\n\n\
+             Handy will keep working, but dictations from this session won't be \
+             saved to History. Update Handy to see your history again.",
+            db_path.display()
+        ))
+        .title("History unavailable")
+        .kind(MessageDialogKind::Warning)
+        .show(|_| {});
+}
 
 /// Builds before this fix recorded the fork columns as migrations 5 (cleanup
 /// state) and 6 (context). Such a database is upstream schema 4 plus fork
 /// columns, so its `user_version` is put back to 4 to stay openable by
 /// upstream builds.
+///
+/// Only that exact legacy shape is reset: a database at version 5 or 6 that
+/// went fork -> newer upstream (which ran its own migration 5) -> fork
+/// carries upstream's new schema too, and resetting it would make upstream
+/// re-run that migration (duplicate column). Anything else is left alone.
 fn reset_fork_schema_version(conn: &Connection) -> Result<()> {
     let upstream_version = MIGRATIONS.len() as i32;
     let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if !matches!(version, 5 | 6) {
-        // Anything else is either current or belongs to a newer upstream;
-        // leave the latter for rusqlite_migration to report.
+    if version <= upstream_version || !matches!(version, 5 | 6) {
         return Ok(());
     }
-    let present = existing_columns(conn)?;
-    // Migration 5 added cleanup_state; migration 6 the three context_*
-    // columns. Columns added later (context_process) were never migrations.
-    let fork_owned = FORK_COLUMNS
-        .iter()
-        .take(if version == 5 { 1 } else { 4 })
-        .all(|(name, _)| present.iter().any(|c| c == name));
-    if fork_owned {
+    if is_legacy_fork_shape(conn, version)? {
         info!(
             "History database at fork schema version {}; resetting to upstream version {}",
-            version, upstream_version
+            version, LEGACY_FORK_BASE_VERSION
         );
-        conn.pragma_update(None, "user_version", upstream_version)?;
+        conn.pragma_update(None, "user_version", LEGACY_FORK_BASE_VERSION)?;
+    } else {
+        info!(
+            "History database at version {} has a schema this build doesn't recognize; leaving it as is",
+            version
+        );
     }
     Ok(())
+}
+
+/// Rolling back to the pre-merge fork build means setting `user_version` to
+/// 3 by hand (see BUILD.md). Its v4 column is still there, so migration 4
+/// would fail on the duplicate column: put the version back to 4 instead.
+fn restore_rolled_back_version(conn: &Connection) -> Result<()> {
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version == 3
+        && existing_columns(conn)?
+            .iter()
+            .any(|c| c == "post_process_requested")
+    {
+        info!("History database was rolled back to version 3 with version 4 columns; restoring 4");
+        conn.pragma_update(None, "user_version", 4)?;
+    }
+    Ok(())
+}
+
+/// Is this exactly what the old fork builds produced at `version` (5 or 6):
+/// upstream v4's table plus fork columns, nothing else?
+fn is_legacy_fork_shape(conn: &Connection, version: i32) -> Result<bool> {
+    // Migration 5 added cleanup_state; migration 6 the three context_*
+    // columns. Columns added later (context_process, ...) were never
+    // migrations, so they may or may not be present.
+    let migration_owned = if version == 5 { 1 } else { 4 };
+    let present = existing_columns(conn)?;
+    let is_fork = |name: &str| FORK_COLUMNS.iter().any(|(fork, _)| *fork == name);
+    let required_present = UPSTREAM_V4_COLUMNS
+        .iter()
+        .copied()
+        .chain(
+            FORK_COLUMNS[..migration_owned]
+                .iter()
+                .map(|(name, _)| *name),
+        )
+        .all(|name| present.iter().any(|c| c == name));
+    let nothing_foreign = present
+        .iter()
+        .all(|c| UPSTREAM_V4_COLUMNS.contains(&c.as_str()) || is_fork(c));
+    if !required_present || !nothing_foreign {
+        return Ok(false);
+    }
+    // No other tables, indexes, triggers or views. SQLite's own objects
+    // (sqlite_sequence, autoindexes) and tauri-plugin-sql's old tracking
+    // table are expected.
+    let mut stmt = conn.prepare(
+        "SELECT type, name FROM sqlite_master
+         WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\'",
+    )?;
+    let objects = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(objects.iter().all(|(kind, name)| {
+        kind == "table" && (name == "transcription_history" || name == "_sqlx_migrations")
+    }))
 }
 
 fn existing_columns(conn: &Connection) -> Result<Vec<String>> {
@@ -110,6 +237,13 @@ fn ensure_fork_columns(conn: &Connection) -> Result<()> {
 /// fork's columns. See [`MIGRATIONS`] for why the two are kept apart.
 fn migrate_schema(conn: &mut Connection) -> Result<()> {
     reset_fork_schema_version(conn)?;
+    restore_rolled_back_version(conn)?;
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let supported = MIGRATIONS.len() as i32;
+    if version > supported {
+        // Written by a newer Handy: don't touch it (no fork columns either).
+        return Err(HistoryDbTooNew { version, supported }.into());
+    }
     let migrations = Migrations::new(MIGRATIONS.to_vec());
     // Validate migrations in debug builds
     #[cfg(debug_assertions)]
@@ -143,7 +277,7 @@ macro_rules! entry_columns {
     () => {
         "id, file_name, timestamp, saved, title, transcription_text, post_processed_text, \
          post_process_prompt, post_process_requested, cleanup_state, context_app, \
-         context_title, context_screenshot"
+         context_title, context_screenshot, context_screenshot_sent, cleanup_attempted"
     };
 }
 
@@ -153,13 +287,18 @@ macro_rules! entry_columns {
 pub struct HistoryContext {
     pub app: Option<String>,
     pub title: Option<String>,
+    /// The screenshot shaped the cleanup that was used.
     pub screenshot: bool,
+    /// The screenshot was uploaded (it left the machine), used or not.
+    #[serde(default)]
+    pub screenshot_sent: bool,
 }
 
 impl HistoryContext {
     /// `None` when nothing was shared.
     pub fn into_option(self) -> Option<Self> {
-        (self.app.is_some() || self.title.is_some() || self.screenshot).then_some(self)
+        (self.app.is_some() || self.title.is_some() || self.screenshot || self.screenshot_sent)
+            .then_some(self)
     }
 }
 
@@ -229,7 +368,11 @@ pub struct HistoryEntry {
     pub transcription_text: String,
     pub post_processed_text: Option<String>,
     pub post_process_prompt: Option<String>,
+    /// The user asked for cleanup (post-process hotkey, or every dictation).
     pub post_process_requested: bool,
+    /// A cleanup request was attempted. `None` on entries from before this
+    /// was recorded, where `post_process_requested` meant "attempted".
+    pub cleanup_attempted: Option<bool>,
     pub cleanup_state: Option<CleanupState>,
     /// App context sent with the cleanup request (`None` when none was sent).
     pub context: Option<HistoryContext>,
@@ -254,14 +397,26 @@ impl HistoryManager {
             debug!("Created recordings directory: {:?}", recordings_dir);
         }
 
-        let manager = Self {
+        let mut manager = Self {
             app_handle: app_handle.clone(),
             recordings_dir,
             db_path,
         };
 
         // Initialize database and run migrations synchronously
-        manager.init_database()?;
+        if let Err(e) = manager.init_database() {
+            let Some(too_new) = e.downcast_ref::<HistoryDbTooNew>() else {
+                return Err(e);
+            };
+            // A newer Handy owns this database. Leave it untouched and keep
+            // working with a throwaway session history instead of crashing.
+            error!("History unavailable: {}", too_new);
+            notify_history_unavailable(app_handle, &manager.db_path);
+            manager.db_path = std::env::temp_dir()
+                .join(format!("handy-session-history-{}.db", std::process::id()));
+            let _ = fs::remove_file(&manager.db_path);
+            manager.init_database()?;
+        }
 
         Ok(manager)
     }
@@ -379,11 +534,13 @@ impl HistoryManager {
             post_processed_text: row.get("post_processed_text")?,
             post_process_prompt: row.get("post_process_prompt")?,
             post_process_requested: row.get("post_process_requested")?,
+            cleanup_attempted: row.get("cleanup_attempted")?,
             cleanup_state: CleanupState::from_db(row.get("cleanup_state")?),
             context: HistoryContext {
                 app: row.get("context_app")?,
                 title: row.get("context_title")?,
                 screenshot: row.get("context_screenshot")?,
+                screenshot_sent: row.get("context_screenshot_sent")?,
             }
             .into_option(),
         })
@@ -391,6 +548,15 @@ impl HistoryManager {
 
     pub fn recordings_dir(&self) -> &std::path::Path {
         &self.recordings_dir
+    }
+
+    /// A fresh, unused WAV file name for a new recording. Millisecond
+    /// resolution keeps a clip skipped by the dead-air guard and a dictation
+    /// started right after it from overwriting each other's audio (the old
+    /// whole-second `handy-{secs}.wav` names collided). The name is stored
+    /// per entry, so existing second-resolution files keep working.
+    pub fn new_recording_file_name(&self) -> String {
+        unique_recording_file_name(&self.recordings_dir, chrono::Utc::now().timestamp_millis())
     }
 
     /// Save a new history entry to the database.
@@ -401,6 +567,7 @@ impl HistoryManager {
         file_name: String,
         transcription_text: String,
         post_process_requested: bool,
+        cleanup_attempted: bool,
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
         cleanup_state: Option<CleanupState>,
@@ -425,8 +592,10 @@ impl HistoryManager {
                 context_app,
                 context_title,
                 context_screenshot,
-                context_process
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                context_process,
+                context_screenshot_sent,
+                cleanup_attempted
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 &file_name,
                 timestamp,
@@ -441,6 +610,8 @@ impl HistoryManager {
                 &context.title,
                 context.screenshot,
                 &match_process,
+                context.screenshot_sent,
+                cleanup_attempted,
             ],
         )?;
 
@@ -454,6 +625,7 @@ impl HistoryManager {
             post_processed_text,
             post_process_prompt,
             post_process_requested,
+            cleanup_attempted: Some(cleanup_attempted),
             cleanup_state,
             context: context.into_option(),
         };
@@ -476,16 +648,17 @@ impl HistoryManager {
     }
 
     /// Update an existing history entry with new transcription results (used by retry).
-    /// `post_process_requested` records whether a cleanup request was
-    /// attempted; `context` is what that request shared, or `None` to keep
-    /// the stored context (no request went out, so nothing new was shared).
+    /// `cleanup` is (requested, attempted): whether cleanup was wanted and
+    /// whether a request actually went out. `context` is what that request
+    /// shared, or `None` to keep the stored context (no request went out, so
+    /// nothing new was shared).
     pub fn update_transcription(
         &self,
         id: i64,
         transcription_text: String,
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
-        post_process_requested: bool,
+        cleanup: (bool, bool),
         context: Option<HistoryContext>,
     ) -> Result<HistoryEntry> {
         let conn = self.get_connection()?;
@@ -495,7 +668,7 @@ impl HistoryManager {
             transcription_text,
             post_processed_text,
             post_process_prompt,
-            post_process_requested,
+            cleanup,
             context,
         )?;
         if updated == 0 {
@@ -532,7 +705,7 @@ impl HistoryManager {
         transcription_text: String,
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
-        post_process_requested: bool,
+        (post_process_requested, cleanup_attempted): (bool, bool),
         context: Option<HistoryContext>,
     ) -> Result<usize> {
         let keep_context = context.is_none();
@@ -546,7 +719,10 @@ impl HistoryManager {
                  cleanup_state = NULL,
                  context_app = CASE WHEN ?9 THEN context_app ELSE ?4 END,
                  context_title = CASE WHEN ?9 THEN context_title ELSE ?5 END,
-                 context_screenshot = CASE WHEN ?9 THEN context_screenshot ELSE ?6 END
+                 context_screenshot = CASE WHEN ?9 THEN context_screenshot ELSE ?6 END,
+                 context_screenshot_sent =
+                     CASE WHEN ?9 THEN context_screenshot_sent ELSE ?10 END,
+                 cleanup_attempted = ?11
              WHERE id = ?7",
             params![
                 transcription_text,
@@ -557,7 +733,9 @@ impl HistoryManager {
                 context.screenshot,
                 id,
                 post_process_requested,
-                keep_context
+                keep_context,
+                context.screenshot_sent,
+                cleanup_attempted
             ],
         )?)
     }
@@ -600,7 +778,8 @@ impl HistoryManager {
             }) => conn.execute(
                 "UPDATE transcription_history
                  SET post_processed_text = ?1, post_process_prompt = ?2, cleanup_state = ?3,
-                     context_screenshot = (context_screenshot OR ?6)
+                     context_screenshot = (context_screenshot OR ?6),
+                     context_screenshot_sent = (context_screenshot_sent OR ?6)
                  WHERE id = ?4 AND cleanup_state = ?5",
                 params![
                     text,
@@ -1019,10 +1198,39 @@ impl HistoryManager {
     }
 }
 
+/// `handy-{millis}.wav`, with a numeric suffix if that name is already taken
+/// in `dir` (two recordings within the same millisecond).
+fn unique_recording_file_name(dir: &std::path::Path, timestamp_millis: i64) -> String {
+    let base = format!("handy-{}", timestamp_millis);
+    let mut name = format!("{}.wav", base);
+    let mut suffix = 1u32;
+    while dir.join(&name).exists() && suffix < 1_000 {
+        name = format!("{}-{}.wav", base, suffix);
+        suffix += 1;
+    }
+    name
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rusqlite::{params, Connection};
+
+    #[test]
+    fn recording_file_names_use_millis_and_never_reuse_a_taken_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "handy-names-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = unique_recording_file_name(&dir, 1_700_000_000_123);
+        assert_eq!(first, "handy-1700000000123.wav");
+        std::fs::write(dir.join(&first), b"x").unwrap();
+        let second = unique_recording_file_name(&dir, 1_700_000_000_123);
+        assert_eq!(second, "handy-1700000000123-1.wav");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn setup_conn() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory db");
@@ -1041,7 +1249,9 @@ mod tests {
                 context_app TEXT,
                 context_title TEXT,
                 context_screenshot BOOLEAN NOT NULL DEFAULT 0,
-                context_process TEXT
+                context_process TEXT,
+                context_screenshot_sent BOOLEAN NOT NULL DEFAULT 0,
+                cleanup_attempted BOOLEAN
             );",
         )
         .expect("create transcription_history table");
@@ -1439,11 +1649,81 @@ mod tests {
     }
 
     #[test]
+    fn future_upstream_v5_with_fork_columns_is_not_reset() {
+        // fork (v4 + fork columns) -> newer upstream ran its migration 5
+        // (here: a new column) -> fork again. Resetting to 4 would make
+        // upstream re-run migration 5 and fail on the duplicate column.
+        for (version, extra) in [
+            (
+                5,
+                "ALTER TABLE transcription_history ADD COLUMN upstream_new TEXT;",
+            ),
+            (
+                5,
+                "CREATE INDEX idx_upstream ON transcription_history(timestamp);",
+            ),
+            (6, "CREATE TABLE upstream_table (id INTEGER PRIMARY KEY);"),
+        ] {
+            let mut conn = setup_conn();
+            conn.execute_batch(extra).expect("upstream change");
+            conn.pragma_update(None, "user_version", version)
+                .expect("set version");
+            let err = migrate_schema(&mut conn).expect_err("too new");
+            assert!(err.downcast_ref::<HistoryDbTooNew>().is_some());
+            assert_eq!(user_version(&conn), version, "{extra}");
+        }
+    }
+
+    #[test]
+    fn version_5_needs_only_cleanup_state_to_be_legacy() {
+        let mut conn = Connection::open_in_memory().expect("open");
+        Migrations::new(MIGRATIONS.to_vec())
+            .to_latest(&mut conn)
+            .expect("upstream schema");
+        conn.execute_batch("ALTER TABLE transcription_history ADD COLUMN cleanup_state TEXT;")
+            .expect("fork migration 5");
+        conn.pragma_update(None, "user_version", 5)
+            .expect("set version");
+        migrate_schema(&mut conn).expect("migrate");
+        assert_eq!(user_version(&conn), 4);
+        assert_fork_columns_present(&conn);
+    }
+
+    #[test]
+    fn version_6_missing_its_context_columns_is_not_legacy() {
+        let mut conn = Connection::open_in_memory().expect("open");
+        Migrations::new(MIGRATIONS.to_vec())
+            .to_latest(&mut conn)
+            .expect("upstream schema");
+        conn.execute_batch("ALTER TABLE transcription_history ADD COLUMN cleanup_state TEXT;")
+            .expect("cleanup_state only");
+        conn.pragma_update(None, "user_version", 6)
+            .expect("set version");
+        assert!(migrate_schema(&mut conn).is_err());
+        assert_eq!(user_version(&conn), 6);
+    }
+
+    #[test]
+    fn manual_rollback_to_version_3_is_restored() {
+        let mut conn = setup_conn();
+        insert_entry(&conn, 100, "kept", None);
+        conn.pragma_update(None, "user_version", 3)
+            .expect("set version");
+        migrate_schema(&mut conn).expect("migrate");
+        assert_eq!(user_version(&conn), 4);
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("fetch")
+            .expect("entry");
+        assert_eq!(entry.transcription_text, "kept");
+    }
+
+    #[test]
     fn newer_upstream_version_is_left_alone() {
         let mut conn = setup_conn();
         conn.pragma_update(None, "user_version", 9)
             .expect("set version");
-        assert!(migrate_schema(&mut conn).is_err());
+        let err = migrate_schema(&mut conn).expect_err("too new");
+        assert!(err.downcast_ref::<HistoryDbTooNew>().is_some());
         assert_eq!(user_version(&conn), 9);
     }
 
@@ -1528,7 +1808,7 @@ mod tests {
             "hi".into(),
             None,
             None,
-            false,
+            (false, false),
             None,
         )
         .expect("update");
@@ -1542,6 +1822,7 @@ mod tests {
                 app: Some("slack".into()),
                 title: Some("#general".into()),
                 screenshot: true,
+                screenshot_sent: false,
             })
         );
 
@@ -1552,7 +1833,7 @@ mod tests {
             "hi".into(),
             Some("Hi.".into()),
             None,
-            true,
+            (true, true),
             Some(HistoryContext::default()),
         )
         .expect("update");
@@ -1590,6 +1871,7 @@ mod tests {
                 app: Some("Slack".into()),
                 title: None,
                 screenshot: false,
+                screenshot_sent: false,
             })
         );
         let first = HistoryManager::query_history_page(&conn, None, None, None)
@@ -1613,5 +1895,67 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(shot_only.clone().into_option(), Some(shot_only));
+        // An upload that the cleanup didn't use still shows in History.
+        let sent_only = HistoryContext {
+            screenshot_sent: true,
+            ..Default::default()
+        };
+        assert_eq!(sent_only.clone().into_option(), Some(sent_only));
+    }
+
+    #[test]
+    fn cleanup_intent_is_kept_apart_from_the_attempt() {
+        let conn = setup_conn();
+        insert_entry(&conn, 1, "um hi", None);
+        // Cleanup wanted but misconfigured: requested, not attempted.
+        HistoryManager::update_transcription_with_conn(
+            &conn,
+            1,
+            "hi".into(),
+            None,
+            None,
+            (true, false),
+            None,
+        )
+        .expect("update");
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("fetch")
+            .expect("entry");
+        assert!(entry.post_process_requested);
+        assert_eq!(entry.cleanup_attempted, Some(false));
+
+        // Rows from before the column read as unknown.
+        insert_entry(&conn, 2, "old", None);
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("fetch")
+            .expect("entry");
+        assert_eq!(entry.cleanup_attempted, None);
+    }
+
+    #[test]
+    fn uploaded_screenshot_is_recorded_even_when_unused() {
+        let conn = setup_conn();
+        insert_entry(&conn, 1, "um hi", None);
+        HistoryManager::update_transcription_with_conn(
+            &conn,
+            1,
+            "hi".into(),
+            Some("Hi.".into()),
+            None,
+            (true, true),
+            Some(HistoryContext {
+                app: Some("Slack".into()),
+                title: None,
+                screenshot: false,
+                screenshot_sent: true,
+            }),
+        )
+        .expect("update");
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("fetch")
+            .expect("entry");
+        let context = entry.context.expect("context");
+        assert!(context.screenshot_sent);
+        assert!(!context.screenshot);
     }
 }

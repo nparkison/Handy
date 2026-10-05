@@ -686,7 +686,9 @@ pub fn is_no_input_device_error(error_message: &str) -> bool {
 
 /// Route one 16 kHz frame through VAD to recording and live outputs.
 /// Kept free-standing to permit disjoint borrows around resampler callbacks.
-/// Returns how many samples VAD forwarded as speech.
+/// Returns how many samples count as *live speech* for tap classification:
+/// samples VAD forwarded as speech for a frame the inner model actually heard
+/// as voice. `stats.speech_samples` still counts everything VAD forwarded.
 fn handle_frame(
     samples: &[f32],
     vad_policy: VadPolicy,
@@ -712,18 +714,28 @@ fn handle_frame(
 
     if let Some(cfg) = vad {
         let mut detector = cfg.detector.lock().unwrap();
-        match detector
-            .push_frame(samples)
-            .unwrap_or(VadFrame::Speech(samples))
-        {
-            VadFrame::Speech(buf) => {
-                let speech = buf.len() as u64;
-                stats.speech_samples += speech;
+        let (forwarded, vad_failed) = match detector.push_frame(samples) {
+            Ok(VadFrame::Speech(buf)) => {
                 emit(buf);
-                speech
+                (buf.len() as u64, false)
             }
-            VadFrame::Noise => 0,
+            Ok(VadFrame::Noise) => (0, false),
+            Err(_) => {
+                // Fail open: keep the audio rather than lose words.
+                emit(samples);
+                (samples.len() as u64, true)
+            }
+        };
+        stats.speech_samples += forwarded;
+        // A smoothing detector's hangover tail keeps emitting `Speech` after
+        // the voice stops. When that tail started in the pre-roll (the user
+        // just finished talking before pressing), counting it would turn a
+        // silent tap into a dictation, so hangover-only frames are not live
+        // speech.
+        if forwarded > 0 && !vad_failed && detector.last_frame_voiced() == Some(false) {
+            return 0;
         }
+        forwarded
     } else {
         emit(samples);
         0

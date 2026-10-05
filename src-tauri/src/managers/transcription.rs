@@ -21,8 +21,8 @@ use std::time::{Duration, Instant, SystemTime};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_specta::Event;
 use transcribe_cpp::{
-    Backend, Feature, Model, ModelOptions, RunExtension, RunOptions, Session, StreamOptions, Task,
-    WhisperRunOptions,
+    Backend, Feature, Model, ModelOptions, RunExtension, RunOptions, Session, SessionOptions,
+    StreamOptions, Task, WhisperRunOptions,
 };
 use transcribe_rs::{
     onnx::{
@@ -561,6 +561,7 @@ impl TranscriptionManager {
             &model_info.engine_type,
             &model_path,
             device_index,
+            None,
         )
         .inspect_err(|e| emit_loading_failed(&e.to_string()))?;
 
@@ -1446,6 +1447,12 @@ fn run_engine_batch(
 /// state or emitting model events. Shared by the live load path
 /// ([`TranscriptionManager::load_model_with_device`]) and isolated engines
 /// such as the replay bench ([`IsolatedEngine`]).
+///
+/// `cpu_threads` caps the engine's CPU worker threads where the engine API
+/// exposes it (whisper via transcribe-cpp, Moonshine streaming); `None` keeps
+/// the library default. The ONNX batch engines (Parakeet, SenseVoice, ...)
+/// are loaded through transcribe-rs constructors that take no thread option,
+/// so they always use ONNX Runtime's default pool.
 fn build_engine(
     app_handle: &AppHandle,
     model_manager: &ModelManager,
@@ -1453,7 +1460,9 @@ fn build_engine(
     engine_type: &EngineType,
     model_path: &std::path::Path,
     device_index: Option<usize>,
+    cpu_threads: Option<usize>,
 ) -> Result<LoadedEngine> {
+    let cpu_threads = cpu_threads.unwrap_or(0);
     let loaded_engine = match engine_type {
         EngineType::TranscribeCpp => {
             // The whisper backend is chosen at load time (transcribe-cpp has
@@ -1489,7 +1498,11 @@ fn build_engine(
             // The bound backend may differ from the request (e.g. CPU
             // fallback under Auto); log what actually loaded.
             let bound_backend = model.backend();
-            let session = model.session().map_err(|e| {
+            let session_options = SessionOptions {
+                n_threads: i32::try_from(cpu_threads).unwrap_or(0),
+                ..SessionOptions::default()
+            };
+            let session = model.session_with(&session_options).map_err(|e| {
                 anyhow::anyhow!(
                     "Failed to create session for whisper model {}: {}",
                     model_id,
@@ -1542,8 +1555,8 @@ fn build_engine(
             LoadedEngine::Moonshine(engine)
         }
         EngineType::MoonshineStreaming => {
-            let engine =
-                StreamingModel::load(model_path, 0, &Quantization::default()).map_err(|e| {
+            let engine = StreamingModel::load(model_path, cpu_threads, &Quantization::default())
+                .map_err(|e| {
                     anyhow::anyhow!(
                         "Failed to load moonshine streaming model {}: {}",
                         model_id,
@@ -1575,6 +1588,16 @@ fn build_engine(
         }
     };
     Ok(loaded_engine)
+}
+
+/// CPU worker threads for an [`IsolatedEngine`]: half the logical cores (at
+/// least one). The bench lowers its own thread's priority, but engine worker
+/// pools are separate threads that run at normal priority on Windows, so a
+/// thread cap is what actually leaves cores free for a live dictation.
+fn isolated_engine_cpu_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).max(1))
+        .unwrap_or(1)
 }
 
 /// A transcription engine loaded outside [`TranscriptionManager`], for offline
@@ -1609,6 +1632,7 @@ impl IsolatedEngine {
                 &info.engine_type,
                 &model_path,
                 None,
+                Some(isolated_engine_cpu_threads()),
             )
         }))
         .map_err(|payload| {

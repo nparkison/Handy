@@ -316,7 +316,10 @@ pub async fn start(app: &AppHandle, request: ReplayBenchRequest) -> Result<(), S
 
 /// Best effort: run the bench below normal priority so a dictation that
 /// starts mid-clip (load, transcribe and cleanup can't be interrupted) wins
-/// the CPU. On Linux, threads the engine spawns from here inherit it.
+/// the CPU. On Linux, threads the engine spawns from here inherit it; on
+/// Windows they don't, which is why bench engines also get a CPU thread cap
+/// (see `IsolatedEngine`). Cleanup runs off this thread (`run_bench_cleanup`)
+/// so the shared async runtime never inherits the lowered priority.
 fn lower_current_thread_priority() {
     #[cfg(windows)]
     {
@@ -426,7 +429,7 @@ fn run(
         emit(app, progress(model, 0, total, ReplayBenchPhase::Loading));
         let load_start = Instant::now();
         let mut engine = match load_engine(app, model_manager, &model.model_id) {
-            Ok(engine) => engine,
+            Ok(engine) => Some(engine),
             Err(e) => {
                 warn!("Replay bench could not load {}: {}", model.model_id, e);
                 emit(
@@ -446,27 +449,30 @@ fn run(
             if dictation_active(app) {
                 // Free the bench model while the user dictates so the live
                 // model has the memory (and VRAM) to itself, then reload.
-                drop(engine);
-                crate::memory::trim_freed_memory();
+                release_engine(&mut engine);
                 if !wait_for_dictation(app, model, entry_index, total) {
                     emit_model_finished(app, model, load_ms, &results);
                     break 'models;
                 }
+            }
+            if engine.is_none() {
+                // Freed for a dictation (here or while an earlier entry
+                // waited to run its cleanup): load it again.
                 emit(
                     app,
                     progress(model, entry_index, total, ReplayBenchPhase::Loading),
                 );
-                engine = match load_engine(app, model_manager, &model.model_id) {
-                    Ok(engine) => engine,
+                match load_engine(app, model_manager, &model.model_id) {
+                    Ok(loaded) => engine = Some(loaded),
                     Err(e) => {
                         warn!("Replay bench could not reload {}: {}", model.model_id, e);
                         emit_model_finished(app, model, load_ms, &results);
                         continue 'models;
                     }
-                };
+                }
             }
             if cancelled() {
-                drop(engine);
+                release_engine(&mut engine);
                 emit_model_finished(app, model, load_ms, &results);
                 break 'models;
             }
@@ -494,9 +500,15 @@ fn run(
         }
 
         // Free this model before the next one loads.
-        drop(engine);
-        crate::memory::trim_freed_memory();
+        release_engine(&mut engine);
         emit_model_finished(app, model, load_ms, &results);
+    }
+}
+
+/// Drop the bench engine (if loaded) and hand its memory back to the OS.
+fn release_engine(engine: &mut Option<IsolatedEngine>) {
+    if engine.take().is_some() {
+        crate::memory::trim_freed_memory();
     }
 }
 
@@ -532,7 +544,7 @@ fn elapsed_ms(start: Instant) -> f64 {
 #[allow(clippy::too_many_arguments)]
 fn bench_entry(
     app: &AppHandle,
-    engine: &mut IsolatedEngine,
+    engine: &mut Option<IsolatedEngine>,
     model_manager: &ModelManager,
     settings: &AppSettings,
     planned: &PlannedEntry,
@@ -567,8 +579,12 @@ fn bench_entry(
     };
     let audio_secs = samples.len() as f64 / SAMPLE_RATE;
 
+    let Some(loaded) = engine.as_mut() else {
+        result.failure = Some(ReplayBenchFailure::TranscribeFailed);
+        return result;
+    };
     let start = Instant::now();
-    let text = match engine.transcribe(&samples, settings, model_manager) {
+    let text = match loaded.transcribe(&samples, settings, model_manager) {
         Ok(text) => text,
         Err(e) => {
             warn!(
@@ -587,21 +603,18 @@ fn bench_entry(
     let mut compared = text.clone();
     // A dictation may have started during transcription. Cleanup can't be
     // interrupted once sent, and a single-slot local LLM would make the live
-    // cleanup queue behind it, so wait for the dictation to finish first.
+    // cleanup queue behind it, so wait for the dictation to finish first,
+    // without holding the bench model (the next entry reloads it).
+    if include_cleanup && dictation_active(app) {
+        release_engine(engine);
+    }
     if include_cleanup && wait_for_dictation(app, model, entry_index, total) {
         emit(
             app,
             progress(model, entry_index, total, ReplayBenchPhase::Cleanup),
         );
         let start = Instant::now();
-        // No app context: the bench replays audio outside the app it was
-        // dictated into, so it always measures the selected prompt.
-        let outcome = tauri::async_runtime::block_on(crate::actions::run_cleanup(
-            settings,
-            &text,
-            &crate::app_context::CleanupRequest::plain(),
-            &RequestSent::detached(),
-        ));
+        let outcome = run_bench_cleanup(settings, &text);
         match outcome {
             CleanupOutcome::Cleaned(cleaned) => {
                 result.cleanup_ms = Some(elapsed_ms(start));
@@ -622,6 +635,33 @@ fn bench_entry(
     result.diff = diff.tokens;
     result.text = text;
     result
+}
+
+/// Run the bench cleanup on a runtime worker rather than the bench thread.
+/// The bench thread runs below normal priority, and on Linux any thread it
+/// creates inherits that nice value; awaiting the cleanup here would let the
+/// runtime's blocking pool grow niced threads that live dictations reuse.
+/// No app context: the bench replays audio outside the app it was dictated
+/// into, so it always measures the selected prompt.
+fn run_bench_cleanup(settings: &AppSettings, text: &str) -> CleanupOutcome {
+    let settings = settings.clone();
+    let text = text.to_string();
+    let task = tauri::async_runtime::spawn(async move {
+        crate::actions::run_cleanup(
+            &settings,
+            &text,
+            &crate::app_context::CleanupRequest::plain(),
+            &RequestSent::detached(),
+        )
+        .await
+    });
+    match tauri::async_runtime::block_on(task) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            warn!("Replay bench cleanup task failed: {}", e);
+            CleanupOutcome::Failed
+        }
+    }
 }
 
 fn summarize(

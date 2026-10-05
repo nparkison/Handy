@@ -10,6 +10,9 @@ import { Input } from "../../ui/Input";
 import { useSettings } from "../../../hooks/useSettings";
 import { useSettingsStore } from "../../../stores/settingsStore";
 
+/** Same cap as the backend (`MAX_APP_RULES` in shortcut/mod.rs). */
+const MAX_APP_RULES = 100;
+
 const DEFAULT_MODE: AppContextMode = "app_and_title";
 
 const newRuleId = (): string => {
@@ -294,7 +297,14 @@ export const AppRules: React.FC = () => {
   const latestRules = (): AppRule[] =>
     useSettingsStore.getState().settings?.app_rules ?? [];
 
+  const atLimit = rules.length >= MAX_APP_RULES;
+
   const addRule = (pattern: string) => {
+    // The backend refuses more than MAX_APP_RULES rules.
+    if (latestRules().length >= MAX_APP_RULES) {
+      setPicking(false);
+      return;
+    }
     // A double click must not add the rule twice.
     const now = Date.now();
     if (now - lastAddRef.current < 400) return;
@@ -406,7 +416,7 @@ export const AppRules: React.FC = () => {
           </ol>
         )}
 
-        {picking ? (
+        {picking && !atLimit ? (
           <div className="flex flex-col gap-2 rounded-md border border-mid-gray/30 p-3">
             <span className="text-xs font-medium text-text/60">
               {t("settings.postProcessing.context.rules.recentApps")}
@@ -446,11 +456,18 @@ export const AppRules: React.FC = () => {
             size="sm"
             className="self-start flex items-center gap-1"
             onClick={openPicker}
-            disabled={openingPicker}
+            disabled={openingPicker || atLimit}
           >
             <Plus width={14} height={14} aria-hidden="true" />
             {t("settings.postProcessing.context.rules.add")}
           </Button>
+        )}
+        {atLimit && (
+          <p className="text-xs text-text/60">
+            {t("settings.postProcessing.context.rules.limitReached", {
+              max: MAX_APP_RULES,
+            })}
+          </p>
         )}
       </div>
     </SettingContainer>
