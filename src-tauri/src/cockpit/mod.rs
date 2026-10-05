@@ -23,7 +23,7 @@
 
 pub mod deadline;
 pub mod gestures;
-mod platform;
+pub(crate) mod platform;
 pub mod swap;
 
 use crate::actions::ShortcutAction;

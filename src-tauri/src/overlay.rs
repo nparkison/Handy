@@ -674,6 +674,23 @@ pub fn show_transcribing_overlay(app_handle: &AppHandle) {
     show_overlay_state(app_handle, "transcribing");
 }
 
+#[derive(Clone, serde::Serialize)]
+struct CleanupContextPayload {
+    app: Option<String>,
+    screenshot: bool,
+}
+
+/// Tell the overlay what context the running cleanup shares, for the
+/// "Cleaning up… · Slack" chip (and its camera icon when a screenshot went
+/// along). Harmless when the overlay is hidden.
+pub fn emit_cleanup_context(app_handle: &AppHandle, app: Option<String>, screenshot: bool) {
+    let _ = app_handle.emit_to(
+        "recording_overlay",
+        "cleanup-context",
+        CleanupContextPayload { app, screenshot },
+    );
+}
+
 /// Shows the processing overlay window
 pub fn show_processing_overlay(app_handle: &AppHandle) {
     show_overlay_state(app_handle, "processing");

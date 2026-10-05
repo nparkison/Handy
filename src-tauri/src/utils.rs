@@ -98,8 +98,8 @@ pub fn cancel_current_operation(app: &AppHandle) {
     let tm = app.state::<Arc<TranscriptionManager>>();
     tm.cancel_stream();
 
-    // Drop any screenshot captured for this recording's post-processing
-    if let Some(slot) = app.try_state::<crate::screen_context::ScreenContextSlot>() {
+    // Drop any app context / screenshot captured for this recording's cleanup
+    if let Some(slot) = app.try_state::<crate::screen_context::PressContextSlot>() {
         slot.clear();
     }
 

@@ -32,7 +32,37 @@ static MIGRATIONS: &[M] = &[
     M::up("ALTER TABLE transcription_history ADD COLUMN post_process_prompt TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN post_process_requested BOOLEAN NOT NULL DEFAULT 0;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN cleanup_state TEXT;"),
+    M::up(
+        "ALTER TABLE transcription_history ADD COLUMN context_app TEXT;
+         ALTER TABLE transcription_history ADD COLUMN context_title TEXT;
+         ALTER TABLE transcription_history ADD COLUMN context_screenshot BOOLEAN NOT NULL DEFAULT 0;",
+    ),
 ];
+
+/// Columns read by [`HistoryManager::map_history_entry`], in SELECT order.
+macro_rules! entry_columns {
+    () => {
+        "id, file_name, timestamp, saved, title, transcription_text, post_processed_text, \
+         post_process_prompt, post_process_requested, cleanup_state, context_app, \
+         context_title, context_screenshot"
+    };
+}
+
+/// What app context was sent with an entry's cleanup request: never the
+/// screenshot itself, only whether one was shared.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct HistoryContext {
+    pub app: Option<String>,
+    pub title: Option<String>,
+    pub screenshot: bool,
+}
+
+impl HistoryContext {
+    /// `None` when nothing was shared.
+    pub fn into_option(self) -> Option<Self> {
+        (self.app.is_some() || self.title.is_some() || self.screenshot).then_some(self)
+    }
+}
 
 /// Where a deadline-missed cleanup stands. `None` on an entry means cleanup
 /// either finished in time, failed, or never ran (see `post_process_requested`).
@@ -93,6 +123,8 @@ pub struct HistoryEntry {
     pub post_process_prompt: Option<String>,
     pub post_process_requested: bool,
     pub cleanup_state: Option<CleanupState>,
+    /// App context sent with the cleanup request (`None` when none was sent).
+    pub context: Option<HistoryContext>,
 }
 
 pub struct HistoryManager {
@@ -247,6 +279,12 @@ impl HistoryManager {
             post_process_prompt: row.get("post_process_prompt")?,
             post_process_requested: row.get("post_process_requested")?,
             cleanup_state: CleanupState::from_db(row.get("cleanup_state")?),
+            context: HistoryContext {
+                app: row.get("context_app")?,
+                title: row.get("context_title")?,
+                screenshot: row.get("context_screenshot")?,
+            }
+            .into_option(),
         })
     }
 
@@ -256,6 +294,7 @@ impl HistoryManager {
 
     /// Save a new history entry to the database.
     /// The WAV file should already have been written to the recordings directory.
+    #[allow(clippy::too_many_arguments)]
     pub fn save_entry(
         &self,
         file_name: String,
@@ -264,6 +303,7 @@ impl HistoryManager {
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
         cleanup_state: Option<CleanupState>,
+        context: HistoryContext,
     ) -> Result<HistoryEntry> {
         let timestamp = Utc::now().timestamp();
         let title = self.format_timestamp_title(timestamp);
@@ -279,8 +319,11 @@ impl HistoryManager {
                 post_processed_text,
                 post_process_prompt,
                 post_process_requested,
-                cleanup_state
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                cleanup_state,
+                context_app,
+                context_title,
+                context_screenshot
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 &file_name,
                 timestamp,
@@ -291,6 +334,9 @@ impl HistoryManager {
                 &post_process_prompt,
                 post_process_requested,
                 cleanup_state.map(CleanupState::as_db),
+                &context.app,
+                &context.title,
+                context.screenshot,
             ],
         )?;
 
@@ -305,6 +351,7 @@ impl HistoryManager {
             post_process_prompt,
             post_process_requested,
             cleanup_state,
+            context: context.into_option(),
         };
 
         debug!("Saved history entry with id {}", entry.id);
@@ -331,6 +378,7 @@ impl HistoryManager {
         transcription_text: String,
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
+        context: HistoryContext,
     ) -> Result<HistoryEntry> {
         let conn = self.get_connection()?;
         let updated = conn.execute(
@@ -338,12 +386,18 @@ impl HistoryManager {
              SET transcription_text = ?1,
                  post_processed_text = ?2,
                  post_process_prompt = ?3,
-                 cleanup_state = NULL
-             WHERE id = ?4",
+                 cleanup_state = NULL,
+                 context_app = ?4,
+                 context_title = ?5,
+                 context_screenshot = ?6
+             WHERE id = ?7",
             params![
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
+                context.app,
+                context.title,
+                context.screenshot,
                 id
             ],
         )?;
@@ -352,13 +406,15 @@ impl HistoryManager {
             return Err(anyhow!("History entry {} not found", id));
         }
 
-        let entry = conn
-            .query_row(
-                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, cleanup_state
-                 FROM transcription_history WHERE id = ?1",
-                params![id],
-                Self::map_history_entry,
-            )?;
+        let entry = conn.query_row(
+            concat!(
+                "SELECT ",
+                entry_columns!(),
+                " FROM transcription_history WHERE id = ?1"
+            ),
+            params![id],
+            Self::map_history_entry,
+        )?;
 
         debug!("Updated transcription for history entry {}", id);
 
@@ -428,8 +484,11 @@ impl HistoryManager {
         }
         Ok(conn
             .query_row(
-                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, cleanup_state
-                 FROM transcription_history WHERE id = ?1",
+                concat!(
+                    "SELECT ",
+                    entry_columns!(),
+                    " FROM transcription_history WHERE id = ?1"
+                ),
                 params![id],
                 Self::map_history_entry,
             )
@@ -595,16 +654,17 @@ impl HistoryManager {
         let fetch_count: i64 = limit.map_or(-1, |lim| lim as i64 + 1);
         let pattern = search.map(like_contains_pattern);
 
-        let mut stmt = conn.prepare(
-            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, cleanup_state
-             FROM transcription_history
+        let mut stmt = conn.prepare(concat!(
+            "SELECT ",
+            entry_columns!(),
+            " FROM transcription_history
              WHERE (?1 IS NULL OR id < ?1)
                AND (?2 IS NULL
                     OR transcription_text LIKE ?2 ESCAPE '\\'
                     OR COALESCE(post_processed_text, '') LIKE ?2 ESCAPE '\\')
              ORDER BY id DESC
-             LIMIT ?3",
-        )?;
+             LIMIT ?3"
+        ))?;
         let mut entries = stmt
             .query_map(
                 params![cursor, pattern, fetch_count],
@@ -620,6 +680,27 @@ impl HistoryManager {
         Ok(PaginatedHistory { entries, has_more })
     }
 
+    /// Distinct app names recorded as cleanup context, most recently used
+    /// first. Feeds the "Add rule" picker.
+    pub fn get_recent_context_apps(&self, limit: usize) -> Result<Vec<String>> {
+        let conn = self.get_connection()?;
+        Self::get_recent_context_apps_with_conn(&conn, limit)
+    }
+
+    fn get_recent_context_apps_with_conn(conn: &Connection, limit: usize) -> Result<Vec<String>> {
+        let mut stmt = conn.prepare(
+            "SELECT context_app FROM transcription_history
+             WHERE context_app IS NOT NULL AND context_app != ''
+             GROUP BY context_app
+             ORDER BY MAX(id) DESC
+             LIMIT ?1",
+        )?;
+        let apps = stmt
+            .query_map(params![limit as i64], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(apps)
+    }
+
     /// The newest `limit` entries that have transcription text (failed
     /// recordings are skipped), newest first. Used by the tray's recent list.
     pub fn get_recent_completed_entries(&self, limit: usize) -> Result<Vec<HistoryEntry>> {
@@ -631,13 +712,14 @@ impl HistoryManager {
         conn: &Connection,
         limit: usize,
     ) -> Result<Vec<HistoryEntry>> {
-        let mut stmt = conn.prepare(
-            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, cleanup_state
-             FROM transcription_history
+        let mut stmt = conn.prepare(concat!(
+            "SELECT ",
+            entry_columns!(),
+            " FROM transcription_history
              WHERE transcription_text != ''
              ORDER BY id DESC
-             LIMIT ?1",
-        )?;
+             LIMIT ?1"
+        ))?;
         let entries = stmt
             .query_map(params![limit as i64], Self::map_history_entry)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -646,22 +728,13 @@ impl HistoryManager {
 
     #[cfg(test)]
     fn get_latest_entry_with_conn(conn: &Connection) -> Result<Option<HistoryEntry>> {
-        let mut stmt = conn.prepare(
-            "SELECT
-                id,
-                file_name,
-                timestamp,
-                saved,
-                title,
-                transcription_text,
-                post_processed_text,
-                post_process_prompt,
-                post_process_requested,
-                cleanup_state
-             FROM transcription_history
+        let mut stmt = conn.prepare(concat!(
+            "SELECT ",
+            entry_columns!(),
+            " FROM transcription_history
              ORDER BY timestamp DESC
-             LIMIT 1",
-        )?;
+             LIMIT 1"
+        ))?;
 
         let entry = stmt.query_row([], Self::map_history_entry).optional()?;
         Ok(entry)
@@ -674,23 +747,14 @@ impl HistoryManager {
     }
 
     fn get_latest_completed_entry_with_conn(conn: &Connection) -> Result<Option<HistoryEntry>> {
-        let mut stmt = conn.prepare(
-            "SELECT
-                id,
-                file_name,
-                timestamp,
-                saved,
-                title,
-                transcription_text,
-                post_processed_text,
-                post_process_prompt,
-                post_process_requested,
-                cleanup_state
-             FROM transcription_history
+        let mut stmt = conn.prepare(concat!(
+            "SELECT ",
+            entry_columns!(),
+            " FROM transcription_history
              WHERE transcription_text != ''
              ORDER BY timestamp DESC
-             LIMIT 1",
-        )?;
+             LIMIT 1"
+        ))?;
 
         let entry = stmt.query_row([], Self::map_history_entry).optional()?;
         Ok(entry)
@@ -734,21 +798,12 @@ impl HistoryManager {
     /// Synchronous lookup by id, for callers outside an async context (tray).
     pub fn find_entry(&self, id: i64) -> Result<Option<HistoryEntry>> {
         let conn = self.get_connection()?;
-        let mut stmt = conn.prepare(
-            "SELECT
-                id,
-                file_name,
-                timestamp,
-                saved,
-                title,
-                transcription_text,
-                post_processed_text,
-                post_process_prompt,
-                post_process_requested,
-                cleanup_state
-             FROM transcription_history
-             WHERE id = ?1",
-        )?;
+        let mut stmt = conn.prepare(concat!(
+            "SELECT ",
+            entry_columns!(),
+            " FROM transcription_history
+             WHERE id = ?1"
+        ))?;
 
         let entry = stmt.query_row([id], Self::map_history_entry).optional()?;
 
@@ -832,7 +887,10 @@ mod tests {
                 post_processed_text TEXT,
                 post_process_prompt TEXT,
                 post_process_requested BOOLEAN NOT NULL DEFAULT 0,
-                cleanup_state TEXT
+                cleanup_state TEXT,
+                context_app TEXT,
+                context_title TEXT,
+                context_screenshot BOOLEAN NOT NULL DEFAULT 0
             );",
         )
         .expect("create transcription_history table");
@@ -1100,5 +1158,76 @@ mod tests {
             .expect("fetch")
             .expect("entry");
         assert_eq!(entry.post_processed_text.as_deref(), Some("Hello."));
+    }
+
+    #[test]
+    fn migrations_add_context_columns_to_an_existing_db() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        // An existing DB at the previous schema version.
+        let previous = MIGRATIONS[..MIGRATIONS.len() - 1].to_vec();
+        Migrations::new(previous)
+            .to_latest(&mut conn)
+            .expect("old schema");
+        insert_entry(&conn, 100, "old entry", None);
+
+        Migrations::new(MIGRATIONS.to_vec())
+            .to_latest(&mut conn)
+            .expect("migrate");
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("fetch")
+            .expect("entry");
+        assert_eq!(entry.context, None);
+    }
+
+    #[test]
+    fn context_round_trips_and_feeds_recent_apps() {
+        let conn = setup_conn();
+        let insert = |timestamp: i64, app: Option<&str>, title: Option<&str>, shot: bool| {
+            conn.execute(
+                "INSERT INTO transcription_history (
+                    file_name, timestamp, saved, title, transcription_text,
+                    context_app, context_title, context_screenshot
+                ) VALUES (?1, ?2, 0, 't', 'text', ?3, ?4, ?5)",
+                params![format!("{timestamp}.wav"), timestamp, app, title, shot],
+            )
+            .expect("insert");
+        };
+        insert(1, Some("Slack"), Some("#general"), true);
+        insert(2, Some("Code"), None, false);
+        insert(3, None, None, false);
+        insert(4, Some("Slack"), None, false);
+
+        let latest = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("fetch")
+            .expect("entry");
+        assert_eq!(
+            latest.context,
+            Some(HistoryContext {
+                app: Some("Slack".into()),
+                title: None,
+                screenshot: false,
+            })
+        );
+        let first = HistoryManager::query_history_page(&conn, None, None, None)
+            .expect("page")
+            .entries
+            .pop()
+            .expect("oldest");
+        assert_eq!(first.context.unwrap().title.as_deref(), Some("#general"));
+
+        let apps = HistoryManager::get_recent_context_apps_with_conn(&conn, 10).expect("apps");
+        assert_eq!(apps, vec!["Slack".to_string(), "Code".to_string()]);
+        let one = HistoryManager::get_recent_context_apps_with_conn(&conn, 1).expect("apps");
+        assert_eq!(one, vec!["Slack".to_string()]);
+    }
+
+    #[test]
+    fn empty_history_context_is_none() {
+        assert_eq!(HistoryContext::default().into_option(), None);
+        let shot_only = HistoryContext {
+            screenshot: true,
+            ..Default::default()
+        };
+        assert_eq!(shot_only.clone().into_option(), Some(shot_only));
     }
 }

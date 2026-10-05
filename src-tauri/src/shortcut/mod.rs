@@ -1076,9 +1076,39 @@ pub fn change_auto_submit_key_setting(app: AppHandle, key: String) -> Result<(),
 
 #[tauri::command]
 #[specta::specta]
-pub fn change_screen_context_enabled_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
+pub fn change_app_context_mode_setting(
+    app: AppHandle,
+    mode: settings::AppContextMode,
+) -> Result<(), String> {
     let mut settings = settings::get_settings(&app);
-    settings.screen_context_enabled = enabled;
+    settings.app_context_mode = mode;
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+/// Most app rules a user can keep (the list is scanned on every cleanup).
+const MAX_APP_RULES: usize = 100;
+
+/// Replace the ordered app rule list. Patterns are trimmed; rules keep their
+/// prompt id even when that prompt is gone (cleanup falls back to the
+/// selected prompt and the settings UI flags it).
+#[tauri::command]
+#[specta::specta]
+pub fn change_app_rules_setting(
+    app: AppHandle,
+    rules: Vec<settings::AppRule>,
+) -> Result<(), String> {
+    if rules.len() > MAX_APP_RULES {
+        return Err(format!("At most {MAX_APP_RULES} app rules are supported"));
+    }
+    let mut settings = settings::get_settings(&app);
+    settings.app_rules = rules
+        .into_iter()
+        .map(|mut rule| {
+            rule.pattern = rule.pattern.trim().to_string();
+            rule
+        })
+        .collect();
     settings::write_settings(&app, settings);
     Ok(())
 }

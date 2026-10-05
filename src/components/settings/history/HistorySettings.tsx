@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { readFile } from "@tauri-apps/plugin-fs";
 import {
+  Camera,
   Check,
   ChevronDown,
   ChevronRight,
@@ -473,6 +474,28 @@ interface HistoryEntryProps {
   retryTranscription: (id: number) => Promise<void>;
 }
 
+/** What app context went along with the entry's cleanup request. */
+const ContextLine: React.FC<{ entry: HistoryEntry }> = ({ entry }) => {
+  const { t } = useTranslation();
+  const context = entry.context;
+  if (!context) return null;
+  const sent = [context.app, context.title].filter(Boolean).join(" - ");
+  if (!sent && !context.screenshot) return null;
+  return (
+    <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-text/60 break-words">
+      {sent && (
+        <span>{t("settings.history.contextSent", { context: sent })}</span>
+      )}
+      {context.screenshot && (
+        <span className="inline-flex items-center gap-1">
+          <Camera width={12} height={12} aria-hidden="true" />
+          {t("settings.history.screenshotShared")}
+        </span>
+      )}
+    </p>
+  );
+};
+
 const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
   entry,
   query,
@@ -638,6 +661,10 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
         )}
       </p>
 
+      {/* Without a disclosure (raw equals polished) the context line shows
+          under the text directly. */}
+      {!hasDistinctOriginal && !retrying && <ContextLine entry={entry} />}
+
       {hasDistinctOriginal && !retrying && (
         <div className="flex flex-col gap-2">
           <button
@@ -667,6 +694,7 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
               <p className="text-sm text-text/70 select-text cursor-text whitespace-pre-wrap break-words">
                 <Highlighted text={originalText} query={query} />
               </p>
+              <ContextLine entry={entry} />
               <Button
                 variant="secondary"
                 size="sm"

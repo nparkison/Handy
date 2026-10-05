@@ -516,13 +516,45 @@
           "custom": "{{seconds}} s"
         }
       },
-      "hotkeyOptionalDescription": "Optional. Cleanup already runs on every dictation, so this hotkey does the same thing as Transcribe."
-    },
-    "screenContext": {
-      "title": "Screen Context",
-      "description": "Capture a screenshot when you start recording. The AI can see what's on your screen to better format your text.",
-      "enabled": "Enable Screen Context",
-      "providerWarning": "Requires a vision-capable model (e.g., Gemma 4 via Ollama)"
+      "hotkeyOptionalDescription": "Optional. Cleanup already runs on every dictation, so this hotkey does the same thing as Transcribe.",
+      "context": {
+        "title": "Context",
+        "shareAppInfo": {
+          "title": "Share app info",
+          "description": "Tell the cleanup model which app you're dictating into, so it can match the tone. Window titles can include document names or email subjects.",
+          "options": {
+            "off": "Off",
+            "appName": "App name only",
+            "appAndTitle": "App name and window title"
+          }
+        },
+        "rules": {
+          "title": "App rules",
+          "description": "Use a different prompt, or let the model see your screen, in specific apps.",
+          "empty": "No app rules yet. Every app uses your Selected Prompt.",
+          "add": "Add rule",
+          "recentApps": "Apps from recent dictations",
+          "typeAppName": "Type an app name...",
+          "cancel": "Cancel",
+          "ruleLabel": "Rule {{number}}",
+          "match": "Match",
+          "matchApp": "App",
+          "matchTitle": "Window title contains",
+          "pattern": "Text to match",
+          "appPlaceholder": "e.g. slack.exe",
+          "titlePlaceholder": "e.g. Inbox",
+          "emptyPattern": "Enter text to match. A rule without text never matches.",
+          "prompt": "Prompt",
+          "promptMissing": "Deleted prompt",
+          "promptMissingNote": "This rule's prompt was deleted, so it uses your Selected Prompt.",
+          "screenshot": "Include screenshot",
+          "screenshotNoVision": "Your current model can't read images.",
+          "screenshotLatency": "Adds about 0.5–1 s; may exceed your cleanup time limit.",
+          "moveUp": "Move rule up",
+          "moveDown": "Move rule down",
+          "delete": "Delete rule"
+        }
+      }
     },
     "history": {
       "title": "Historial",
@@ -555,7 +587,9 @@
         "cleanupFailed": "Cleanup failed",
         "cleaningUp": "Cleaning up...",
         "cleanedUpLate": "Cleaned up late"
-      }
+      },
+      "contextSent": "Sent: {{context}}",
+      "screenshotShared": "Screenshot shared"
     },
     "debug": {
       "title": "Depuració",
@@ -875,6 +909,8 @@
   "overlay": {
     "transcribing": "S'està transcrivint...",
     "processing": "S'està processant...",
+    "processingWithApp": "S'està processant... · {{app}}",
+    "screenshotShared": "screenshot shared",
     "notice": {
       "heardNothing": "Heard nothing from {{mic}}",
       "sentNoAudioWindows": "{{mic}} sent no audio - check Windows mic access",

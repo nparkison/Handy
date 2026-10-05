@@ -232,9 +232,22 @@ async changePostProcessEnabledSetting(enabled: boolean) : Promise<Result<null, s
     else return { status: "error", error: e  as any };
 }
 },
-async changeScreenContextEnabledSetting(enabled: boolean) : Promise<Result<null, string>> {
+async changeAppContextModeSetting(mode: AppContextMode) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("change_screen_context_enabled_setting", { enabled }) };
+    return { status: "ok", data: await TAURI_INVOKE("change_app_context_mode_setting", { mode }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Replace the ordered app rule list. Patterns are trimmed; rules keep their
+ * prompt id even when that prompt is gone (cleanup falls back to the
+ * selected prompt and the settings UI flags it).
+ */
+async changeAppRulesSetting(rules: AppRule[]) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_app_rules_setting", { rules }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -985,6 +998,18 @@ async getAudioFilePath(fileName: string) : Promise<Result<string, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * App names recently sent as cleanup context, newest first (for the app
+ * rule picker).
+ */
+async getRecentContextApps() : Promise<Result<string[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_recent_context_apps") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async deleteHistoryEntry(id: number) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("delete_history_entry", { id }) };
@@ -1077,6 +1102,41 @@ streamTextEvent: "stream-text-event"
 /** user-defined types **/
 
 /**
+ * How much about the app being dictated into is shared with the cleanup
+ * model. Matching app rules always happens locally, whatever this is.
+ */
+export type AppContextMode = "off" | "app_name" | "app_and_title"
+/**
+ * Per-app cleanup override. Rules are checked top to bottom; the first match
+ * picks the cleanup prompt (and whether a screenshot is attached).
+ */
+export type AppRule = { id: string; match_on?: AppRuleMatch; 
+/**
+ * Plain text, no wildcards or regex. An empty pattern never matches.
+ */
+pattern?: string; 
+/**
+ * Prompt to use; a prompt that no longer exists falls back to the
+ * selected prompt.
+ */
+prompt_id?: string; 
+/**
+ * Attach a screenshot of the active window (vision providers only).
+ */
+screenshot?: boolean }
+/**
+ * What an app rule's pattern is matched against.
+ */
+export type AppRuleMatch = 
+/**
+ * App / process name (e.g. `slack.exe`), case-insensitive "contains".
+ */
+"app" | 
+/**
+ * Window title, case-insensitive "contains".
+ */
+"title"
+/**
  * The container-level `serde(default)` (backed by the `Default` impl below)
  * guarantees every field — including ones added in the future — falls back to
  * its `get_default_settings()` value when missing from a stored settings
@@ -1116,7 +1176,16 @@ whats_new_last_seen_version?: string; selected_model?: string; onboarding_comple
  * Which input channel to use on the selected microphone device.
  * None means "average all channels" (original behavior).
  */
-selected_channel?: number | null; clamshell_microphone?: string | null; selected_output_device?: string | null; translate_to_english?: boolean; selected_language?: string; overlay_position?: OverlayPosition; debug_mode?: boolean; log_level?: LogLevel; custom_words?: string[]; model_unload_timeout?: ModelUnloadTimeout; word_correction_threshold?: number; history_limit?: number; recording_retention_period?: RecordingRetentionPeriod; paste_method?: PasteMethod; clipboard_handling?: ClipboardHandling; auto_submit?: boolean; auto_submit_key?: AutoSubmitKey; post_process_enabled?: boolean; post_process_provider_id?: string; post_process_providers?: PostProcessProvider[]; post_process_api_keys?: SecretMap; post_process_models?: Partial<{ [key in string]: string }>; post_process_prompts?: LLMPrompt[]; post_process_selected_prompt_id?: string | null; screen_context_enabled?: boolean; mute_while_recording?: boolean; 
+selected_channel?: number | null; clamshell_microphone?: string | null; selected_output_device?: string | null; translate_to_english?: boolean; selected_language?: string; overlay_position?: OverlayPosition; debug_mode?: boolean; log_level?: LogLevel; custom_words?: string[]; model_unload_timeout?: ModelUnloadTimeout; word_correction_threshold?: number; history_limit?: number; recording_retention_period?: RecordingRetentionPeriod; paste_method?: PasteMethod; clipboard_handling?: ClipboardHandling; auto_submit?: boolean; auto_submit_key?: AutoSubmitKey; post_process_enabled?: boolean; post_process_provider_id?: string; post_process_providers?: PostProcessProvider[]; post_process_api_keys?: SecretMap; post_process_models?: Partial<{ [key in string]: string }>; post_process_prompts?: LLMPrompt[]; post_process_selected_prompt_id?: string | null; 
+/**
+ * Share the app (and window title) being dictated into with cleanup.
+ */
+app_context_mode?: AppContextMode; 
+/**
+ * Per-app prompt / screenshot overrides, first match wins. Replaces the
+ * retired global `screen_context_enabled` toggle.
+ */
+app_rules?: AppRule[]; mute_while_recording?: boolean; 
 /**
  * Dead-air guard: skip silent recordings and say which mic to check.
  */
@@ -1219,7 +1288,16 @@ export type EngineType =
  */
 "TranscribeCpp" | "Parakeet" | "Moonshine" | "MoonshineStreaming" | "SenseVoice" | "GigaAM" | "Canary" | "Cohere"
 export type GpuDeviceOption = { id: string; name: string; total_vram_mb: number }
-export type HistoryEntry = { id: number; file_name: string; timestamp: number; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; post_process_requested: boolean; cleanup_state: CleanupState | null }
+/**
+ * What app context was sent with an entry's cleanup request: never the
+ * screenshot itself, only whether one was shared.
+ */
+export type HistoryContext = { app: string | null; title: string | null; screenshot: boolean }
+export type HistoryEntry = { id: number; file_name: string; timestamp: number; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; post_process_requested: boolean; cleanup_state: CleanupState | null; 
+/**
+ * App context sent with the cleanup request (`None` when none was sent).
+ */
+context: HistoryContext | null }
 export type HistoryUpdatePayload = { action: "added"; entry: HistoryEntry } | { action: "updated"; entry: HistoryEntry } | { action: "deleted"; id: number } | { action: "toggled"; id: number }
 /**
  * Result of changing keyboard implementation

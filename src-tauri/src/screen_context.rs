@@ -1,32 +1,89 @@
+//! Press-time context capture.
+//!
+//! When a dictation starts, a background thread notes the focused app (see
+//! [`crate::app_context`]) and, only when a matching app rule opted in and the
+//! provider can read images, screenshots the active window. Nothing here adds
+//! latency to starting the recording, and screenshots stay in memory: they are
+//! never written to disk or History.
+
+use crate::app_context::{capture_app_info, match_rule, screenshot_wanted, AppInfo};
+use crate::settings::AppSettings;
 use base64::Engine;
-use image::ImageFormat;
+use image::codecs::jpeg::JpegEncoder;
+use image::imageops::FilterType;
+use image::RgbaImage;
 use log::{debug, warn};
-use std::io::Cursor;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
-use xcap::Window;
 
-/// How long post-processing waits for an in-flight capture before giving up
-/// and falling back to text-only post-processing. Capture normally finishes
-/// long before transcription does, so this only matters if the OS capture API
-/// hangs.
+/// The app info is ready within milliseconds of the press; this only matters
+/// if the OS call hangs.
+const APP_INFO_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How long cleanup waits for an in-flight screenshot before going on without
+/// it. The wait happens before the request is sent, so it never counts against
+/// the cleanup time limit.
 const CAPTURE_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 
-#[derive(Debug, Clone)]
-pub struct ScreenContext {
-    /// Base64-encoded PNG screenshot
-    pub image_base64: String,
-    /// Window title of the focused window
-    pub window_title: String,
-    /// Application/process name
-    pub app_name: String,
+/// Screenshots are downscaled so their longest edge is at most this.
+pub const SCREENSHOT_MAX_EDGE: u32 = 1024;
+const JPEG_QUALITY: u8 = 75;
+
+/// An in-memory, JPEG-encoded screenshot of the active window.
+#[derive(Clone)]
+pub struct Screenshot {
+    pub base64: String,
 }
 
-/// Captures a screenshot of the currently focused window.
-/// Returns `None` if no focused window is found or capture fails.
-pub fn capture_focused_window() -> Option<ScreenContext> {
-    let windows = match Window::all() {
+impl Screenshot {
+    pub const MIME: &'static str = "image/jpeg";
+}
+
+impl std::fmt::Debug for Screenshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Screenshot({} bytes base64)", self.base64.len())
+    }
+}
+
+/// Size that fits `width` x `height` within `max_edge` on its longest side,
+/// keeping the aspect ratio. Images already small enough are left alone.
+pub fn downscaled_size(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
+    let longest = width.max(height);
+    if longest <= max_edge || longest == 0 {
+        return (width, height);
+    }
+    let scale = |side: u32| {
+        let scaled =
+            (u64::from(side) * u64::from(max_edge) + u64::from(longest) / 2) / u64::from(longest);
+        (scaled as u32).max(1)
+    };
+    (scale(width), scale(height))
+}
+
+/// Downscale and JPEG-encode a capture.
+fn encode_screenshot(capture: RgbaImage) -> Option<Screenshot> {
+    let (width, height) = downscaled_size(capture.width(), capture.height(), SCREENSHOT_MAX_EDGE);
+    let image = if (width, height) == capture.dimensions() {
+        capture
+    } else {
+        image::imageops::resize(&capture, width, height, FilterType::Triangle)
+    };
+    // JPEG has no alpha channel.
+    let rgb = image::DynamicImage::ImageRgba8(image).into_rgb8();
+    let mut jpeg = Vec::new();
+    if let Err(e) = JpegEncoder::new_with_quality(&mut jpeg, JPEG_QUALITY).encode_image(&rgb) {
+        warn!("Screen context: failed to encode screenshot: {}", e);
+        return None;
+    }
+    Some(Screenshot {
+        base64: base64::engine::general_purpose::STANDARD.encode(jpeg),
+    })
+}
+
+/// Screenshot of the focused window only (never the full screen).
+fn capture_active_window() -> Option<Screenshot> {
+    let windows = match xcap::Window::all() {
         Ok(windows) => windows,
         Err(e) => {
             warn!("Screen context: failed to enumerate windows: {}", e);
@@ -40,108 +97,125 @@ pub fn capture_focused_window() -> Option<ScreenContext> {
         debug!("Screen context: no focused window found");
         return None;
     };
-
-    let app_name = focused.app_name().unwrap_or_default();
-    let window_title = focused.title().unwrap_or_default();
-
-    let capture = match focused.capture_image() {
-        Ok(capture) => capture,
+    match focused.capture_image() {
+        Ok(capture) => encode_screenshot(capture),
         Err(e) => {
             warn!("Screen context: failed to capture focused window: {}", e);
-            return None;
+            None
         }
-    };
-
-    let mut png_bytes = Cursor::new(Vec::new());
-    if let Err(e) = capture.write_to(&mut png_bytes, ImageFormat::Png) {
-        warn!("Screen context: failed to encode screenshot: {}", e);
-        return None;
     }
-
-    let image_base64 = base64::engine::general_purpose::STANDARD.encode(png_bytes.into_inner());
-
-    Some(ScreenContext {
-        image_base64,
-        window_title,
-        app_name,
-    })
 }
 
-/// A screen capture that was started when recording began and may still be in
-/// flight. Resolve it only when the vision post-processing path needs it.
-pub struct PendingScreenContext(oneshot::Receiver<Option<ScreenContext>>);
+/// Context captured at press for the recording that is about to stop.
+pub struct PendingPressContext {
+    app: oneshot::Receiver<Option<AppInfo>>,
+    screenshot: oneshot::Receiver<Option<Screenshot>>,
+}
 
-impl PendingScreenContext {
-    /// Wait (bounded) for the capture to finish.
-    pub async fn resolve(self) -> Option<ScreenContext> {
-        match tokio::time::timeout(CAPTURE_WAIT_TIMEOUT, self.0).await {
-            Ok(Ok(ctx)) => ctx,
-            Ok(Err(_)) => {
-                warn!("Screen context: capture thread ended without a result");
-                None
-            }
+impl PendingPressContext {
+    /// Wait (bounded) for the app info. The screenshot, if one is coming,
+    /// stays pending in the returned [`PendingScreenshot`].
+    pub async fn resolve_app(self) -> (Option<AppInfo>, PendingScreenshot) {
+        let app = match tokio::time::timeout(APP_INFO_WAIT_TIMEOUT, self.app).await {
+            Ok(Ok(info)) => info,
+            Ok(Err(_)) => None,
             Err(_) => {
-                warn!(
-                    "Screen context: capture did not finish within {:?}",
-                    CAPTURE_WAIT_TIMEOUT
-                );
+                warn!("App context: lookup did not finish within {APP_INFO_WAIT_TIMEOUT:?}");
+                None
+            }
+        };
+        (app, PendingScreenshot(self.screenshot))
+    }
+}
+
+/// A screenshot that may still be in flight.
+pub struct PendingScreenshot(oneshot::Receiver<Option<Screenshot>>);
+
+impl PendingScreenshot {
+    /// Wait (bounded) for the screenshot. Resolves to `None` right away when
+    /// no screenshot was taken.
+    pub async fn resolve(self) -> Option<Screenshot> {
+        match tokio::time::timeout(CAPTURE_WAIT_TIMEOUT, self.0).await {
+            Ok(Ok(shot)) => shot,
+            Ok(Err(_)) => None,
+            Err(_) => {
+                warn!("Screen context: capture did not finish within {CAPTURE_WAIT_TIMEOUT:?}");
                 None
             }
         }
     }
 }
 
-/// Managed state that hands the screenshot taken at hotkey press (start) to
+/// Managed state that hands the context captured at hotkey press (start) to
 /// the transcription pipeline (stop).
 #[derive(Default)]
-pub struct ScreenContextSlot {
-    pending: Mutex<Option<PendingScreenContext>>,
+pub struct PressContextSlot {
+    pending: Mutex<Option<PendingPressContext>>,
 }
 
-impl ScreenContextSlot {
-    fn lock(&self) -> MutexGuard<'_, Option<PendingScreenContext>> {
+impl PressContextSlot {
+    fn lock(&self) -> MutexGuard<'_, Option<PendingPressContext>> {
         self.pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Capture the focused window on a background thread so the screenshot
-    /// (and its PNG encoding) never adds latency to starting the recording.
-    /// Replaces any capture left over from a previous recording.
-    pub fn begin_capture(&self) {
-        let (tx, rx) = oneshot::channel();
-        *self.lock() = Some(PendingScreenContext(rx));
+    /// Note the focused app on a background thread and, when a matching app
+    /// rule asks for it (and cleanup will run with a vision provider),
+    /// screenshot the active window. Replaces any leftover capture.
+    pub fn begin_capture(&self, settings: &AppSettings, cleanup_will_run: bool) {
+        let (app_tx, app_rx) = oneshot::channel();
+        let (shot_tx, shot_rx) = oneshot::channel();
+        *self.lock() = Some(PendingPressContext {
+            app: app_rx,
+            screenshot: shot_rx,
+        });
 
+        // Only clone the settings when some rule could ask for a screenshot.
+        let screenshot_settings = (cleanup_will_run
+            && settings
+                .app_rules
+                .iter()
+                .any(|rule| screenshot_wanted(settings, Some(rule))))
+        .then(|| settings.clone());
         let spawned = std::thread::Builder::new()
-            .name("screen-context-capture".to_string())
+            .name("press-context-capture".to_string())
             .spawn(move || {
                 let started = Instant::now();
-                let ctx = capture_focused_window();
-                if let Some(ctx) = &ctx {
-                    debug!(
-                        "Screen context captured from '{}' (title: {} chars, {} bytes base64) in {:?}",
-                        ctx.app_name,
-                        ctx.window_title.chars().count(),
-                        ctx.image_base64.len(),
-                        started.elapsed()
-                    );
+                let info = capture_app_info();
+                let wants_shot = screenshot_settings.as_ref().is_some_and(|settings| {
+                    screenshot_wanted(settings, match_rule(&settings.app_rules, info.as_ref()))
+                });
+                debug!(
+                    "App context captured in {:?} (app: {:?}, title: {} chars)",
+                    started.elapsed(),
+                    info.as_ref().map(|i| i.app_name.as_str()),
+                    info.as_ref()
+                        .and_then(|i| i.window_title.as_ref())
+                        .map_or(0, |t| t.chars().count())
+                );
+                let _ = app_tx.send(info);
+                if wants_shot {
+                    let shot = capture_active_window();
+                    debug!("Screen context: {:?} in {:?}", shot, started.elapsed());
+                    let _ = shot_tx.send(shot);
                 }
-                let _ = tx.send(ctx);
+                // Otherwise dropping shot_tx resolves the screenshot to None.
             });
 
         if let Err(e) = spawned {
-            warn!("Screen context: failed to spawn capture thread: {}", e);
+            warn!("Press context: failed to spawn capture thread: {}", e);
             self.clear();
         }
     }
 
-    /// Drop any pending or captured screenshot.
+    /// Drop any pending or captured context.
     pub fn clear(&self) {
         self.lock().take();
     }
 
     /// Take the capture for the recording that just stopped.
-    pub fn take(&self) -> Option<PendingScreenContext> {
+    pub fn take(&self) -> Option<PendingPressContext> {
         self.lock().take()
     }
 }
@@ -150,42 +224,71 @@ impl ScreenContextSlot {
 mod tests {
     use super::*;
 
-    fn sample_context() -> ScreenContext {
-        ScreenContext {
-            image_base64: "aGVsbG8=".to_string(),
-            window_title: "Inbox".to_string(),
-            app_name: "mail".to_string(),
-        }
+    #[test]
+    fn downscale_keeps_aspect_ratio_within_max_edge() {
+        assert_eq!(downscaled_size(2560, 1440, 1024), (1024, 576));
+        assert_eq!(downscaled_size(1440, 2560, 1024), (576, 1024));
+        assert_eq!(downscaled_size(3000, 3000, 1024), (1024, 1024));
+        assert_eq!(downscaled_size(1366, 768, 1024), (1024, 576));
     }
 
     #[test]
-    fn take_returns_pending_once() {
-        let slot = ScreenContextSlot::default();
-        let (tx, rx) = oneshot::channel();
-        *slot.lock() = Some(PendingScreenContext(rx));
-        tx.send(Some(sample_context())).unwrap();
+    fn downscale_leaves_small_images_alone() {
+        assert_eq!(downscaled_size(800, 600, 1024), (800, 600));
+        assert_eq!(downscaled_size(1024, 10, 1024), (1024, 10));
+        assert_eq!(downscaled_size(0, 0, 1024), (0, 0));
+    }
+
+    #[test]
+    fn downscale_never_collapses_a_side_to_zero() {
+        assert_eq!(downscaled_size(10_000, 1, 1024), (1024, 1));
+    }
+
+    #[test]
+    fn encoded_screenshot_is_a_downscaled_jpeg() {
+        let capture = RgbaImage::from_pixel(2048, 1024, image::Rgba([10, 20, 30, 255]));
+        let shot = encode_screenshot(capture).expect("encodes");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(shot.base64)
+            .unwrap();
+        assert_eq!(&bytes[..3], &[0xFF, 0xD8, 0xFF]); // JPEG SOI marker
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (1024, 512));
+    }
+
+    #[test]
+    fn take_returns_pending_once_and_clear_drops_it() {
+        let slot = PressContextSlot::default();
+        let (app_tx, app_rx) = oneshot::channel();
+        let (_shot_tx, shot_rx) = oneshot::channel();
+        *slot.lock() = Some(PendingPressContext {
+            app: app_rx,
+            screenshot: shot_rx,
+        });
+        app_tx
+            .send(Some(AppInfo::from_process_path("mail.exe", None)))
+            .unwrap();
 
         let pending = slot.take().expect("pending capture");
         assert!(slot.take().is_none());
+        let (info, _) = tauri::async_runtime::block_on(pending.resolve_app());
+        assert_eq!(info.unwrap().app_name, "mail");
 
-        let ctx = tauri::async_runtime::block_on(pending.resolve()).expect("context");
-        assert_eq!(ctx.app_name, "mail");
-    }
-
-    #[test]
-    fn clear_drops_pending_capture() {
-        let slot = ScreenContextSlot::default();
-        let (_tx, rx) = oneshot::channel();
-        *slot.lock() = Some(PendingScreenContext(rx));
+        let (_a, app_rx) = oneshot::channel();
+        let (_s, shot_rx) = oneshot::channel();
+        *slot.lock() = Some(PendingPressContext {
+            app: app_rx,
+            screenshot: shot_rx,
+        });
         slot.clear();
         assert!(slot.take().is_none());
     }
 
     #[test]
-    fn resolve_returns_none_when_sender_dropped() {
-        let (tx, rx) = oneshot::channel::<Option<ScreenContext>>();
+    fn dropped_screenshot_sender_resolves_to_none() {
+        let (tx, rx) = oneshot::channel::<Option<Screenshot>>();
         drop(tx);
-        let ctx = tauri::async_runtime::block_on(PendingScreenContext(rx).resolve());
-        assert!(ctx.is_none());
+        let shot = tauri::async_runtime::block_on(PendingScreenshot(rx).resolve());
+        assert!(shot.is_none());
     }
 }

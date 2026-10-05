@@ -1,4 +1,5 @@
 use crate::actions::process_transcription_output;
+use crate::app_context::AppInfo;
 use crate::managers::{
     history::{HistoryManager, PaginatedHistory},
     transcription::TranscriptionManager,
@@ -63,6 +64,18 @@ pub async fn get_audio_file_path(
         .map(|s| s.to_string())
 }
 
+/// App names recently sent as cleanup context, newest first (for the app
+/// rule picker).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_recent_context_apps(
+    history_manager: State<'_, Arc<HistoryManager>>,
+) -> Result<Vec<String>, String> {
+    history_manager
+        .get_recent_context_apps(10)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn delete_history_entry(
@@ -114,13 +127,28 @@ pub async fn retry_history_entry_transcription(
     // cleaned up now.
     let post_process = entry.post_process_requested
         || crate::settings::get_settings(&app).cleans_up_every_dictation();
-    let processed = process_transcription_output(&app, &transcription, post_process, None).await;
+    // Reuse the app context stored with the entry (only what was shared at
+    // the time): it re-selects the app rule's prompt. No screenshot is retaken.
+    let app_info = entry
+        .context
+        .filter(|ctx| ctx.app.is_some() || ctx.title.is_some())
+        .map(|ctx| {
+            let app_name = ctx.app.unwrap_or_default();
+            AppInfo {
+                process_name: app_name.clone(),
+                app_name,
+                window_title: ctx.title,
+            }
+        });
+    let processed =
+        process_transcription_output(&app, &transcription, post_process, app_info).await;
     history_manager
         .update_transcription(
             id,
             transcription,
             processed.post_processed_text,
             processed.post_process_prompt,
+            processed.context,
         )
         .map(|_| ())
         .map_err(|e| e.to_string())
