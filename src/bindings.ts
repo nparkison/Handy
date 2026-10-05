@@ -923,6 +923,28 @@ async updateRecordingRetentionPeriod(period: string) : Promise<Result<null, stri
     else return { status: "error", error: e  as any };
 }
 },
+async startReplayBench(request: ReplayBenchRequest) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_replay_bench", { request }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async stopReplayBench() : Promise<void> {
+    await TAURI_INVOKE("stop_replay_bench");
+},
+async isReplayBenchRunning() : Promise<boolean> {
+    return await TAURI_INVOKE("is_replay_bench_running");
+},
+async countReplayBenchRecordings(selection: ReplayBenchSelection) : Promise<Result<number, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("count_replay_bench_recordings", { selection }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * Checks if the Mac is a laptop by detecting battery presence
  * 
@@ -944,10 +966,12 @@ async isLaptop() : Promise<Result<boolean, string>> {
 
 export const events = __makeEvents__<{
 historyUpdatePayload: HistoryUpdatePayload,
+replayBenchEvent: ReplayBenchEvent,
 streamPhaseEvent: StreamPhaseEvent,
 streamTextEvent: StreamTextEvent
 }>({
 historyUpdatePayload: "history-update-payload",
+replayBenchEvent: "replay-bench-event",
 streamPhaseEvent: "stream-phase-event",
 streamTextEvent: "stream-text-event"
 })
@@ -1108,6 +1132,15 @@ export type PasteMethod = "ctrl_v" | "direct" | "none" | "shift_insert" | "ctrl_
 export type PermissionAccess = "allowed" | "denied" | "unknown"
 export type PostProcessProvider = { id: string; label: string; base_url: string; allow_base_url_edit?: boolean; models_endpoint?: string | null; supports_structured_output?: boolean; supports_vision?: boolean }
 export type RecordingRetentionPeriod = "never" | "preserve_limit" | "days_3" | "weeks_2" | "months_3"
+export type ReplayBenchEntry = { entry_id: number; timestamp: number; reference_text: string; duration_secs: number; readable: boolean }
+export type ReplayBenchEvent = { type: "started"; entries: ReplayBenchEntry[]; models: ReplayBenchModel[]; include_cleanup: boolean } | { type: "progress"; model_id: string; model_name: string; entry_index: number; entry_total: number; phase: ReplayBenchPhase } | { type: "result"; result: ReplayBenchResult } | { type: "model_finished"; summary: ReplayBenchModelSummary } | { type: "finished"; cancelled: boolean }
+export type ReplayBenchFailure = "decode_failed" | "transcribe_failed"
+export type ReplayBenchModel = { model_id: string; model_name: string }
+export type ReplayBenchModelSummary = { model_id: string; load_ms: number | null; load_error: string | null; transcribe_median_ms: number | null; transcribe_p90_ms: number | null; rtf_median: number | null; cleanup_median_ms: number | null; cleanup_p90_ms: number | null; mean_differs_pct: number | null; completed: number; failed: number }
+export type ReplayBenchPhase = "loading" | "transcribing" | "cleanup" | "paused"
+export type ReplayBenchRequest = { selection: ReplayBenchSelection; model_ids: string[]; include_cleanup: boolean }
+export type ReplayBenchResult = { entry_id: number; model_id: string; failure: ReplayBenchFailure | null; text: string; cleanup_text: string | null; cleanup_failed: boolean; differs_pct: number | null; diff: WordDiffToken[]; transcribe_ms: number | null; rtf: number | null; cleanup_ms: number | null }
+export type ReplayBenchSelection = { kind: "recent"; count: number } | { kind: "starred" }
 export type SecretMap = Partial<{ [key in string]: string }>
 export type SecureInputStatus = { 
 /**
@@ -1202,6 +1235,8 @@ export type TranscribeAcceleratorSetting = "auto" | "cpu" | "gpu"
 export type TypingTool = "auto" | "wtype" | "kwtype" | "dotool" | "ydotool" | "xdotool"
 export type VadBackend = "silero" | "earshot"
 export type WindowsMicrophonePermissionStatus = { supported: boolean; overall_access: PermissionAccess; device_access: PermissionAccess; app_access: PermissionAccess; desktop_app_access: PermissionAccess }
+export type WordDiffKind = "same" | "added" | "removed"
+export type WordDiffToken = { kind: WordDiffKind; text: string }
 
 /** tauri-specta globals **/
 

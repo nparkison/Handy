@@ -17,6 +17,7 @@ mod memory;
 mod overlay;
 mod paste_tx;
 pub mod portable;
+mod replay_bench;
 mod screen_context;
 mod secure_input;
 mod settings;
@@ -767,10 +768,15 @@ pub fn run(cli_args: CliArgs) {
             commands::history::retry_history_entry_transcription,
             commands::history::update_history_limit,
             commands::history::update_recording_retention_period,
+            commands::replay_bench::start_replay_bench,
+            commands::replay_bench::stop_replay_bench,
+            commands::replay_bench::is_replay_bench_running,
+            commands::replay_bench::count_replay_bench_recordings,
             helpers::clamshell::is_laptop,
         ])
         .events(collect_events![
             managers::history::HistoryUpdatePayload,
+            replay_bench::ReplayBenchEvent,
             managers::transcription::StreamTextEvent,
             managers::transcription::StreamPhaseEvent,
         ]);
