@@ -643,8 +643,12 @@ fn default_autostart_enabled() -> bool {
     false
 }
 
+/// Off in this fork: `tauri.conf.json`'s updater still points at upstream
+/// Handy's releases (and signing key), so an "update" would replace this
+/// build with upstream and drop the fork's features. Turn it on only when
+/// that is what you want.
 fn default_update_checks_enabled() -> bool {
-    true
+    false
 }
 
 fn default_show_whats_new_on_update() -> bool {
@@ -716,8 +720,12 @@ fn default_auto_submit() -> bool {
     false
 }
 
-/// Text is tiny, so keep a useful amount of history by default. Recordings
-/// follow the separate retention setting.
+/// Default number of unsaved History entries kept under the default
+/// `RecordingRetentionPeriod::PreserveLimit`. Each entry owns its WAV, so this
+/// also caps retained recordings: 200 entries is roughly 200 recordings on
+/// disk (about 32 KB per second of 16 kHz mono audio, so a few hundred MB for
+/// long dictations). The time-based retention periods ignore this limit and
+/// expire entries and recordings together by age.
 pub(crate) const DEFAULT_HISTORY_LIMIT: usize = 200;
 
 /// The pre-0.10 default, used to migrate users who never changed it.
@@ -1414,11 +1422,6 @@ fn apply_settings_migrations(
         updated = true;
     }
 
-    // One-time overlay migration (only while the new key is absent): the retired
-    // overlay_position `none` meant "hide the overlay" → OverlayStyle::None; any
-    // other position had it visible → Live. The position enum no longer has a
-    // `none` variant (legacy "none" deserializes to Bottom via a serde alias), so
-    // read the raw stored string to recover the old intent.
     // One-time screen context migration (only while `app_rules` is absent):
     // the global `screen_context_enabled` toggle is retired in favour of
     // per-rule screenshots. A rule needs an app to match, so there is no
@@ -1437,6 +1440,21 @@ fn apply_settings_migrations(
         updated = true;
     }
 
+    // One-time fork updater migration, keyed on the first load by a build with
+    // the fork-only `app_rules` key: turn update checks off (see
+    // `default_update_checks_enabled`). Once `app_rules` is stored, a user who
+    // turns update checks back on keeps that choice.
+    if settings_value.get("app_rules").is_none() && settings.update_checks_enabled {
+        info!("Update checks turned off: this fork's updater points at upstream Handy");
+        settings.update_checks_enabled = false;
+        updated = true;
+    }
+
+    // One-time overlay migration (only while the new key is absent): the retired
+    // overlay_position `none` meant "hide the overlay" → OverlayStyle::None; any
+    // other position had it visible → Live. The position enum no longer has a
+    // `none` variant (legacy "none" deserializes to Bottom via a serde alias), so
+    // read the raw stored string to recover the old intent.
     if settings_value.get("overlay_style").is_none() {
         let was_hidden = settings_value
             .get("overlay_position")
@@ -1848,6 +1866,26 @@ mod tests {
         let mut settings: AppSettings = serde_json::from_value(raw.clone()).unwrap();
         apply_settings_migrations(&mut settings, &raw);
         assert_eq!(settings.history_limit, 5);
+    }
+
+    #[test]
+    fn update_checks_default_off_and_migrate_off_once() {
+        assert!(!get_default_settings().update_checks_enabled);
+
+        let mut raw = default_settings_json();
+        let map = raw.as_object_mut().unwrap();
+        map.remove("app_rules");
+        map.insert("update_checks_enabled".into(), serde_json::json!(true));
+        let mut settings: AppSettings = serde_json::from_value(raw.clone()).unwrap();
+        assert!(apply_settings_migrations(&mut settings, &raw));
+        assert!(!settings.update_checks_enabled);
+
+        // After the fork's keys are stored, turning checks back on sticks.
+        let mut raw = serde_json::to_value(&settings).unwrap();
+        raw["update_checks_enabled"] = serde_json::json!(true);
+        let mut settings: AppSettings = serde_json::from_value(raw.clone()).unwrap();
+        apply_settings_migrations(&mut settings, &raw);
+        assert!(settings.update_checks_enabled);
     }
 
     #[test]
