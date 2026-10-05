@@ -6,7 +6,7 @@ use crate::audio_toolkit::vad::{VadFrame, VoiceActivityDetector};
 use rtrb::RingBuffer;
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -75,6 +75,120 @@ fn idle_chunks_are_discarded_without_reaching_the_recording() {
     let mut processor = CaptureProcessor::new(16_000, None, None, None, Instant::now());
     processor.process_raw_chunk(&[1.0; 480], ChunkDisposition::Discard);
     assert!(processor.finish_recording().is_empty());
+}
+
+/// Treats a frame as speech only when it contains a non-zero sample, so
+/// silence (all zeros) is trimmed like a real detector would.
+struct NonZeroVad;
+
+impl VoiceActivityDetector for NonZeroVad {
+    fn push_frame<'a>(&'a mut self, frame: &'a [f32]) -> anyhow::Result<VadFrame<'a>> {
+        if frame.iter().any(|&sample| sample != 0.0) {
+            Ok(VadFrame::Speech(frame))
+        } else {
+            Ok(VadFrame::Noise)
+        }
+    }
+
+    fn frame_samples(&self) -> usize {
+        480
+    }
+}
+
+fn pre_roll_processor(
+    pre_roll_ms: u64,
+    vad: Option<VadConfig>,
+) -> (CaptureProcessor, Arc<Mutex<Vec<f32>>>) {
+    let streamed = Arc::new(Mutex::new(Vec::new()));
+    let streamed_cb = Arc::clone(&streamed);
+    let processor = CaptureProcessor::new(
+        16_000,
+        vad,
+        None,
+        Some(Arc::new(move |frame: &[f32]| {
+            streamed_cb.lock().unwrap().extend_from_slice(frame)
+        })),
+        Instant::now(),
+    )
+    .with_pre_roll(Arc::new(AtomicU64::new(pre_roll_ms)));
+    (processor, streamed)
+}
+
+#[test]
+fn pre_roll_prepends_recent_idle_audio_to_recording_and_stream() {
+    // 300 ms at 16 kHz = 4800 samples of window.
+    let (mut processor, streamed) = pre_roll_processor(300, None);
+    processor.process_raw_chunk(&[1.0; 6_000], ChunkDisposition::Discard);
+    processor.process_raw_chunk(&[2.0; 480], ChunkDisposition::Discard);
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    processor.begin_recording(VadPolicy::Disabled, ready_tx);
+    // Buffered history must not count as the live first-sample signal.
+    assert!(ready_rx.try_recv().is_err());
+    processor.process_raw_chunk(&[3.0; 960], ChunkDisposition::Capture);
+    assert!(ready_rx.try_recv().is_ok());
+    let samples = processor.finish_recording();
+
+    let mut expected = vec![1.0; 4_320];
+    expected.extend_from_slice(&[2.0; 480]);
+    expected.extend_from_slice(&[3.0; 960]);
+    assert_eq!(samples, expected);
+    assert_eq!(*streamed.lock().unwrap(), expected);
+}
+
+#[test]
+fn pre_roll_is_consumed_once_and_refills_only_while_idle() {
+    // 90 ms = 1440 samples, a whole number of 30 ms frames.
+    let (mut processor, _streamed) = pre_roll_processor(90, None);
+    processor.process_raw_chunk(&[1.0; 1_600], ChunkDisposition::Discard);
+
+    let (ready_tx, _ready_rx) = mpsc::channel();
+    processor.begin_recording(VadPolicy::Disabled, ready_tx);
+    processor.process_raw_chunk(&[2.0; 480], ChunkDisposition::Capture);
+    let first = processor.finish_recording();
+    assert_eq!(first.len(), 1_440 + 480);
+    assert!(first[..1_440].iter().all(|&sample| sample == 1.0));
+
+    // Live audio from the first recording must not seed the next pre-roll.
+    let (ready_tx, _ready_rx) = mpsc::channel();
+    processor.begin_recording(VadPolicy::Disabled, ready_tx);
+    processor.process_raw_chunk(&[3.0; 480], ChunkDisposition::Capture);
+    assert_eq!(processor.finish_recording(), vec![3.0; 480]);
+}
+
+#[test]
+fn zero_pre_roll_prepends_nothing() {
+    let (mut processor, _streamed) = pre_roll_processor(0, None);
+    processor.process_raw_chunk(&[1.0; 4_800], ChunkDisposition::Discard);
+    let (ready_tx, _ready_rx) = mpsc::channel();
+    processor.begin_recording(VadPolicy::Disabled, ready_tx);
+    processor.process_raw_chunk(&[2.0; 480], ChunkDisposition::Capture);
+    assert_eq!(processor.finish_recording(), vec![2.0; 480]);
+}
+
+#[test]
+fn pre_roll_goes_through_vad_so_silence_is_trimmed_and_onset_kept() {
+    let vad = VadConfig {
+        detector: Arc::new(Mutex::new(Box::new(NonZeroVad))),
+        frame_samples: 480,
+        offline_hangover_frames: 0,
+        streaming_hangover_frames: 0,
+    };
+    let (mut processor, streamed) = pre_roll_processor(300, Some(vad));
+    // 180 ms of silence followed by 120 ms of speech onset before the press
+    // (both whole 30 ms frames, filling the 300 ms window exactly).
+    processor.process_raw_chunk(&[0.0; 2_880], ChunkDisposition::Discard);
+    processor.process_raw_chunk(&[0.5; 1_920], ChunkDisposition::Discard);
+
+    let (ready_tx, _ready_rx) = mpsc::channel();
+    processor.begin_recording(VadPolicy::Streaming, ready_tx);
+    processor.process_raw_chunk(&[1.0; 960], ChunkDisposition::Capture);
+    let samples = processor.finish_recording();
+
+    let mut expected = vec![0.5; 1_920];
+    expected.extend_from_slice(&[1.0; 960]);
+    assert_eq!(samples, expected);
+    assert_eq!(*streamed.lock().unwrap(), expected);
 }
 
 #[test]
