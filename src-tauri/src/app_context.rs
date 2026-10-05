@@ -222,11 +222,21 @@ impl SharedContext {
 
 /// Invisible characters that can smuggle hidden text or reorder what the
 /// model reads: format characters (Unicode Cf: zero-width, bidi controls,
-/// soft hyphen, Unicode tag characters) and variation selectors.
+/// soft hyphen, Unicode tag characters), variation selectors (incl.
+/// Mongolian free variation selectors), the combining grapheme joiner, and
+/// blank-looking letters (Hangul fillers, braille blank).
 pub fn is_invisible_format_char(c: char) -> bool {
     matches!(
         c as u32,
         0x00AD
+            | 0x034F
+            | 0x115F
+            | 0x1160
+            | 0x180B..=0x180D
+            | 0x180F
+            | 0x2800
+            | 0x3164
+            | 0xFFA0
             | 0x0600..=0x0605
             | 0x061C
             | 0x06DD
@@ -619,6 +629,25 @@ mod tests {
         assert_eq!(ctx.window_title.as_deref(), Some("Inboxevil - Mail"));
         // Only invisible characters: nothing is shared.
         let blank = AppInfo::from_process_path("x.exe", Some("\u{200B}\u{E0041}".into()));
+        let ctx = SharedContext::new(Some(&blank), AppContextMode::AppAndTitle).unwrap();
+        assert_eq!(ctx.window_title, None);
+    }
+
+    #[test]
+    fn blank_looking_fillers_are_stripped() {
+        for c in [
+            '\u{034F}', '\u{115F}', '\u{1160}', '\u{3164}', '\u{FFA0}', '\u{180B}', '\u{180C}',
+            '\u{180D}', '\u{180F}', '\u{2800}',
+        ] {
+            assert!(is_invisible_format_char(c), "U+{:04X}", c as u32);
+        }
+        let info = AppInfo::from_process_path(
+            "x.exe",
+            Some("In\u{3164}box\u{2800}\u{034F} - Mail\u{180B}\u{FFA0}".into()),
+        );
+        let ctx = SharedContext::new(Some(&info), AppContextMode::AppAndTitle).unwrap();
+        assert_eq!(ctx.window_title.as_deref(), Some("Inbox - Mail"));
+        let blank = AppInfo::from_process_path("x.exe", Some("\u{3164}\u{2800}".into()));
         let ctx = SharedContext::new(Some(&blank), AppContextMode::AppAndTitle).unwrap();
         assert_eq!(ctx.window_title, None);
     }
