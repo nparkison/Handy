@@ -20,6 +20,23 @@ pub async fn get_history_entries(
         .map_err(|e| e.to_string())
 }
 
+/// Search all retained history entries (raw and polished text), paginated the
+/// same way as `get_history_entries`.
+#[tauri::command]
+#[specta::specta]
+pub async fn search_history_entries(
+    _app: AppHandle,
+    history_manager: State<'_, Arc<HistoryManager>>,
+    query: String,
+    cursor: Option<i64>,
+    limit: Option<usize>,
+) -> Result<PaginatedHistory, String> {
+    history_manager
+        .search_history_entries(&query, cursor, limit)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn toggle_history_entry_saved(
@@ -121,6 +138,8 @@ pub async fn update_history_limit(
     history_manager
         .cleanup_old_entries()
         .map_err(|e| e.to_string())?;
+    // A small limit or a short retention window can prune the newest entries.
+    crate::tray::refresh_recent_dictations(&app);
 
     Ok(())
 }
@@ -150,6 +169,8 @@ pub async fn update_recording_retention_period(
     history_manager
         .cleanup_old_entries()
         .map_err(|e| e.to_string())?;
+    // A small limit or a short retention window can prune the newest entries.
+    crate::tray::refresh_recent_dictations(&app);
 
     Ok(())
 }

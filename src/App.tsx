@@ -166,6 +166,19 @@ function App() {
     };
   }, [t]);
 
+  // The tray's "Open History..." item asks the window to switch sections.
+  useEffect(() => {
+    const unlisten = listen<string>("navigate-to-section", (event) => {
+      const section = event.payload;
+      if (section in SECTIONS_CONFIG) {
+        setCurrentSection(section as SidebarSection);
+      }
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
   // Listen for paste failures and show a toast.
   // The technical error detail is logged to handy.log on the Rust side
   // (see actions.rs `error!("Failed to paste transcription: ...")`),

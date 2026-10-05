@@ -304,6 +304,10 @@ fn initialize_core_logic(app_handle: &AppHandle) {
             "copy_last_transcript" => {
                 tray::copy_last_transcript(app);
             }
+            "open_history" => {
+                show_main_window(app);
+                let _ = app.emit("navigate-to-section", "history");
+            }
             "unload_model" => {
                 let transcription_manager = app.state::<Arc<TranscriptionManager>>();
                 if !transcription_manager.is_model_loaded() {
@@ -323,6 +327,12 @@ fn initialize_core_logic(app_handle: &AppHandle) {
             }
             "quit" => {
                 app.exit(0);
+            }
+            id if id.starts_with(tray::RECENT_DICTATION_ID_PREFIX) => {
+                match id[tray::RECENT_DICTATION_ID_PREFIX.len()..].parse::<i64>() {
+                    Ok(entry_id) => tray::copy_history_entry(app, entry_id),
+                    Err(e) => log::error!("Invalid recent dictation menu id '{}': {}", id, e),
+                }
             }
             id if id.starts_with("model_select:") => {
                 let model_id = id.strip_prefix("model_select:").unwrap().to_string();
@@ -351,6 +361,8 @@ fn initialize_core_logic(app_handle: &AppHandle) {
 
     // Initialize tray menu with idle state
     tray::update_tray_menu(app_handle);
+    // Populate the "Recent Dictations" submenu (runs off-thread, then resyncs).
+    tray::refresh_recent_dictations(app_handle);
 
     // Apply show_tray_icon setting
     let settings = settings::get_settings(app_handle);
@@ -707,6 +719,7 @@ pub fn run(cli_args: CliArgs) {
             shortcut::change_keyboard_implementation_setting,
             shortcut::get_keyboard_implementation,
             shortcut::change_show_tray_icon_setting,
+            shortcut::change_show_recent_dictations_in_tray_setting,
             shortcut::change_transcribe_accelerator_setting,
             shortcut::change_ort_accelerator_setting,
             shortcut::change_transcribe_gpu_device,
@@ -762,6 +775,7 @@ pub fn run(cli_args: CliArgs) {
             commands::transcription::get_model_load_status,
             commands::transcription::unload_model_manually,
             commands::history::get_history_entries,
+            commands::history::search_history_entries,
             commands::history::toggle_history_entry_saved,
             commands::history::get_audio_file_path,
             commands::history::delete_history_entry,

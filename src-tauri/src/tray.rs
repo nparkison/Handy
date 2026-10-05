@@ -31,10 +31,22 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 use tauri::image::Image;
-use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIcon;
 use tauri::{AppHandle, Manager, Theme};
 use tauri_plugin_clipboard_manager::ClipboardExt;
+
+/// How many dictations the tray's "Recent Dictations" submenu lists.
+pub const RECENT_DICTATIONS_COUNT: usize = 5;
+
+/// Visible characters of a recent-dictation label before it is ellipsized.
+const RECENT_DICTATION_LABEL_CHARS: usize = 40;
+
+/// Menu id prefix for recent-dictation items; the suffix is the history id.
+pub const RECENT_DICTATION_ID_PREFIX: &str = "recent_dictation:";
+
+/// `(history id, menu label)` for one tray recent-dictation item.
+type RecentDictation = (i64, String);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayIconState {
@@ -63,6 +75,8 @@ struct MenuInputs {
     downloaded_models: Vec<(String, String)>,
     locale: String,
     update_checks_enabled: bool,
+    /// `None` when the user hid the recent-dictations submenu.
+    recent_dictations: Option<Vec<RecentDictation>>,
 }
 
 /// Complete description of what the tray should look like.
@@ -93,6 +107,9 @@ struct TrayInner {
     next_seq: u64,
     /// Sequence number of the request that produced `desired`.
     desired_seq: u64,
+    /// Cached recent dictations, refreshed off-thread whenever history
+    /// changes so a tray sync never has to query the database.
+    recent_dictations: Vec<RecentDictation>,
 }
 
 /// Tauri managed state owning the tray's desired/applied snapshots.
@@ -109,6 +126,7 @@ impl TrayState {
             icons: HashMap::new(),
             next_seq: 0,
             desired_seq: 0,
+            recent_dictations: Vec::new(),
         }))
     }
 
@@ -249,11 +267,15 @@ fn sync_tray_with(app: &AppHandle, update: impl FnOnce(&mut TrayInner)) {
 
     // Record intent and claim a sequence number in one critical section, so
     // sequence order == the order in which state changes were requested.
-    let (seq, icon_state) = {
+    let (seq, icon_state, recent_dictations) = {
         let mut inner = state.lock();
         update(&mut inner);
         inner.next_seq += 1;
-        (inner.next_seq, inner.icon_state)
+        (
+            inner.next_seq,
+            inner.icon_state,
+            inner.recent_dictations.clone(),
+        )
     };
 
     // Tray not built yet (early secure-input monitor callbacks). The intent
@@ -262,7 +284,7 @@ fn sync_tray_with(app: &AppHandle, update: impl FnOnce(&mut TrayInner)) {
         return;
     }
 
-    let desired = compute_desired(app, icon_state);
+    let desired = compute_desired(app, icon_state, recent_dictations);
 
     // Decode the icon off the main thread, once per path, outside the lock.
     let needs_icon = !state.lock().icons.contains_key(desired.icon_path);
@@ -309,7 +331,11 @@ fn sync_tray_with(app: &AppHandle, update: impl FnOnce(&mut TrayInner)) {
     }
 }
 
-fn compute_desired(app: &AppHandle, icon_state: TrayIconState) -> TrayDesired {
+fn compute_desired(
+    app: &AppHandle,
+    icon_state: TrayIconState,
+    recent_dictations: Vec<RecentDictation>,
+) -> TrayDesired {
     let settings = settings::get_settings(app);
     let theme = get_current_theme(app);
     let warning = crate::secure_input::tray_warning_active(app);
@@ -334,6 +360,9 @@ fn compute_desired(app: &AppHandle, icon_state: TrayIconState) -> TrayDesired {
             downloaded_models,
             locale: settings.app_language,
             update_checks_enabled: settings.update_checks_enabled,
+            recent_dictations: settings
+                .show_recent_dictations_in_tray
+                .then_some(recent_dictations),
         },
     }
 }
@@ -512,23 +541,29 @@ fn build_menu(app: &AppHandle, inputs: &MenuInputs) -> tauri::Result<(Menu<tauri
     let quit_i = MenuItem::with_id(app, "quit", &strings.quit, true, quit_accelerator)?;
     let separator = || PredefinedMenuItem::separator(app);
 
+    let recent_submenu = match &inputs.recent_dictations {
+        Some(recent) => Some(build_recent_dictations_submenu(app, &strings, recent)?),
+        None => None,
+    };
+    // "Copy Last Transcript" plus, when enabled, the recent list right below it.
+    let mut transcript_items: Vec<&dyn IsMenuItem<tauri::Wry>> = vec![&copy_last_transcript_i];
+    if let Some(submenu) = &recent_submenu {
+        transcript_items.push(submenu);
+    }
+
     let menu = if inputs.busy {
         let cancel_i = MenuItem::with_id(app, "cancel", &strings.cancel, true, None::<&str>)?;
-        Menu::with_items(
-            app,
-            &[
-                &version_i,
-                &separator()?,
-                &cancel_i,
-                &separator()?,
-                &copy_last_transcript_i,
-                &separator()?,
-                &settings_i,
-                &check_updates_i,
-                &separator()?,
-                &quit_i,
-            ],
-        )?
+        let (sep1, sep2, sep3, sep4) = (separator()?, separator()?, separator()?, separator()?);
+        let mut items: Vec<&dyn IsMenuItem<tauri::Wry>> = vec![&version_i, &sep1, &cancel_i, &sep2];
+        items.extend(transcript_items.iter().copied());
+        items.extend([
+            &sep3 as &dyn IsMenuItem<tauri::Wry>,
+            &settings_i,
+            &check_updates_i,
+            &sep4,
+            &quit_i,
+        ]);
+        Menu::with_items(app, &items)?
     } else {
         // Build model submenu — label is the active model name
         let submenu_label = inputs
@@ -554,22 +589,20 @@ fn build_menu(app: &AppHandle, inputs: &MenuInputs) -> tauri::Result<(Menu<tauri
             None::<&str>,
         )?;
 
-        Menu::with_items(
-            app,
-            &[
-                &version_i,
-                &separator()?,
-                &copy_last_transcript_i,
-                &separator()?,
-                &model_submenu,
-                &unload_model_i,
-                &separator()?,
-                &settings_i,
-                &check_updates_i,
-                &separator()?,
-                &quit_i,
-            ],
-        )?
+        let (sep1, sep2, sep3, sep4) = (separator()?, separator()?, separator()?, separator()?);
+        let mut items: Vec<&dyn IsMenuItem<tauri::Wry>> = vec![&version_i, &sep1];
+        items.extend(transcript_items.iter().copied());
+        items.extend([
+            &sep2 as &dyn IsMenuItem<tauri::Wry>,
+            &model_submenu,
+            &unload_model_i,
+            &sep3,
+            &settings_i,
+            &check_updates_i,
+            &sep4,
+            &quit_i,
+        ]);
+        Menu::with_items(app, &items)?
     };
 
     // When update checks are forced off (e.g. HANDY_DISABLE_UPDATER, set by
@@ -594,11 +627,160 @@ fn build_menu(app: &AppHandle, inputs: &MenuInputs) -> tauri::Result<(Menu<tauri
     Ok((menu, tooltip))
 }
 
+/// "Recent Dictations" submenu: one item per entry (click copies it), or a
+/// disabled placeholder when there are none, then "Open History...".
+fn build_recent_dictations_submenu(
+    app: &AppHandle,
+    strings: &crate::tray_i18n::TrayStrings,
+    recent: &[RecentDictation],
+) -> tauri::Result<Submenu<tauri::Wry>> {
+    let submenu = Submenu::with_id(app, "recent_dictations", &strings.recent_dictations, true)?;
+    if recent.is_empty() {
+        submenu.append(&MenuItem::with_id(
+            app,
+            "recent_dictations_empty",
+            &strings.no_dictations_yet,
+            false,
+            None::<&str>,
+        )?)?;
+    } else {
+        for (id, label) in recent {
+            submenu.append(&MenuItem::with_id(
+                app,
+                format!("{RECENT_DICTATION_ID_PREFIX}{id}"),
+                label,
+                true,
+                None::<&str>,
+            )?)?;
+        }
+    }
+    submenu.append(&PredefinedMenuItem::separator(app)?)?;
+    submenu.append(&MenuItem::with_id(
+        app,
+        "open_history",
+        &strings.open_history,
+        true,
+        None::<&str>,
+    )?)?;
+    Ok(submenu)
+}
+
+/// The text a dictation is used as: the polished (post-processed) text when
+/// present, otherwise the raw transcription.
 fn last_transcript_text(entry: &HistoryEntry) -> &str {
     entry
         .post_processed_text
         .as_deref()
+        .filter(|text| !text.trim().is_empty())
         .unwrap_or(&entry.transcription_text)
+}
+
+/// Single-line, length-limited menu label for a dictation. Whitespace runs
+/// (including newlines) collapse to one space, text longer than
+/// [`RECENT_DICTATION_LABEL_CHARS`] characters is cut with an ellipsis, and
+/// `&` is doubled so the menu shows it literally instead of as a mnemonic.
+fn recent_dictation_label(text: &str) -> String {
+    let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let label = if single_line.chars().count() > RECENT_DICTATION_LABEL_CHARS {
+        let cut: String = single_line
+            .chars()
+            .take(RECENT_DICTATION_LABEL_CHARS)
+            .collect();
+        format!("{}\u{2026}", cut.trim_end())
+    } else {
+        single_line
+    };
+    label.replace('&', "&&")
+}
+
+fn recent_dictations_from_entries(entries: &[HistoryEntry]) -> Vec<RecentDictation> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let label = recent_dictation_label(last_transcript_text(entry));
+            (!label.is_empty()).then_some((entry.id, label))
+        })
+        .collect()
+}
+
+/// Serializes refreshes so a slow, older query can never overwrite the result
+/// of a newer one: each refresh queries and stores while holding this lock.
+static RECENT_REFRESH_LOCK: Mutex<()> = Mutex::new(());
+
+/// Re-reads the recent dictations after history changed. Returns immediately;
+/// the query runs on a background thread so the dictation pipeline (which
+/// saves history right before pasting) never waits on it.
+pub fn refresh_recent_dictations(app: &AppHandle) {
+    let app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("tray-recent-dictations".into())
+        .spawn(move || refresh_recent_dictations_blocking(&app));
+    if let Err(err) = spawned {
+        error!("Failed to spawn tray recent-dictations refresh: {err}");
+    }
+}
+
+fn refresh_recent_dictations_blocking(app: &AppHandle) {
+    let _guard = RECENT_REFRESH_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(history_manager) = app.try_state::<Arc<HistoryManager>>() else {
+        return;
+    };
+    let recent = match history_manager.get_recent_completed_entries(RECENT_DICTATIONS_COUNT) {
+        Ok(entries) => recent_dictations_from_entries(&entries),
+        Err(err) => {
+            error!("Failed to load recent dictations for the tray: {err}");
+            return;
+        }
+    };
+    let Some(state) = app.try_state::<TrayState>() else {
+        return;
+    };
+    let busy = {
+        let mut inner = state.lock();
+        if inner.recent_dictations == recent {
+            return;
+        }
+        inner.recent_dictations = recent;
+        inner.icon_state.is_busy()
+    };
+    // While recording/transcribing the cache is enough: the transition back
+    // to idle syncs the tray anyway, so we avoid an extra main-thread menu
+    // rebuild right before the paste.
+    if !busy {
+        sync_tray(app);
+    }
+}
+
+/// Copies one history entry (polished text preferred) from the tray's recent
+/// list. Copy rather than paste: clicking the tray moves focus away from the
+/// app the user would paste into.
+pub fn copy_history_entry(app: &AppHandle, id: i64) {
+    let history_manager = app.state::<Arc<HistoryManager>>();
+    let entry = match history_manager.find_entry(id) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            warn!("History entry {id} no longer exists; refreshing tray list.");
+            refresh_recent_dictations(app);
+            return;
+        }
+        Err(err) => {
+            error!("Failed to load history entry {id} for tray copy: {err}");
+            return;
+        }
+    };
+
+    let text = last_transcript_text(&entry);
+    if text.trim().is_empty() {
+        warn!("History entry {id} has no text; skipping tray copy.");
+        return;
+    }
+    if let Err(err) = app.clipboard().write_text(text) {
+        error!("Failed to copy history entry to clipboard: {err}");
+        return;
+    }
+    info!("Copied recent dictation to clipboard via tray.");
 }
 
 pub fn set_tray_visibility(app: &AppHandle, visible: bool) {
@@ -668,7 +850,10 @@ pub fn copy_last_transcript(app: &AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{last_transcript_text, load_tray_icon, MenuInputs, TrayDesired, TrayIconState};
+    use super::{
+        last_transcript_text, load_tray_icon, recent_dictation_label,
+        recent_dictations_from_entries, MenuInputs, TrayDesired, TrayIconState,
+    };
     use crate::managers::history::HistoryEntry;
 
     fn build_entry(transcription: &str, post_processed: Option<&str>) -> HistoryEntry {
@@ -694,6 +879,7 @@ mod tests {
             downloaded_models: vec![("small".to_string(), "Small".to_string())],
             locale: "en".to_string(),
             update_checks_enabled: true,
+            recent_dictations: Some(vec![(1, "hello".to_string())]),
         }
     }
 
@@ -707,6 +893,77 @@ mod tests {
     fn falls_back_to_raw_transcription() {
         let entry = build_entry("raw", None);
         assert_eq!(last_transcript_text(&entry), "raw");
+    }
+
+    #[test]
+    fn blank_post_processed_text_falls_back_to_raw() {
+        let entry = build_entry("raw", Some("  "));
+        assert_eq!(last_transcript_text(&entry), "raw");
+    }
+
+    #[test]
+    fn recent_label_keeps_short_text() {
+        assert_eq!(recent_dictation_label("Hello world"), "Hello world");
+    }
+
+    #[test]
+    fn recent_label_is_single_line() {
+        assert_eq!(
+            recent_dictation_label("  first line\n\nsecond\tline \r\n"),
+            "first line second line"
+        );
+    }
+
+    #[test]
+    fn recent_label_truncates_with_ellipsis() {
+        let text = "a".repeat(39) + " and then a lot more words";
+        let label = recent_dictation_label(&text);
+        // 39 'a's + the space is trimmed before the ellipsis.
+        assert_eq!(label, format!("{}\u{2026}", "a".repeat(39)));
+
+        let exact = "b".repeat(40);
+        assert_eq!(recent_dictation_label(&exact), exact);
+
+        let long = "c".repeat(41);
+        assert_eq!(
+            recent_dictation_label(&long),
+            format!("{}\u{2026}", "c".repeat(40))
+        );
+    }
+
+    #[test]
+    fn recent_label_counts_characters_not_bytes() {
+        let text = "\u{e9}".repeat(45);
+        let label = recent_dictation_label(&text);
+        assert_eq!(label.chars().count(), 41);
+        assert!(label.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn recent_label_escapes_mnemonic_ampersand() {
+        assert_eq!(recent_dictation_label("Q&A notes"), "Q&&A notes");
+    }
+
+    #[test]
+    fn recent_dictations_prefer_polished_and_skip_blank() {
+        let mut polished = build_entry("raw one", Some("Polished one."));
+        polished.id = 7;
+        let mut blank = build_entry("   ", None);
+        blank.id = 8;
+        let mut raw = build_entry("raw two", None);
+        raw.id = 9;
+
+        assert_eq!(
+            recent_dictations_from_entries(&[polished, blank, raw]),
+            vec![(7, "Polished one.".to_string()), (9, "raw two".to_string())]
+        );
+    }
+
+    #[test]
+    fn hiding_recent_dictations_changes_menu_inputs() {
+        let mut hidden = inputs(false);
+        hidden.recent_dictations = None;
+        assert_ne!(inputs(false), hidden);
     }
 
     #[test]
