@@ -8,10 +8,20 @@
 //! opens the microphone itself and is dropped with the stream.
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 /// Upper bound for the user setting. Longer windows start pulling in the tail
 /// of a previous sentence or conversation.
 pub const MAX_PRE_ROLL_MS: u64 = 1_000;
+
+/// Audio captured this soon after a recording stops never seeds the next
+/// pre-roll. It is the stop chime and the tail of a word the user was still
+/// saying at release, which a quick re-press would otherwise prepend.
+pub const POST_STOP_GUARD_MS: u64 = 200;
+
+/// Slack on top of the pre-roll length before buffered audio counts as stale
+/// (see [`PreRollBuffer::clear_if_stale`]).
+pub const PRE_ROLL_STALE_SLACK_MS: u64 = 250;
 
 /// Number of device-rate samples needed to hold `ms` of audio, clamped to
 /// [`MAX_PRE_ROLL_MS`]. Returns 0 when pre-roll is disabled.
@@ -25,6 +35,9 @@ pub fn pre_roll_capacity_samples(sample_rate: u32, ms: u64) -> usize {
 pub struct PreRollBuffer {
     samples: VecDeque<f32>,
     capacity: usize,
+    /// When audio last arrived. A stream can stall without an error (sleep,
+    /// another app taking exclusive mode), leaving old audio in the window.
+    last_push: Option<Instant>,
 }
 
 impl PreRollBuffer {
@@ -74,11 +87,31 @@ impl PreRollBuffer {
         if chunk.len() >= self.capacity {
             self.samples.clear();
             self.samples.extend(&chunk[chunk.len() - self.capacity..]);
+            self.last_push = Some(Instant::now());
             return;
         }
         let overflow = (self.samples.len() + chunk.len()).saturating_sub(self.capacity);
         self.samples.drain(..overflow);
         self.samples.extend(chunk);
+        self.last_push = Some(Instant::now());
+    }
+
+    /// Empty the window when its newest audio arrived more than `max_age`
+    /// before `now`: after a silent device stall it would otherwise prepend
+    /// audio that is minutes old.
+    pub fn clear_if_stale(&mut self, now: Instant, max_age: Duration) {
+        let stale = self
+            .last_push
+            .is_some_and(|pushed| now.saturating_duration_since(pushed) > max_age);
+        if stale {
+            self.samples.clear();
+        }
+    }
+
+    /// Drop all but the newest `count` samples.
+    pub fn keep_newest(&mut self, count: usize) {
+        let excess = self.samples.len().saturating_sub(count);
+        self.samples.drain(..excess);
     }
 
     /// Move the window, oldest first, into `out` (which is cleared first) and
@@ -106,6 +139,32 @@ mod tests {
         assert_eq!(pre_roll_capacity_samples(48_000, 300), 14_400);
         assert_eq!(pre_roll_capacity_samples(44_100, 1_000), 44_100);
         assert_eq!(pre_roll_capacity_samples(48_000, 5_000), 48_000);
+    }
+
+    #[test]
+    fn stale_window_is_dropped() {
+        let mut buffer = PreRollBuffer::new();
+        buffer.set_capacity(10);
+        buffer.push(&[1.0, 2.0]);
+        let pushed = Instant::now();
+        let max_age = Duration::from_millis(550);
+
+        buffer.clear_if_stale(pushed + Duration::from_millis(100), max_age);
+        assert_eq!(buffer.len(), 2);
+        buffer.clear_if_stale(pushed + Duration::from_secs(120), max_age);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn keep_newest_trims_the_oldest_samples() {
+        let mut buffer = PreRollBuffer::new();
+        buffer.set_capacity(10);
+        buffer.push(&[1.0, 2.0, 3.0, 4.0]);
+        buffer.keep_newest(3);
+        assert_eq!(contents(&mut buffer), vec![2.0, 3.0, 4.0]);
+        buffer.push(&[5.0]);
+        buffer.keep_newest(0);
+        assert!(buffer.is_empty());
     }
 
     #[test]

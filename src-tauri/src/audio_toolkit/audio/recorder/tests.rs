@@ -158,6 +158,43 @@ fn pre_roll_is_consumed_once_and_refills_only_while_idle() {
 }
 
 #[test]
+fn pre_roll_skips_audio_right_after_a_stop() {
+    // 300 ms window; the guard drops the first 200 ms (3200 samples) after a stop.
+    let (mut processor, _streamed) = pre_roll_processor(300, None);
+    let (ready_tx, _ready_rx) = mpsc::channel();
+    processor.begin_recording(VadPolicy::Disabled, ready_tx);
+    processor.process_raw_chunk(&[1.0; 480], ChunkDisposition::Capture);
+    processor.finish_recording();
+
+    // Quick re-press: only 150 ms idle since the stop (the chime / word tail).
+    processor.process_raw_chunk(&[9.0; 2_400], ChunkDisposition::Discard);
+    let (ready_tx, _ready_rx) = mpsc::channel();
+    processor.begin_recording(VadPolicy::Disabled, ready_tx);
+    processor.process_raw_chunk(&[2.0; 480], ChunkDisposition::Capture);
+    assert_eq!(processor.finish_recording(), vec![2.0; 480]);
+
+    // 260 ms idle: only the 60 ms after the guard window is kept (whole
+    // 30 ms frames keep the resampler out of the comparison).
+    processor.process_raw_chunk(&[9.0; 3_200], ChunkDisposition::Discard);
+    processor.process_raw_chunk(&[5.0; 960], ChunkDisposition::Discard);
+    let (ready_tx, _ready_rx) = mpsc::channel();
+    processor.begin_recording(VadPolicy::Disabled, ready_tx);
+    processor.process_raw_chunk(&[2.0; 480], ChunkDisposition::Capture);
+    let samples = processor.finish_recording();
+    let mut expected = vec![5.0; 960];
+    expected.extend_from_slice(&[2.0; 480]);
+    assert_eq!(samples, expected);
+
+    // A long pause: the full window is available again.
+    processor.process_raw_chunk(&[9.0; 16_000], ChunkDisposition::Discard);
+    processor.process_raw_chunk(&[6.0; 4_800], ChunkDisposition::Discard);
+    let (ready_tx, _ready_rx) = mpsc::channel();
+    processor.begin_recording(VadPolicy::Disabled, ready_tx);
+    let samples = processor.finish_recording();
+    assert_eq!(samples, vec![6.0; 4_800]);
+}
+
+#[test]
 fn zero_pre_roll_prepends_nothing() {
     let (mut processor, _streamed) = pre_roll_processor(0, None);
     processor.process_raw_chunk(&[1.0; 4_800], ChunkDisposition::Discard);

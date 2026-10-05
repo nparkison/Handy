@@ -20,6 +20,7 @@ use serde::Serialize;
 use specta::Type;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
 /// Consecutive silent clips that raise the persistent alert. Tolerates the
@@ -136,23 +137,22 @@ pub fn reset(app: &AppHandle) {
 
 /// Handle a dead clip: warn in the overlay and track the silent streak.
 /// The caller has already skipped transcription and torn down any stream.
+///
+/// Runs in the stop task while the coordinator is still busy, so it must stay
+/// cheap: no device enumeration here (the "Use {{mic}}" action checks that
+/// the mic still exists when it is clicked).
 pub fn on_silent_clip(app: &AppHandle, verdict: ClipVerdict, mic: Option<String>) {
+    let settings = get_settings(app);
+    let strings = get_tray_translations(Some(settings.app_language.clone()));
     let mic = mic
-        .or_else(|| get_settings(app).selected_microphone)
-        .unwrap_or_else(|| "Default".to_string());
+        .or(settings.selected_microphone)
+        .unwrap_or_else(|| strings.default_microphone.clone());
 
     let (alert, fallback) = with_state(|s| {
         let alert = s.record_silent(&mic);
         (alert, s.fallback_mic(&mic).map(str::to_string))
     });
-    // Only offer a mic the system still has.
-    let fallback = fallback.filter(|candidate| {
-        list_input_devices()
-            .map(|devices| devices.iter().any(|d| &d.name == candidate))
-            .unwrap_or(false)
-    });
 
-    let strings = get_tray_translations(Some(get_settings(app).app_language));
     let no_audio = verdict == ClipVerdict::NoAudio;
     let (message_key, tray_template) = if no_audio {
         let key = if cfg!(target_os = "windows") {
@@ -220,8 +220,65 @@ pub fn open_sound_settings(app: &AppHandle) {
     let _ = app.emit("navigate-to-section", "general");
 }
 
+/// Longest a "Use {{mic}}" click waits for an in-flight dictation to finish.
+const SWITCH_WAIT_LIMIT: Duration = Duration::from_secs(60);
+const SWITCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// True while a dictation is recording or being processed.
+fn dictation_active(app: &AppHandle) -> bool {
+    let coordinator_busy = app
+        .try_state::<crate::TranscriptionCoordinator>()
+        .is_some_and(|c| c.is_busy());
+    let recording = app
+        .try_state::<Arc<AudioRecordingManager>>()
+        .is_some_and(|a| a.is_recording());
+    coordinator_busy || recording
+}
+
 /// Make `name` the selected microphone (the "Use {{mic}}" action).
+///
+/// Switching restarts the capture stream, which would cut off a recording in
+/// progress (and its empty stop would be charged to the new mic), so a click
+/// during a dictation is deferred until the pipeline is idle.
 fn switch_microphone(app: &AppHandle, name: &str) {
+    if dictation_active(app) {
+        let app = app.clone();
+        let name = name.to_string();
+        let spawned = std::thread::Builder::new()
+            .name("dead-air-mic-switch".to_string())
+            .spawn(move || {
+                let started = Instant::now();
+                while dictation_active(&app) {
+                    if started.elapsed() >= SWITCH_WAIT_LIMIT {
+                        warn!("Gave up switching to '{name}': dictation still running");
+                        return;
+                    }
+                    std::thread::sleep(SWITCH_POLL_INTERVAL);
+                }
+                apply_microphone_switch(&app, &name);
+            });
+        if let Err(err) = spawned {
+            error!("Failed to defer microphone switch: {err}");
+        }
+        return;
+    }
+    apply_microphone_switch(app, name);
+}
+
+fn apply_microphone_switch(app: &AppHandle, name: &str) {
+    // The mic was known-good earlier but may have been unplugged since.
+    let present = list_input_devices()
+        .map(|devices| devices.iter().any(|d| d.name == name))
+        .unwrap_or(false);
+    if !present {
+        warn!("Microphone '{name}' is no longer available");
+        show_overlay_notice(
+            app,
+            Notice::warning(NoticeText::new("overlay.notice.switchFailed").param("mic", name)),
+        );
+        return;
+    }
+
     let mut settings = get_settings(app);
     settings.selected_microphone = Some(name.to_string());
     write_settings(app, settings);
