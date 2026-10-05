@@ -30,6 +30,7 @@ use crate::clipboard::send_return_key;
 use crate::input::EnigoState;
 use crate::settings::{AutoSubmitKey, ClipboardHandling, PasteMethod};
 use windows::Win32::Foundation::GlobalFree;
+use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardOwner,
     GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
@@ -260,44 +261,79 @@ unsafe fn settle_clipboard(shared: &WinTxShared) {
 
 /// Restores the snapshotted clipboard contents. Safe to call from any thread.
 unsafe fn restore_snapshot(shared: &WinTxShared) {
-    if OpenClipboard(None).is_err() {
-        warn!("[reliable-paste] could not open clipboard to restore");
-        return;
+    let bitmap = shared
+        .saved_bitmap
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    let restored = match shared.snapshot.lock() {
+        Ok(formats) => put_formats(&formats, bitmap),
+        Err(_) => put_formats(&[], bitmap),
+    };
+    match restored {
+        Ok(()) => info!("[reliable-paste] restored previous clipboard"),
+        Err(e) => warn!("[reliable-paste] could not restore clipboard: {e}"),
+    }
+}
+
+/// Replaces the clipboard with `formats` (plus an owned copied HBITMAP, whose
+/// ownership passes to the clipboard on success, or is freed).
+unsafe fn put_formats(formats: &[SavedFormat], bitmap: Option<usize>) -> Result<(), String> {
+    if let Err(e) = OpenClipboard(None) {
+        if let Some(raw) = bitmap {
+            let _ = DeleteObject(HGDIOBJ(raw as *mut _));
+        }
+        return Err(format!("OpenClipboard failed: {e}"));
     }
     let _ = EmptyClipboard();
-    if let Ok(formats) = shared.snapshot.lock() {
-        for saved in formats.iter() {
-            if saved.data.is_empty() {
-                continue;
-            }
-            let Ok(hg) = GlobalAlloc(GMEM_MOVEABLE, saved.data.len()) else {
-                continue;
-            };
-            let ptr = GlobalLock(hg) as *mut u8;
-            if ptr.is_null() {
-                let _ = GlobalFree(Some(hg));
-                continue;
-            }
-            std::ptr::copy_nonoverlapping(saved.data.as_ptr(), ptr, saved.data.len());
-            let _ = GlobalUnlock(hg);
-            // SetClipboardData takes ownership of the handle on success.
-            if SetClipboardData(saved.format, Some(HANDLE(hg.0))).is_err() {
-                let _ = GlobalFree(Some(hg));
-            }
+    for saved in formats {
+        if saved.data.is_empty() {
+            continue;
+        }
+        let Ok(hg) = GlobalAlloc(GMEM_MOVEABLE, saved.data.len()) else {
+            continue;
+        };
+        let ptr = GlobalLock(hg) as *mut u8;
+        if ptr.is_null() {
+            let _ = GlobalFree(Some(hg));
+            continue;
+        }
+        std::ptr::copy_nonoverlapping(saved.data.as_ptr(), ptr, saved.data.len());
+        let _ = GlobalUnlock(hg);
+        // SetClipboardData takes ownership of the handle on success.
+        if SetClipboardData(saved.format, Some(HANDLE(hg.0))).is_err() {
+            let _ = GlobalFree(Some(hg));
         }
     }
-    if let Ok(mut bitmap) = shared.saved_bitmap.lock() {
-        if let Some(raw) = bitmap.take() {
-            let _ = SetClipboardData(CF_BITMAP.0 as u32, Some(HANDLE(raw as *mut _)));
+    if let Some(raw) = bitmap {
+        if SetClipboardData(CF_BITMAP.0 as u32, Some(HANDLE(raw as *mut _))).is_err() {
+            let _ = DeleteObject(HGDIOBJ(raw as *mut _));
         }
     }
-    let _ = CloseClipboard();
-    info!("[reliable-paste] restored previous clipboard");
+    CloseClipboard().map_err(|e| format!("CloseClipboard failed: {e}"))
 }
 
 unsafe fn snapshot_clipboard(hwnd: HWND, shared: &WinTxShared) -> Result<(), String> {
-    OpenClipboard(Some(hwnd)).map_err(|e| format!("OpenClipboard failed: {e}"))?;
+    let (formats, bitmap) = capture_formats(Some(hwnd))?;
+    if let Some(raw) = bitmap {
+        if let Ok(mut slot) = shared.saved_bitmap.lock() {
+            *slot = Some(raw);
+        }
+    }
+    if let Ok(mut slot) = shared.snapshot.lock() {
+        *slot = formats;
+    }
+    Ok(())
+}
+
+/// Copies every clipboard format that is plain global memory, plus a copy of
+/// the CF_BITMAP handle (owned by the caller).
+unsafe fn capture_formats(
+    owner: Option<HWND>,
+) -> Result<(Vec<SavedFormat>, Option<usize>), String> {
+    OpenClipboard(owner).map_err(|e| format!("OpenClipboard failed: {e}"))?;
     let mut formats = Vec::new();
+    let mut bitmap = None;
     let mut format = 0u32;
     loop {
         format = EnumClipboardFormats(format);
@@ -310,9 +346,7 @@ unsafe fn snapshot_clipboard(hwnd: HWND, shared: &WinTxShared) -> Result<(), Str
                 if let Ok(copy) =
                     CopyImage(handle, IMAGE_BITMAP_TYPE, 0, 0, LR_CREATEDIBSECTION_FLAG)
                 {
-                    if let Ok(mut slot) = shared.saved_bitmap.lock() {
-                        *slot = Some(copy.0 as usize);
-                    }
+                    bitmap = Some(copy.0 as usize);
                 }
             }
             continue;
@@ -345,10 +379,63 @@ unsafe fn snapshot_clipboard(hwnd: HWND, shared: &WinTxShared) -> Result<(), Str
         }
     }
     let _ = CloseClipboard();
-    if let Ok(mut slot) = shared.snapshot.lock() {
-        *slot = formats;
+    Ok((formats, bitmap))
+}
+
+/// A full-fidelity copy of the clipboard (every byte-copyable format plus a
+/// bitmap), for code that borrows the clipboard and must put the user's
+/// content back as it was (Swap last's selection check).
+pub(crate) struct ClipboardSnapshot {
+    formats: Vec<SavedFormat>,
+    bitmap: Option<usize>,
+}
+
+/// Another process (often the app that was just asked to copy) may hold the
+/// clipboard open for a moment: retry briefly.
+fn with_clipboard_retry<T>(mut f: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+    let mut result = f();
+    for _ in 0..9 {
+        if result.is_ok() {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+        result = f();
     }
-    Ok(())
+    result
+}
+
+impl ClipboardSnapshot {
+    pub(crate) fn capture() -> Result<Self, String> {
+        let (formats, bitmap) = with_clipboard_retry(|| unsafe { capture_formats(None) })?;
+        Ok(Self { formats, bitmap })
+    }
+
+    /// Put the snapshot back (an empty snapshot leaves an empty clipboard).
+    pub(crate) fn restore(mut self) -> Result<(), String> {
+        let mut bitmap = self.bitmap.take();
+        let formats = std::mem::take(&mut self.formats);
+        // The bitmap moves into the first attempt (which hands it to the
+        // clipboard or frees it); a retry restores the other formats.
+        with_clipboard_retry(|| unsafe { put_formats(&formats, bitmap.take()) })
+    }
+}
+
+impl Drop for ClipboardSnapshot {
+    fn drop(&mut self) {
+        if let Some(raw) = self.bitmap.take() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(raw as *mut _));
+            }
+        }
+    }
+}
+
+/// Settle the transaction still holding the clipboard, if any: put the
+/// user's clipboard back now (when it is still ours) instead of when the
+/// target's reads go quiet, so other code sees the user's real clipboard and
+/// cannot defeat the guarded restore.
+pub(crate) fn finish_pending() {
+    flush_pending();
 }
 
 /// Publishes the transcript as a delayed-render promise plus clipboard

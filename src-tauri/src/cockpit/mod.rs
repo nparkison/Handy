@@ -16,10 +16,13 @@
 //! pastes the other version over it through the normal paste path. Never
 //! Ctrl+Z, never backspace runs. Guards (all must pass, otherwise the other
 //! version is only copied): clipboard paste method without auto-submit,
-//! single-line plain characters only, same window, a known non-terminal app,
-//! no key/mouse-button input (other than the trigger's own) from the paste
-//! until the swap acts, a live input watch, < 2 min. Only Windows can verify
-//! the window and input guards; other platforms always copy.
+//! single-line plain characters only, same window, a known app that is not a
+//! terminal, an IDE with an embedded terminal, a spreadsheet or a modal editor
+//! (see `swap.rs` for the residual risk), no key/mouse-button input (other
+//! than the trigger's own) from the paste until the paste over the selection,
+//! a live input watch, < 2 min. Only Windows can verify the window and input
+//! guards; other platforms always copy. The user's clipboard is saved with
+//! every format and put back after the selection check.
 
 pub mod deadline;
 pub mod gestures;
@@ -34,7 +37,7 @@ use crate::settings::{get_settings, AppSettings, PasteMethod};
 use crate::TranscriptionCoordinator;
 use log::{debug, error, info, warn};
 use platform::ForegroundApp;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use swap::{plan_swap, SwapCheck, SwapPlan};
@@ -100,11 +103,14 @@ struct LastPaste {
     paste_method_ok: bool,
 }
 
+/// Lock order: [`LATE_RESOLVED`] before [`LAST_PASTE`] whenever both are held.
 static LAST_PASTE: Mutex<Option<LastPaste>> = Mutex::new(None);
 static NEXT_PASTE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_LATE_ID: AtomicU64 = AtomicU64::new(1);
 /// The most recent late-cleanup resolution, for a paste recorded after its
-/// cleanup already finished (`(late_id, result)`).
+/// cleanup already finished (`(late_id, result)`). Held together with
+/// [`LAST_PASTE`] (taken first) while either side reads and writes, so a
+/// resolution can never fall between a paste's read and its record.
 static LATE_RESOLVED: Mutex<Option<(u64, Polished)>> = Mutex::new(None);
 /// Swaps run one at a time.
 static SWAP_LOCK: Mutex<()> = Mutex::new(());
@@ -113,6 +119,10 @@ static DICTATIONS: AtomicU64 = AtomicU64::new(0);
 
 fn last_paste() -> std::sync::MutexGuard<'static, Option<LastPaste>> {
     LAST_PASTE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn late_resolved() -> std::sync::MutexGuard<'static, Option<(u64, Polished)>> {
+    LATE_RESOLVED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn note_dictation_started() -> u64 {
@@ -128,11 +138,30 @@ pub fn new_late_id() -> u64 {
     NEXT_LATE_ID.fetch_add(1, Ordering::AcqRel)
 }
 
-/// Settings changed: refresh the gesture cache, and run the input watch only
-/// while Swap last is reachable (installed before the first paste, so that
-/// paste can already be swapped in place). Cheap; called on every settings
-/// read and write.
+/// Some settings were applied (by a write, or by the first read).
+static SETTINGS_APPLIED: AtomicBool = AtomicBool::new(false);
+
+/// Settings were written: refresh the gesture cache, and run the input watch
+/// only while Swap last is reachable (installed before the first paste, so
+/// that paste can already be swapped in place). Cheap.
 pub fn sync_settings(settings: &AppSettings) {
+    SETTINGS_APPLIED.store(true, Ordering::SeqCst);
+    apply_settings(settings);
+}
+
+/// Settings were read. Only the first read (startup) is applied: a later
+/// read may be a stale snapshot racing a write, and applying it would turn
+/// the input watch off and on again (losing its "watched since" time).
+pub fn sync_settings_on_read(settings: &AppSettings) {
+    if SETTINGS_APPLIED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        apply_settings(settings);
+    }
+}
+
+fn apply_settings(settings: &AppSettings) {
     gestures::cache_settings(settings);
     if settings.swap_last_reachable() {
         platform::start_input_watch();
@@ -185,28 +214,48 @@ pub fn record_paste(
     if settings.swap_last_reachable() {
         platform::start_input_watch();
     }
-    // A late cleanup that finished before this paste was recorded.
-    let polished = match (late_id, polished) {
-        (Some(late), Polished::Pending) => {
-            let resolved = LATE_RESOLVED.lock().unwrap_or_else(|e| e.into_inner());
-            match resolved.as_ref() {
-                Some((id, result)) if *id == late => result.clone(),
-                _ => Polished::Pending,
-            }
-        }
-        (_, polished) => polished,
-    };
-    *last_paste() = Some(LastPaste {
+    let foreground = platform::foreground_app();
+    // Both locks (in order) across the read and the write: a resolution
+    // landing in between would otherwise leave this paste Pending forever.
+    let resolved = late_resolved();
+    let mut last = last_paste();
+    *last = Some(LastPaste {
         id: NEXT_PASTE_ID.fetch_add(1, Ordering::AcqRel),
         late_id,
         original,
-        polished,
+        polished: polished_for_new_paste(resolved.as_ref(), late_id, polished),
         pasted,
         inserted_text: inserted_text(&settings, pasted_text),
         at: started_at,
-        foreground: platform::foreground_app(),
+        foreground,
         paste_method_ok: paste_method_allows_swap(&settings),
     });
+}
+
+/// A paste recorded with its cleanup still pending picks up a resolution
+/// that already arrived.
+fn polished_for_new_paste(
+    resolved: Option<&(u64, Polished)>,
+    late_id: Option<u64>,
+    polished: Polished,
+) -> Polished {
+    match (late_id, polished) {
+        (Some(late), Polished::Pending) => match resolved {
+            Some((id, result)) if *id == late => result.clone(),
+            _ => Polished::Pending,
+        },
+        (_, polished) => polished,
+    }
+}
+
+/// A late cleanup resolved: update the last paste when it is still waiting
+/// for exactly that cleanup.
+fn apply_late_result(last: Option<&mut LastPaste>, late_id: u64, result: &Polished) {
+    if let Some(last) = last {
+        if last.late_id == Some(late_id) && last.polished == Polished::Pending {
+            last.polished = result.clone();
+        }
+    }
 }
 
 fn polished_from_late(cleaned: Option<&str>) -> Polished {
@@ -221,12 +270,11 @@ fn polished_from_late(cleaned: Option<&str>) -> Polished {
 /// without a History entry, and for a paste recorded later.
 fn on_late_cleanup_resolved(late_id: u64, cleaned: Option<&str>) {
     let result = polished_from_late(cleaned);
-    *LATE_RESOLVED.lock().unwrap_or_else(|e| e.into_inner()) = Some((late_id, result.clone()));
-    if let Some(last) = last_paste().as_mut() {
-        if last.late_id == Some(late_id) && last.polished == Polished::Pending {
-            last.polished = result;
-        }
-    }
+    // Same lock order as `record_paste`, both held across the update.
+    let mut resolved = late_resolved();
+    let mut last = last_paste();
+    apply_late_result(last.as_mut(), late_id, &result);
+    *resolved = Some((late_id, result));
 }
 
 /// Finish a deadline-missed cleanup in the background. The result only ever
@@ -421,9 +469,12 @@ fn with_enigo<T>(
     f(&mut enigo)
 }
 
-fn select_back(app: &AppHandle, chars: usize) -> Result<(), String> {
+/// Shift+Left × `chars`. Returns how many Left presses were sent, and the
+/// error that stopped it early, if any.
+fn select_back(app: &AppHandle, chars: usize) -> (usize, Result<(), String>) {
     use enigo::{Direction, Key, Keyboard};
-    with_enigo(app, |enigo| {
+    let mut sent = 0;
+    let result = with_enigo(app, |enigo| {
         enigo
             .key(Key::Shift, Direction::Press)
             .map_err(|e| format!("Failed to press Shift: {e}"))?;
@@ -433,13 +484,15 @@ fn select_back(app: &AppHandle, chars: usize) -> Result<(), String> {
                 result = Err(format!("Failed to press Left: {e}"));
                 break;
             }
+            sent += 1;
         }
         // Always release Shift, even after a failure.
         enigo
             .key(Key::Shift, Direction::Release)
             .map_err(|e| format!("Failed to release Shift: {e}"))?;
         result
-    })
+    });
+    (sent, result)
 }
 
 /// Collapse the selection to its right end (where the caret was).
@@ -454,23 +507,11 @@ fn collapse_selection(app: &AppHandle) {
     }
 }
 
-/// How long to wait for the target app to put the selection on the clipboard.
-const COPY_SELECTION_TIMEOUT: Duration = Duration::from_millis(400);
-
-/// Copy the current selection with Ctrl+Insert (never Ctrl+C, which is
-/// SIGINT in terminals) and return it, restoring the user's clipboard.
-/// `None` when the app did not copy anything.
-fn copy_selection(app: &AppHandle) -> Option<String> {
+/// Ctrl+Insert: copy the selection (never Ctrl+C, which is SIGINT in
+/// terminals).
+fn send_copy(app: &AppHandle) -> Result<(), String> {
     use enigo::{Direction, Key, Keyboard};
-    let before = platform::clipboard_sequence()?;
-    let clipboard = app.clipboard();
-    let saved_text = clipboard.read_text().ok().filter(|t| !t.is_empty());
-    let saved_image = if saved_text.is_none() {
-        clipboard.read_image().ok().map(|image| image.to_owned())
-    } else {
-        None
-    };
-    let sent = with_enigo(app, |enigo| {
+    with_enigo(app, |enigo| {
         enigo
             .key(Key::Control, Direction::Press)
             .map_err(|e| format!("Failed to press Ctrl: {e}"))?;
@@ -481,34 +522,46 @@ fn copy_selection(app: &AppHandle) -> Option<String> {
             .key(Key::Control, Direction::Release)
             .map_err(|e| format!("Failed to release Ctrl: {e}"))?;
         result
-    });
-    if let Err(e) = sent {
-        warn!("Swap last: {e}");
-        return None;
-    }
+    })
+}
+
+/// How long to wait for the target app to put the selection on the clipboard.
+const COPY_SELECTION_TIMEOUT: Duration = Duration::from_millis(400);
+/// After the timeout, how much longer to watch for a slow app's late copy,
+/// so it can never land on top of what Swap last puts on the clipboard next.
+const LATE_COPY_GRACE: Duration = Duration::from_millis(250);
+
+/// Wait up to `timeout` for the clipboard to change from `before`.
+fn clipboard_changed_within(before: u32, timeout: Duration) -> bool {
     let start = Instant::now();
-    let mut changed = false;
-    while start.elapsed() < COPY_SELECTION_TIMEOUT {
+    loop {
         if platform::clipboard_sequence().is_some_and(|now| now != before) {
-            changed = true;
-            break;
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// After Ctrl+Insert: wait for the target app to copy, read the copied text
+/// and put the user's clipboard back. `None` when the app copied nothing.
+/// Runs off the main thread.
+fn await_copy(app: &AppHandle, before: u32, backup: platform::ClipboardBackup) -> Option<String> {
+    let changed = clipboard_changed_within(before, COPY_SELECTION_TIMEOUT)
+        || clipboard_changed_within(before, LATE_COPY_GRACE);
     let copied = if changed {
         // Let the owner finish writing all formats.
         std::thread::sleep(Duration::from_millis(20));
-        clipboard.read_text().ok()
+        app.clipboard().read_text().ok()
     } else {
+        debug!("Swap last: the app did not copy the selection");
         None
     };
     if changed {
-        if let Some(text) = saved_text {
-            let _ = clipboard.write_text(text);
-        } else if let Some(image) = saved_image {
-            let _ = clipboard.write_image(&image);
-        } else {
-            let _ = clipboard.clear();
+        if let Err(e) = backup.restore() {
+            error!("Swap last: could not restore the clipboard after the selection check: {e}");
         }
     }
     copied
@@ -521,13 +574,151 @@ fn selection_matches(copied: &str, inserted: &str) -> bool {
     normalize(copied) == normalize(inserted)
 }
 
+/// The last paste was recorded after the swap was triggered: this trigger
+/// was queued behind another swap (or paste) and must not swap that one back.
+fn superseded_after_trigger(last_at: Instant, trigger_at: Instant) -> bool {
+    last_at > trigger_at
+}
+
 enum SwapResult {
     Swapped,
-    /// A guard failed at the last moment; nothing was changed.
+    /// A guard failed at the last moment; nothing was replaced.
     CopyInstead(&'static str),
     /// A newer paste replaced the one this swap planned against.
     Stale,
     Failed(String),
+}
+
+/// What the first main-thread step left behind.
+enum Selected {
+    /// The selection was made and Ctrl+Insert sent.
+    CopySent,
+    Done(SwapResult),
+}
+
+/// Re-checks right before touching the target app (main thread): the paste
+/// is still the last one, no real input since it, and focus is unchanged.
+fn still_safe(
+    planned: &LastPaste,
+    trigger_at: Instant,
+    window: Option<isize>,
+) -> Result<(), SwapResult> {
+    if last_paste().as_ref().map(|l| l.id) != Some(planned.id) {
+        return Err(SwapResult::Stale);
+    }
+    if platform::input_since_paste(planned.at, trigger_at, Instant::now(), false) != Some(false) {
+        return Err(SwapResult::CopyInstead("input after the trigger"));
+    }
+    if platform::foreground_app().map(|f| f.window) != window {
+        return Err(SwapResult::CopyInstead("focus changed"));
+    }
+    Ok(())
+}
+
+/// Select the inserted text back, verify it, and paste `text` over it. Only
+/// the key injections and the paste run on the main thread (where the
+/// regular pipeline pastes); waiting for the copy runs here.
+fn swap_in_place(
+    app: &AppHandle,
+    planned: &LastPaste,
+    trigger_at: Instant,
+    select_back_chars: usize,
+    window: Option<isize>,
+    target: Version,
+    text: &str,
+) -> Option<SwapResult> {
+    // Save the user's clipboard (settling a reliable paste still holding it)
+    // before Ctrl+Insert overwrites it.
+    let backup = match platform::ClipboardBackup::capture() {
+        Ok(backup) => backup,
+        Err(e) => {
+            warn!("Swap last: could not save the clipboard: {e}");
+            return Some(SwapResult::CopyInstead("clipboard unavailable"));
+        }
+    };
+    let Some(before) = platform::clipboard_sequence() else {
+        return Some(SwapResult::CopyInstead("clipboard sequence unavailable"));
+    };
+
+    let plan = planned.clone();
+    let selected = on_main_thread(app, move |app| {
+        if let Err(result) = still_safe(&plan, trigger_at, window) {
+            return Selected::Done(result);
+        }
+        let (sent, selected) = select_back(app, select_back_chars);
+        if let Err(e) = selected {
+            if sent > 0 {
+                collapse_selection(app);
+            }
+            return Selected::Done(SwapResult::Failed(e));
+        }
+        if let Err(e) = send_copy(app) {
+            warn!("Swap last: {e}");
+            collapse_selection(app);
+            return Selected::Done(SwapResult::CopyInstead("copy failed"));
+        }
+        Selected::CopySent
+    })?;
+    match selected {
+        Selected::CopySent => {}
+        Selected::Done(result) => return Some(result),
+    }
+
+    // Verify the selection is exactly what Handy inserted before replacing
+    // it: apps can rewrite pasted text, and a stale clipboard restore can
+    // paste something else.
+    let copied = await_copy(app, before, backup);
+    let verified = copied
+        .as_deref()
+        .is_some_and(|copied| selection_matches(copied, &planned.inserted_text));
+    // Collapse only a selection the copy proved non-empty: Right after an
+    // empty selection would move the caret.
+    let selection_live = copied.as_deref().is_some_and(|c| !c.is_empty());
+
+    let plan = planned.clone();
+    let swap_text = text.to_string();
+    on_main_thread(app, move |app| {
+        if !verified {
+            debug!(
+                "Swap last: selection {} the inserted text",
+                if selection_live {
+                    "differs from"
+                } else {
+                    "could not be compared with"
+                }
+            );
+            if selection_live && platform::foreground_app().map(|f| f.window) == window {
+                collapse_selection(app);
+            }
+            return SwapResult::CopyInstead("selection mismatch");
+        }
+        // A newer paste, input or a focus change while the copy was checked:
+        // the selection may be gone or elsewhere, and keys sent now could
+        // reach another window. Leave it to the user.
+        if let Err(result) = still_safe(&plan, trigger_at, window) {
+            return result;
+        }
+        let started_at = Instant::now();
+        match crate::utils::paste(swap_text.clone(), app.clone()) {
+            Ok(()) => {
+                let settings = get_settings(app);
+                let mut guard = last_paste();
+                if let Some(record) = guard.as_mut().filter(|r| r.id == plan.id) {
+                    record.id = NEXT_PASTE_ID.fetch_add(1, Ordering::AcqRel);
+                    record.pasted = target;
+                    record.inserted_text = inserted_text(&settings, &swap_text);
+                    record.at = started_at;
+                    record.foreground = platform::foreground_app();
+                }
+                SwapResult::Swapped
+            }
+            Err(e) => {
+                // The verified selection may still be live.
+                collapse_selection(app);
+                SwapResult::Failed(e)
+            }
+        }
+    })
 }
 
 /// Swap the last Handy paste to its other version. `trigger_at` is when the
@@ -540,6 +731,11 @@ pub fn swap_last(app: &AppHandle, trigger_at: Instant) {
         notice(app, "overlay.notice.nothingToSwap");
         return;
     };
+    if superseded_after_trigger(last.at, trigger_at) {
+        // Its notice already showed; swapping again would undo it.
+        debug!("Swap last: queued behind a newer paste or swap; ignoring this trigger");
+        return;
+    }
     let (target, text) = match swap_target(&last) {
         Ok(target) => target,
         Err(key) => {
@@ -548,7 +744,6 @@ pub fn swap_last(app: &AppHandle, trigger_at: Instant) {
         }
     };
 
-    let modifiers_released = platform::modifiers_released(MODIFIER_RELEASE_TIMEOUT);
     let foreground = platform::foreground_app();
     let same_window = match (&last.foreground, &foreground) {
         (Some(then), Some(now)) => Some(then.window == now.window),
@@ -558,15 +753,19 @@ pub fn swap_last(app: &AppHandle, trigger_at: Instant) {
         inserted_text: &last.inserted_text,
         age: last.at.elapsed(),
         same_window,
-        input_since_paste: platform::input_since_paste(last.at, trigger_at, Instant::now(), true),
         process_name: last
             .foreground
             .as_ref()
             .and_then(|f| f.process_path.as_deref()),
         paste_method_ok: last.paste_method_ok,
-        modifiers_released,
     };
-    let plan = plan_swap(&check);
+    // The modifier wait and the input-watch probe only run once every cheap
+    // guard passed.
+    let plan = plan_swap(
+        &check,
+        || platform::modifiers_released(MODIFIER_RELEASE_TIMEOUT),
+        || platform::input_since_paste(last.at, trigger_at, Instant::now(), true),
+    );
     debug!("Swap last: {plan:?}");
 
     let copy_instead = |app: &AppHandle, text: String| match app.clipboard().write_text(text) {
@@ -583,60 +782,16 @@ pub fn swap_last(app: &AppHandle, trigger_at: Instant) {
         }
     };
 
-    let planned = last.clone();
     let window = foreground.as_ref().map(|f| f.window);
-    let swap_text = text.clone();
-    let result = on_main_thread(app, move |app| {
-        // Re-validate right before touching the target app: a paste queued
-        // on this thread may have landed since the plan was made.
-        if last_paste().as_ref().map(|l| l.id) != Some(planned.id) {
-            return SwapResult::Stale;
-        }
-        if platform::input_since_paste(planned.at, trigger_at, Instant::now(), false) != Some(false)
-        {
-            return SwapResult::CopyInstead("input after the trigger");
-        }
-        if platform::foreground_app().map(|f| f.window) != window {
-            return SwapResult::CopyInstead("focus changed");
-        }
-        if let Err(e) = select_back(app, select_back_chars) {
-            return SwapResult::Failed(e);
-        }
-        // Verify the selection is exactly what Handy inserted before
-        // replacing it: apps can rewrite pasted text, and a stale clipboard
-        // restore can paste something else.
-        match copy_selection(app) {
-            Some(copied) if selection_matches(&copied, &planned.inserted_text) => {}
-            other => {
-                debug!(
-                    "Swap last: selection {} the inserted text",
-                    if other.is_some() {
-                        "differs from"
-                    } else {
-                        "could not be compared with"
-                    }
-                );
-                collapse_selection(app);
-                return SwapResult::CopyInstead("selection mismatch");
-            }
-        }
-        let started_at = Instant::now();
-        match crate::utils::paste(swap_text.clone(), app.clone()) {
-            Ok(()) => {
-                let settings = get_settings(app);
-                let mut guard = last_paste();
-                if let Some(record) = guard.as_mut().filter(|r| r.id == planned.id) {
-                    record.id = NEXT_PASTE_ID.fetch_add(1, Ordering::AcqRel);
-                    record.pasted = target;
-                    record.inserted_text = inserted_text(&settings, &swap_text);
-                    record.at = started_at;
-                    record.foreground = platform::foreground_app();
-                }
-                SwapResult::Swapped
-            }
-            Err(e) => SwapResult::Failed(e),
-        }
-    });
+    let result = swap_in_place(
+        app,
+        &last,
+        trigger_at,
+        select_back_chars,
+        window,
+        target,
+        &text,
+    );
     match result {
         Some(SwapResult::Swapped) => notice(
             app,
@@ -763,6 +918,67 @@ mod tests {
         on_late_cleanup_resolved(late, Some("  "));
         let resolved = LATE_RESOLVED.lock().unwrap().clone();
         assert_eq!(resolved, Some((late, Polished::None)));
+    }
+
+    #[test]
+    fn late_resolution_reaches_the_paste_in_either_order() {
+        let ready = Polished::Ready("Cleaned.".into());
+        let pending_paste = |late_id| LastPaste {
+            late_id: Some(late_id),
+            ..last(Version::Original, Polished::Pending)
+        };
+
+        // Resolved first, paste recorded afterwards.
+        let resolved = Some((7, ready.clone()));
+        assert_eq!(
+            polished_for_new_paste(resolved.as_ref(), Some(7), Polished::Pending),
+            ready
+        );
+        // Paste recorded first, resolved afterwards.
+        let mut paste = Some(pending_paste(7));
+        apply_late_result(paste.as_mut(), 7, &ready);
+        assert_eq!(paste.unwrap().polished, ready);
+    }
+
+    #[test]
+    fn late_resolution_only_touches_its_own_pending_paste() {
+        let ready = Polished::Ready("Cleaned.".into());
+        // Another dictation's resolution.
+        assert_eq!(
+            polished_for_new_paste(Some(&(6, ready.clone())), Some(7), Polished::Pending),
+            Polished::Pending
+        );
+        let mut paste = Some(LastPaste {
+            late_id: Some(7),
+            ..last(Version::Original, Polished::Pending)
+        });
+        apply_late_result(paste.as_mut(), 6, &ready);
+        assert_eq!(paste.as_ref().unwrap().polished, Polished::Pending);
+        // A paste that already knows its cleaned-up version keeps it.
+        assert_eq!(
+            polished_for_new_paste(Some(&(7, Polished::None)), Some(7), ready.clone()),
+            ready
+        );
+        let mut known = Some(LastPaste {
+            late_id: Some(7),
+            ..last(Version::Original, ready.clone())
+        });
+        apply_late_result(known.as_mut(), 7, &Polished::None);
+        assert_eq!(known.unwrap().polished, ready);
+        // No paste at all: nothing to update, no panic.
+        apply_late_result(None, 7, &ready);
+    }
+
+    #[test]
+    fn a_trigger_queued_behind_a_newer_paste_is_stale() {
+        let trigger = Instant::now();
+        let later = trigger + Duration::from_millis(300);
+        let earlier = trigger - Duration::from_millis(300);
+        // The first swap re-recorded the paste after this trigger was pressed.
+        assert!(superseded_after_trigger(later, trigger));
+        // The normal case: the paste happened before the trigger.
+        assert!(!superseded_after_trigger(earlier, trigger));
+        assert!(!superseded_after_trigger(trigger, trigger));
     }
 
     #[test]

@@ -513,7 +513,13 @@ fn show_overlay_state(app_handle: &AppHandle, state: &str) {
     // only chooses Top vs Bottom placement. Checked here (off the main thread)
     // so the common overlay-disabled case never pays for a main-thread hop.
     let settings = settings::get_settings(app_handle);
-    if settings.overlay_style == OverlayStyle::None {
+    show_overlay_state_for_style(app_handle, state, settings.overlay_style);
+}
+
+/// [`show_overlay_state`] for a caller that already knows the overlay style
+/// (no settings read, e.g. while holding a lock).
+pub fn show_overlay_state_for_style(app_handle: &AppHandle, state: &str, style: OverlayStyle) {
+    if style == OverlayStyle::None {
         return;
     }
 
@@ -657,16 +663,6 @@ pub fn emit_recording_ready(app_handle: &AppHandle) {
     let _ = app_handle.run_on_main_thread(move || {
         let _ = handle.emit_to("recording_overlay", "recording-ready", ());
     });
-}
-
-/// Shows the recording overlay window with fade-in animation
-pub fn show_recording_overlay(app_handle: &AppHandle) {
-    show_overlay_state(app_handle, "recording");
-}
-
-/// Shows the larger streaming overlay that displays live transcription text
-pub fn show_streaming_overlay(app_handle: &AppHandle) {
-    show_overlay_state(app_handle, "streaming");
 }
 
 /// Shows the transcribing overlay window

@@ -6,6 +6,17 @@
 //! suspends jobs in terminals) or with backspace runs. A wrong delete destroys
 //! user text, so every guard must pass; otherwise the other version is only
 //! copied to the clipboard.
+//!
+//! ## Residual risk
+//! The selection is verified (copied with Ctrl+Insert and compared with what
+//! Handy inserted) before anything is pasted, so text is only replaced when
+//! the selection is exactly Handy's paste. The keys used to select and copy
+//! (Shift+Left × N, Ctrl+Insert, and Right to collapse a wrong selection) are
+//! sent before that verification, though. Known terminals, IDEs with embedded
+//! terminals, spreadsheets and modal editors are excluded by executable name,
+//! but an unlisted app whose focused element is not a text field (an embedded
+//! terminal or grid in some other app) still receives those keys: they can
+//! move its cursor or selection, or reach a shell as escape sequences.
 
 use std::time::Duration;
 
@@ -17,10 +28,8 @@ pub const MAX_SELECT_BACK_CHARS: usize = 500;
 
 /// Executables (Windows) and app names (macOS/Linux) that are terminals.
 /// Matched case-insensitively against the process file name, with or without
-/// ".exe". Terminals embedded in other apps (VS Code, JetBrains IDEs) report
-/// the host app's executable and cannot be detected here; nothing else
-/// guards against them, which is why a swap must also verify the selection
-/// (see `cockpit::swap_last`).
+/// ".exe". Terminals embedded in other apps report the host app's executable;
+/// the known hosts are in [`NON_TEXT_HOSTS`].
 const TERMINALS: &[&str] = &[
     "windowsterminal",
     "openconsole",
@@ -54,20 +63,85 @@ const TERMINALS: &[&str] = &[
     "cmder",
 ];
 
-/// Whether `process_name` (e.g. `C:\\...\\WindowsTerminal.exe`, `pwsh.exe`,
-/// `iTerm2`) is a known terminal.
-pub fn is_terminal(process_name: &str) -> bool {
+/// Apps whose focused element is often not a plain text field: IDEs with an
+/// embedded terminal (their terminal panel reports the IDE's executable),
+/// spreadsheets (Shift+Left extends a cell range in Ready mode) and modal
+/// editors (Shift+Left is a motion in normal mode). Swap last only copies in
+/// them. Plain editors without an embedded terminal (Notepad, Notepad++,
+/// Sublime Text) stay allowed.
+const NON_TEXT_HOSTS: &[&str] = &[
+    // VS Code and its forks.
+    "code",
+    "code - insiders",
+    "codium",
+    "vscodium",
+    "cursor",
+    "windsurf",
+    "trae",
+    "zed",
+    // JetBrains IDEs (32- and 64-bit launchers) and Android Studio.
+    "idea",
+    "idea64",
+    "pycharm",
+    "pycharm64",
+    "webstorm",
+    "webstorm64",
+    "rider",
+    "rider64",
+    "clion",
+    "clion64",
+    "goland",
+    "goland64",
+    "phpstorm",
+    "phpstorm64",
+    "rubymine",
+    "rubymine64",
+    "datagrip",
+    "datagrip64",
+    "rustrover",
+    "rustrover64",
+    "dataspell",
+    "dataspell64",
+    "studio",
+    "studio64",
+    "fleet",
+    // Visual Studio.
+    "devenv",
+    // Spreadsheets.
+    "excel",
+    "et",
+    // Modal / terminal-hosting editors.
+    "gvim",
+    "nvim-qt",
+    "neovide",
+    "emacs",
+    "runemacs",
+];
+
+/// Lower-cased file name of `process_name` without ".exe" / ".app".
+fn process_stem(process_name: &str) -> String {
     let file = process_name
         .rsplit(['\\', '/'])
         .next()
         .unwrap_or(process_name)
         .trim()
         .to_ascii_lowercase();
-    let stem = file
-        .strip_suffix(".exe")
+    file.strip_suffix(".exe")
         .or_else(|| file.strip_suffix(".app"))
-        .unwrap_or(&file);
-    TERMINALS.contains(&stem)
+        .map(str::to_string)
+        .unwrap_or(file)
+}
+
+/// Whether `process_name` (e.g. `C:\\...\\WindowsTerminal.exe`, `pwsh.exe`,
+/// `iTerm2`) is a known terminal.
+pub fn is_terminal(process_name: &str) -> bool {
+    TERMINALS.contains(&process_stem(process_name).as_str())
+}
+
+/// Whether `process_name` is a known app whose focus may not be a text field
+/// (see [`NON_TEXT_HOSTS`]).
+pub fn is_non_text_host(process_name: &str) -> bool {
+    NON_TEXT_HOSTS.contains(&process_stem(process_name).as_str())
 }
 
 /// Characters for which one Left arrow press is known to move exactly one
@@ -116,6 +190,8 @@ pub enum CopyReason {
     InputSincePaste,
     TooOld,
     Terminal,
+    /// An IDE with an embedded terminal, a spreadsheet or a modal editor.
+    NonTextHost,
     MultiLine,
     /// Characters whose cursor movement is unpredictable, or too long.
     UnsafeText,
@@ -134,13 +210,10 @@ pub struct SwapCheck<'a> {
     pub age: Duration,
     /// `None` when the foreground window cannot be determined.
     pub same_window: Option<bool>,
-    /// `None` when input tracking is unavailable.
-    pub input_since_paste: Option<bool>,
     pub process_name: Option<&'a str>,
     /// The paste method types or pastes plain text that Shift+Left can
     /// select back, and auto-submit is off.
     pub paste_method_ok: bool,
-    pub modifiers_released: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,7 +225,16 @@ pub enum SwapPlan {
     CopyOnly(CopyReason),
 }
 
-pub fn plan_swap(check: &SwapCheck<'_>) -> SwapPlan {
+/// Decide how to swap. The cheap guards on `check` run first; the costly
+/// probes only run once they all passed, in this order:
+/// `modifiers_released` (waits for the user to let go of Shift/Ctrl/Alt/Win),
+/// then `input_since_paste` (`None` when input tracking is unavailable; may
+/// send a liveness probe and wait for it).
+pub fn plan_swap(
+    check: &SwapCheck<'_>,
+    modifiers_released: impl FnOnce() -> bool,
+    input_since_paste: impl FnOnce() -> Option<bool>,
+) -> SwapPlan {
     use CopyReason::*;
     let fail = SwapPlan::CopyOnly;
     if !check.paste_method_ok {
@@ -165,11 +247,14 @@ pub fn plan_swap(check: &SwapCheck<'_>) -> SwapPlan {
         return fail(DifferentWindow);
     }
     // An unknown process could be a terminal: never risk it.
-    if check.process_name.is_none_or(is_terminal) {
+    let Some(process) = check.process_name else {
+        return fail(Terminal);
+    };
+    if is_terminal(process) {
         return fail(Terminal);
     }
-    if check.input_since_paste != Some(false) {
-        return fail(InputSincePaste);
+    if is_non_text_host(process) {
+        return fail(NonTextHost);
     }
     if check.inserted_text.contains(['\n', '\r']) {
         return fail(MultiLine);
@@ -181,8 +266,11 @@ pub fn plan_swap(check: &SwapCheck<'_>) -> SwapPlan {
     {
         return fail(UnsafeText);
     }
-    if !check.modifiers_released {
+    if !modifiers_released() {
         return fail(ModifiersHeld);
+    }
+    if input_since_paste() != Some(false) {
+        return fail(InputSincePaste);
     }
     SwapPlan::InPlace { select_back: count }
 }
@@ -190,28 +278,32 @@ pub fn plan_swap(check: &SwapCheck<'_>) -> SwapPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     fn ok_check(text: &str) -> SwapCheck<'_> {
         SwapCheck {
             inserted_text: text,
             age: Duration::from_secs(5),
             same_window: Some(true),
-            input_since_paste: Some(false),
             process_name: Some(r"C:\Program Files\Slack\slack.exe"),
             paste_method_ok: true,
-            modifiers_released: true,
         }
+    }
+
+    /// Plan with the probes reporting "released" and "no input".
+    fn plan(check: &SwapCheck<'_>) -> SwapPlan {
+        plan_swap(check, || true, || Some(false))
     }
 
     #[test]
     fn all_guards_pass_selects_back_char_count() {
         assert_eq!(
-            plan_swap(&ok_check("Hello, world. ")),
+            plan(&ok_check("Hello, world. ")),
             SwapPlan::InPlace { select_back: 14 }
         );
         // Smart quotes, dashes and accents are one character each.
         assert_eq!(
-            plan_swap(&ok_check("Café — “quoted”")),
+            plan(&ok_check("Café — “quoted”")),
             SwapPlan::InPlace { select_back: 15 }
         );
     }
@@ -236,20 +328,6 @@ mod tests {
             ),
             (
                 SwapCheck {
-                    input_since_paste: Some(true),
-                    ..ok_check("hi")
-                },
-                InputSincePaste,
-            ),
-            (
-                SwapCheck {
-                    input_since_paste: None,
-                    ..ok_check("hi")
-                },
-                InputSincePaste,
-            ),
-            (
-                SwapCheck {
                     age: Duration::from_secs(120),
                     ..ok_check("hi")
                 },
@@ -261,6 +339,15 @@ mod tests {
                     ..ok_check("hi")
                 },
                 Terminal,
+            ),
+            (
+                SwapCheck {
+                    process_name: Some(
+                        r"C:\Users\me\AppData\Local\Programs\Microsoft VS Code\Code.exe",
+                    ),
+                    ..ok_check("hi")
+                },
+                NonTextHost,
             ),
             (ok_check("line one\nline two"), MultiLine),
             (ok_check("line one\r\n"), MultiLine),
@@ -281,19 +368,77 @@ mod tests {
                 },
                 PasteMethod,
             ),
-            (
-                SwapCheck {
-                    modifiers_released: false,
-                    ..ok_check("hi")
-                },
-                ModifiersHeld,
-            ),
         ];
         for (check, reason) in cases {
-            assert_eq!(plan_swap(&check), SwapPlan::CopyOnly(reason), "{check:?}");
+            assert_eq!(plan(&check), SwapPlan::CopyOnly(reason), "{check:?}");
         }
         let long = "a".repeat(MAX_SELECT_BACK_CHARS + 1);
-        assert_eq!(plan_swap(&ok_check(&long)), SwapPlan::CopyOnly(UnsafeText));
+        assert_eq!(plan(&ok_check(&long)), SwapPlan::CopyOnly(UnsafeText));
+
+        let check = ok_check("hi");
+        assert_eq!(
+            plan_swap(&check, || false, || Some(false)),
+            SwapPlan::CopyOnly(ModifiersHeld)
+        );
+        assert_eq!(
+            plan_swap(&check, || true, || Some(true)),
+            SwapPlan::CopyOnly(InputSincePaste)
+        );
+        // Input tracking unavailable.
+        assert_eq!(
+            plan_swap(&check, || true, || None),
+            SwapPlan::CopyOnly(InputSincePaste)
+        );
+    }
+
+    #[test]
+    fn costly_probes_only_run_after_every_cheap_guard_passed() {
+        let modifiers = Cell::new(0);
+        let input = Cell::new(0);
+        let probe = |check: &SwapCheck<'_>, released: bool| {
+            plan_swap(
+                check,
+                || {
+                    modifiers.set(modifiers.get() + 1);
+                    released
+                },
+                || {
+                    input.set(input.get() + 1);
+                    Some(false)
+                },
+            )
+        };
+        // A cheap guard fails: neither probe runs.
+        for check in [
+            SwapCheck {
+                paste_method_ok: false,
+                ..ok_check("hi")
+            },
+            SwapCheck {
+                same_window: Some(false),
+                ..ok_check("hi")
+            },
+            SwapCheck {
+                process_name: Some("EXCEL.EXE"),
+                ..ok_check("hi")
+            },
+            ok_check("two\nlines"),
+        ] {
+            assert!(matches!(probe(&check, true), SwapPlan::CopyOnly(_)));
+        }
+        assert_eq!((modifiers.get(), input.get()), (0, 0));
+        // Modifiers still held: the input probe does not run.
+        assert_eq!(
+            probe(&ok_check("hi"), false),
+            SwapPlan::CopyOnly(CopyReason::ModifiersHeld)
+        );
+        assert_eq!((modifiers.get(), input.get()), (1, 0));
+        // Everything passes: both run, modifiers first.
+        assert!(matches!(
+            probe(&ok_check("hi"), true),
+            SwapPlan::InPlace { .. }
+        ));
+        assert_eq!((modifiers.get(), input.get()), (2, 1));
     }
 
     #[test]
@@ -312,7 +457,7 @@ mod tests {
             "\u{05D0}",         // Hebrew (not allow-listed)
         ] {
             assert_eq!(
-                plan_swap(&ok_check(text)),
+                plan(&ok_check(text)),
                 SwapPlan::CopyOnly(CopyReason::UnsafeText),
                 "{text:?}"
             );
@@ -327,7 +472,7 @@ mod tests {
             "naïve",
         ] {
             assert!(
-                matches!(plan_swap(&ok_check(text)), SwapPlan::InPlace { .. }),
+                matches!(plan(&ok_check(text)), SwapPlan::InPlace { .. }),
                 "{text:?}"
             );
         }
@@ -366,6 +511,48 @@ mod tests {
             "terminalizer-notes.exe",
         ] {
             assert!(!is_terminal(name), "{name} should not be a terminal");
+        }
+    }
+
+    #[test]
+    fn ide_spreadsheet_and_modal_editor_detection() {
+        for name in [
+            "Code.exe",
+            r"C:\Users\me\AppData\Local\Programs\Microsoft VS Code Insiders\Code - Insiders.exe",
+            "Cursor.exe",
+            "Windsurf.exe",
+            r"C:\Program Files\JetBrains\IntelliJ IDEA 2025.2\bin\idea64.exe",
+            "pycharm64.exe",
+            "webstorm64.exe",
+            "rider64.exe",
+            "clion64.exe",
+            "goland64.exe",
+            "studio64.exe",
+            r"C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\devenv.exe",
+            r"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE",
+            "gvim.exe",
+        ] {
+            assert!(is_non_text_host(name), "{name} should be copy-only");
+            assert_eq!(
+                plan(&SwapCheck {
+                    process_name: Some(name),
+                    ..ok_check("hi")
+                }),
+                SwapPlan::CopyOnly(CopyReason::NonTextHost),
+                "{name}"
+            );
+        }
+        for name in [
+            "sublime_text.exe",
+            "notepad.exe",
+            "notepad++.exe",
+            "slack.exe",
+            "WINWORD.EXE",
+            "chrome.exe",
+            "Obsidian.exe",
+            "codex-notes.exe",
+        ] {
+            assert!(!is_non_text_host(name), "{name} should stay allowed");
         }
     }
 }

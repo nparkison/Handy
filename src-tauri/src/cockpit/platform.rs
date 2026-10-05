@@ -10,9 +10,12 @@
 //! (a Swap last binding or tap gestures) and removed when it stops being
 //! reachable. Every event counts as user input, injected ones included (the
 //! on-screen keyboard, AutoHotkey and KVM software inject), except Handy's own
-//! injections, recognised by enigo's `dwExtraInfo` marker. Windows silently
-//! removes a hook that is too slow, so a swap first sends a probe event and
-//! only trusts the watch when the hook sees it.
+//! injections (enigo events carrying [`crate::input::INJECTION_MARKER`], the
+//! hotkey listener's "menu mask" key, the liveness probe). Windows silently
+//! removes a hook that is too slow (`LowLevelHooksTimeout`), so a swap first
+//! sends a probe event and only trusts the watch when the hook sees it; when
+//! it does not, the hooks are re-installed, so the next paste is covered
+//! again.
 
 use std::time::{Duration, Instant};
 
@@ -43,9 +46,38 @@ const MOUSE_MIDDLE: InputCode = 0x103;
 #[cfg(windows)]
 const MOUSE_X: InputCode = 0x104; // + 0 / 1 for XBUTTON1 / XBUTTON2
 
+/// Unassigned virtual key used both by the liveness probe and by the
+/// hotkey listener's (handy-keys) "menu mask" on Win/Alt hotkeys. Never real
+/// typing, so it is never recorded.
+pub(crate) const UNASSIGNED_VK: u32 = 0xE8;
+/// `dwExtraInfo` of handy-keys' injected menu-mask events.
+pub(crate) const HANDY_KEYS_MARKER: usize = 0x484B_4D4D;
+/// Shift, Ctrl, Alt, Win (generic and left/right variants).
+pub(crate) const MODIFIER_VKS: &[u32] = &[
+    0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,
+];
+
+/// Whether a key-down seen by the keyboard hook is user input. Modifiers
+/// alone never change text (and the swap shortcut's own modifiers are pressed
+/// before it); Handy's own injections are not user input; anything else
+/// injected is (on-screen keyboards, AutoHotkey, KVM software).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn is_user_key_press(vk: u32, extra_info: usize) -> bool {
+    vk != UNASSIGNED_VK
+        && !MODIFIER_VKS.contains(&vk)
+        && extra_info != crate::input::INJECTION_MARKER
+        && extra_info != HANDY_KEYS_MARKER
+}
+
+/// Whether a mouse-button press seen by the mouse hook is user input.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn is_user_mouse_press(extra_info: usize) -> bool {
+    extra_info != crate::input::INJECTION_MARKER
+}
+
 pub use imp::{
     clipboard_sequence, foreground_app, last_press_of, modifiers_released, recorded_inputs,
-    start_input_watch, stop_input_watch, watch_verified_since, window_title,
+    start_input_watch, stop_input_watch, watch_verified_since, window_title, ClipboardBackup,
 };
 
 /// Pure decision behind [`input_since_paste`], on microsecond timestamps.
@@ -111,7 +143,8 @@ pub fn input_since_paste(
 #[cfg(windows)]
 mod imp {
     use super::{
-        ForegroundApp, InputCode, INPUT_RING, MOUSE_LEFT, MOUSE_MIDDLE, MOUSE_RIGHT, MOUSE_X,
+        is_user_key_press, is_user_mouse_press, ForegroundApp, InputCode, INPUT_RING, MODIFIER_VKS,
+        MOUSE_LEFT, MOUSE_MIDDLE, MOUSE_RIGHT, MOUSE_X, UNASSIGNED_VK,
     };
     use log::{debug, warn};
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -136,18 +169,12 @@ mod imp {
         WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_XBUTTONDOWN,
     };
 
-    /// enigo's default `dwExtraInfo` on Windows (`enigo::EVENT_MARKER`): every
-    /// Handy injection (paste chords, Shift+Left, Ctrl+C) goes through enigo.
-    const ENIGO_MARKER: usize = enigo::EVENT_MARKER as usize;
     /// Marker of the liveness probe (a key-up of an unassigned virtual key).
     const PROBE_MARKER: usize = 0x4841_4E44; // "HAND"
-    const PROBE_VK: u16 = 0xE8; // unassigned
     const PROBE_TIMEOUT: Duration = Duration::from_millis(150);
-
-    /// Shift, Ctrl, Alt, Win (generic and left/right variants).
-    const MODIFIER_VKS: &[u32] = &[
-        0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,
-    ];
+    /// After the hooks could not be installed, wait this long before trying
+    /// again (on the next settings change or paste).
+    const INSTALL_RETRY_AFTER: Duration = Duration::from_secs(30);
 
     /// Clock origin of every stored timestamp (microseconds since BASE).
     static BASE: OnceLock<Instant> = OnceLock::new();
@@ -167,9 +194,9 @@ mod imp {
     static THREAD_ID: AtomicU32 = AtomicU32::new(0);
     /// Serialises start/stop decisions with the hook thread's exit decision.
     static CONTROL: Mutex<()> = Mutex::new(());
-    /// Installing the hooks failed once; do not retry (and warn) on every
-    /// settings read.
-    static INSTALL_FAILED: AtomicBool = AtomicBool::new(false);
+    /// When installing the hooks last failed (µs + 1; 0 = never): do not
+    /// retry (and warn) on every paste, only after [`INSTALL_RETRY_AFTER`].
+    static INSTALL_FAILED_AT: AtomicU64 = AtomicU64::new(0);
 
     fn base() -> Instant {
         *BASE.get_or_init(Instant::now)
@@ -200,12 +227,8 @@ mod imp {
                 // Invisible to everyone else.
                 return LRESULT(1);
             }
-            // Modifiers alone never change text; the swap shortcut's own
-            // modifiers are pressed before it. Handy's own injections are
-            // not user input; anything else injected is.
             if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN)
-                && info.dwExtraInfo != ENIGO_MARKER
-                && !MODIFIER_VKS.contains(&info.vkCode)
+                && is_user_key_press(info.vkCode, info.dwExtraInfo)
             {
                 record_press(info.vkCode.min(0xFF) as InputCode);
             }
@@ -226,7 +249,7 @@ mod imp {
             if let Some(mut button) = button {
                 // SAFETY: for HC_ACTION, lparam points to an MSLLHOOKSTRUCT.
                 let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-                if info.dwExtraInfo != ENIGO_MARKER {
+                if is_user_mouse_press(info.dwExtraInfo) {
                     if button == MOUSE_X && (info.mouseData >> 16) == 2 {
                         button += 1;
                     }
@@ -291,8 +314,8 @@ mod imp {
                     if let Ok(m) = m {
                         let _ = UnhookWindowsHookEx(m);
                     }
-                    // Do not spin: give up for this session.
-                    INSTALL_FAILED.store(true, Ordering::SeqCst);
+                    // Do not spin: retry only after INSTALL_RETRY_AFTER.
+                    INSTALL_FAILED_AT.store(now_us(base) + 1, Ordering::SeqCst);
                     DESIRED.store(false, Ordering::SeqCst);
                     return;
                 }
@@ -319,12 +342,16 @@ mod imp {
 
     /// Install the low-level hooks on their own thread (no-op when running).
     pub fn start_input_watch() {
-        if INSTALL_FAILED.load(Ordering::Relaxed)
-            || (DESIRED.load(Ordering::SeqCst) && THREAD_ALIVE.load(Ordering::SeqCst))
+        if DESIRED.load(Ordering::SeqCst) && THREAD_ALIVE.load(Ordering::SeqCst) {
+            return;
+        }
+        let base = base();
+        let failed_at = INSTALL_FAILED_AT.load(Ordering::SeqCst);
+        if failed_at != 0
+            && now_us(base).saturating_sub(failed_at - 1) < INSTALL_RETRY_AFTER.as_micros() as u64
         {
             return;
         }
-        let _ = base();
         let _guard = CONTROL.lock().unwrap_or_else(|e| e.into_inner());
         DESIRED.store(true, Ordering::SeqCst);
         if THREAD_ALIVE.load(Ordering::SeqCst) {
@@ -367,7 +394,7 @@ mod imp {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(PROBE_VK),
+                    wVk: VIRTUAL_KEY(UNASSIGNED_VK as u16),
                     wScan: 0,
                     dwFlags: KEYEVENTF_KEYUP,
                     time: 0,
@@ -387,8 +414,32 @@ mod imp {
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-        warn!("Input watch: hook did not see the probe (removed by Windows?)");
+        warn!("Input watch: hook did not see the probe (removed by Windows?); re-installing");
+        restart_watch();
         false
+    }
+
+    /// The hooks stopped working (Windows removes a hook that exceeds
+    /// `LowLevelHooksTimeout` without telling us): stop trusting the watch
+    /// and have the hook thread re-install them. Input before the re-install
+    /// is unknown, so pastes made until then copy instead of swapping; the
+    /// next paste after it can be swapped in place again.
+    fn restart_watch() {
+        let _guard = CONTROL.lock().unwrap_or_else(|e| e.into_inner());
+        WATCH_SINCE.store(0, Ordering::SeqCst);
+        if !DESIRED.load(Ordering::SeqCst) {
+            return;
+        }
+        let tid = THREAD_ID.load(Ordering::SeqCst);
+        if tid != 0 {
+            // DESIRED stays true, so the hook thread installs fresh hooks
+            // (and a new WATCH_SINCE) right after leaving its message loop.
+            unsafe {
+                if let Err(e) = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0)) {
+                    warn!("Input watch: failed to restart hook thread: {e}");
+                }
+            }
+        }
     }
 
     /// The watch has run continuously since before `at` and (with `probe`)
@@ -518,6 +569,24 @@ mod imp {
         (seq != 0).then_some(seq)
     }
 
+    /// The user's clipboard, saved with every format the reliable paste can
+    /// restore (text, HTML, RTF, files, images, ...).
+    pub struct ClipboardBackup(crate::paste_tx::ClipboardSnapshot);
+
+    impl ClipboardBackup {
+        /// Settles a reliable paste still waiting to restore the clipboard
+        /// first: until then the clipboard holds Handy's own transcript, and
+        /// borrowing it would defeat that guarded restore.
+        pub fn capture() -> Result<Self, String> {
+            crate::paste_tx::finish_pending();
+            crate::paste_tx::ClipboardSnapshot::capture().map(Self)
+        }
+
+        pub fn restore(self) -> Result<(), String> {
+            self.0.restore()
+        }
+    }
+
     fn any_modifier_down() -> bool {
         MODIFIER_VKS
             .iter()
@@ -575,6 +644,19 @@ mod imp {
 
     pub fn modifiers_released(_timeout: Duration) -> bool {
         true
+    }
+
+    /// In-place swaps never run here (no foreground or input probes).
+    pub struct ClipboardBackup;
+
+    impl ClipboardBackup {
+        pub fn capture() -> Result<Self, String> {
+            Err("clipboard backup is not supported on this platform".to_string())
+        }
+
+        pub fn restore(self) -> Result<(), String> {
+            Ok(())
+        }
     }
 }
 
@@ -639,6 +721,28 @@ mod tests {
         // Queued trigger at 0.5 s, paste at 1 s, typing at 1.2 s.
         let events = [(500_000, KEY_F9), (1_200_000, KEY_F9)];
         assert!(check(&events, 1_000_000, 500_000, 1_500_000));
+    }
+
+    #[test]
+    fn handy_injections_and_the_menu_mask_are_not_user_input() {
+        // Typing, and other software's injections (enigo's shared default
+        // marker included), count.
+        assert!(is_user_key_press(0x41, 0));
+        assert!(is_user_key_press(0x41, 100));
+        assert!(is_user_mouse_press(0));
+        // Handy's own enigo events never count.
+        assert!(!is_user_key_press(0x41, crate::input::INJECTION_MARKER));
+        assert!(!is_user_mouse_press(crate::input::INJECTION_MARKER));
+        // handy-keys' menu mask on Win/Alt hotkeys: neither its marker nor
+        // the unassigned key itself (whatever the marker) counts.
+        assert!(!is_user_key_press(UNASSIGNED_VK, HANDY_KEYS_MARKER));
+        assert!(!is_user_key_press(UNASSIGNED_VK, 0));
+        assert!(!is_user_key_press(0x41, HANDY_KEYS_MARKER));
+        // Modifiers alone never count.
+        for &vk in MODIFIER_VKS {
+            assert!(!is_user_key_press(vk, 0), "{vk:#x}");
+        }
+        assert_ne!(crate::input::INJECTION_MARKER, enigo::EVENT_MARKER as usize);
     }
 
     #[test]

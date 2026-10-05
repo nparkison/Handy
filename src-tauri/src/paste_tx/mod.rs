@@ -47,6 +47,9 @@ use macos as platform;
 #[cfg(target_os = "windows")]
 use windows as platform;
 
+#[cfg(target_os = "windows")]
+pub(crate) use windows::{finish_pending, ClipboardSnapshot};
+
 /// How long after the *last* observed read the transcript stays on the
 /// clipboard before restoring. Covers applications that read the clipboard
 /// several times per paste (e.g. Chromium probe-then-read).

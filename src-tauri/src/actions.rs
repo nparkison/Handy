@@ -21,9 +21,7 @@ use crate::settings::{
 };
 use crate::shortcut;
 use crate::tray::{set_tray_state, TrayIconState};
-use crate::utils::{
-    self, show_processing_overlay, show_recording_overlay, show_transcribing_overlay,
-};
+use crate::utils::{self, show_processing_overlay, show_transcribing_overlay};
 use crate::TranscriptionCoordinator;
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
@@ -36,6 +34,10 @@ use tauri::Manager;
 use tauri::{AppHandle, Emitter};
 
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// The held-back recording overlay wakes this long after the tap window plus
+/// the release grace, so a release confirmed right at the end of that window
+/// is already recorded when the overlay decides whether to appear.
+const OVERLAY_HOLD_BACK_MARGIN: Duration = Duration::from_millis(20);
 
 #[derive(Clone, serde::Serialize)]
 struct RecordingErrorEvent {
@@ -227,12 +229,17 @@ fn begin_working_feedback(app: &AppHandle, tm: &TranscriptionManager, use_stream
 }
 
 /// The overlay shown when a recording starts. Sizing follows the model's
-/// advertised streaming capability.
+/// advertised streaming capability. Uses the overlay style the caller already
+/// read (no settings read: the held-back overlay calls this under a lock).
 fn show_start_overlay(app: &AppHandle, style: OverlayStyle, model_supports_streaming: bool) {
     match style {
-        OverlayStyle::Live if model_supports_streaming => utils::show_streaming_overlay(app),
-        OverlayStyle::Live | OverlayStyle::Minimal => show_recording_overlay(app),
-        OverlayStyle::None => {} // show_overlay_state no-ops on None anyway
+        OverlayStyle::Live if model_supports_streaming => {
+            utils::show_overlay_state_for_style(app, "streaming", style)
+        }
+        OverlayStyle::Live | OverlayStyle::Minimal => {
+            utils::show_overlay_state_for_style(app, "recording", style)
+        }
+        OverlayStyle::None => {}
     }
 }
 
@@ -708,6 +715,7 @@ impl ShortcutAction for TranscribeAction {
         let gesture_delay = gestures::active_for(&binding_id, &settings).then(|| {
             gestures::GestureTiming::from_settings(&settings).tap_max
                 + crate::transcription_coordinator::RELEASE_GRACE
+                + OVERLAY_HOLD_BACK_MARGIN
         });
         gestures::reset_press_overlay(gesture_delay.is_some());
         if let Some(slot) = app.try_state::<PressContextSlot>() {

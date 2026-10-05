@@ -150,10 +150,20 @@ mod macos {
 /// Enigo is wrapped in a Mutex since it requires mutable access.
 pub struct EnigoState(pub Mutex<Enigo>);
 
+/// `dwExtraInfo` stamped on every key/mouse event Handy injects through enigo
+/// on Windows ("HDYI"). Unique to Handy, unlike enigo's shared default
+/// (`enigo::EVENT_MARKER`, used by every enigo-based app), so Swap last's
+/// input watch can tell Handy's own injections from everyone else's.
+pub const INJECTION_MARKER: usize = 0x4844_5949;
+
 impl EnigoState {
     pub fn new() -> Result<Self, String> {
-        let enigo = Enigo::new(&Settings::default())
-            .map_err(|e| format!("Failed to initialize Enigo: {}", e))?;
+        let settings = Settings {
+            windows_dw_extra_info: Some(INJECTION_MARKER),
+            ..Settings::default()
+        };
+        let enigo =
+            Enigo::new(&settings).map_err(|e| format!("Failed to initialize Enigo: {}", e))?;
         Ok(Self(Mutex::new(enigo)))
     }
 }

@@ -251,7 +251,8 @@ static MACHINE: Mutex<Option<GestureMachine>> = Mutex::new(None);
 /// (pressed_at, released_at) of the main-binding hold that ended the
 /// current recording, recorded by the coordinator before it runs Stop.
 static LAST_HOLD: Mutex<Option<(Instant, Instant)>> = Mutex::new(None);
-/// Latest release of the main binding's key (raw edge, before the grace).
+/// Latest confirmed release of the main binding's key: recorded once the
+/// auto-repeat grace confirmed it, timestamped at the raw key-up.
 static LAST_RELEASE: Mutex<Option<Instant>> = Mutex::new(None);
 
 fn with_machine<T>(f: impl FnOnce(&mut GestureMachine) -> T) -> T {
