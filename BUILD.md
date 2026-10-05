@@ -14,6 +14,13 @@ This guide covers how to set up the development environment and build Handy from
 > - **History database:** the fork's extra History columns are added outside
 >   upstream's numbered migrations, so an upstream build can still open the
 >   same `history.db`.
+> - **Rolling back:** switching to an upstream build of the same or a newer
+>   version is safe; it ignores the fork's columns. The older fork build
+>   (before the v0.9.8 merge) only knows three History migrations and refuses
+>   a database at version 4. To run it, close Handy and run
+>   `PRAGMA user_version=3;` on `history.db` (e.g. with the `sqlite3` CLI);
+>   the extra columns are harmless to it. This build puts the version back
+>   to 4 on its own when you return to it.
 
 ## Prerequisites
 

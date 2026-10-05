@@ -146,11 +146,11 @@ pub async fn retry_history_entry_transcription(
             transcription,
             processed.post_processed_text,
             processed.post_process_prompt,
-            // Retry can turn cleanup on for an entry that never had it (every
-            // dictation is cleaned up now); record that so a failure shows.
-            // Only an attempted request counts: a skipped cleanup (nothing
-            // configured) must not read as "Cleanup failed".
-            processed.cleanup_attempted,
+            // The intent is kept (or turned on: every dictation is cleaned up
+            // now) even when cleanup is still not configured, so a later
+            // retry honors it; only an attempted request can read as
+            // "Cleanup failed".
+            (post_process, processed.cleanup_attempted),
             processed.context,
         )
         .map(|_| ())

@@ -6,7 +6,8 @@ import type { HistoryEntry } from "@/bindings";
  * - cleanedUpLate: polished text arrived after the cleanup time limit
  *   (the original was pasted)
  * - cleaningUp: the cleanup missed its time limit and is still running
- * - cleanupFailed: post-processing was requested but produced nothing
+ * - cleanupFailed: post-processing was requested and attempted but produced
+ *   nothing (requested but never sent, e.g. misconfigured, is "original")
  * - original: no post-processing ran
  */
 export type EntryStatus =
@@ -31,7 +32,7 @@ type EntryTextFields = Pick<
   HistoryEntry,
   "transcription_text" | "post_processed_text" | "post_process_requested"
 > &
-  Partial<Pick<HistoryEntry, "cleanup_state">>;
+  Partial<Pick<HistoryEntry, "cleanup_state" | "cleanup_attempted">>;
 
 export const getEntryTexts = (entry: EntryTextFields): EntryTexts => {
   const originalText = entry.transcription_text;
@@ -49,7 +50,11 @@ export const getEntryTexts = (entry: EntryTextFields): EntryTexts => {
   } else if (polished !== null) {
     status = entry.cleanup_state === "late" ? "cleanedUpLate" : "cleanedUp";
   } else if (hasTranscription) {
-    status = entry.post_process_requested ? "cleanupFailed" : "original";
+    // Failed only when cleanup was wanted AND a request went out. Older
+    // entries (no attempted flag) stored "attempted" as "requested".
+    const attempted = entry.cleanup_attempted ?? true;
+    status =
+      entry.post_process_requested && attempted ? "cleanupFailed" : "original";
   }
 
   return {

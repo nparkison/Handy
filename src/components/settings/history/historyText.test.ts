@@ -38,6 +38,17 @@ const entry = (
 // Cleanup requested but nothing came back (or only whitespace): failed.
 assert.equal(getEntryTexts(entry("raw", null, true)).status, "cleanupFailed");
 assert.equal(getEntryTexts(entry("raw", "  ", true)).status, "cleanupFailed");
+// Requested but never sent (cleanup misconfigured): not a failure.
+assert.equal(
+  getEntryTexts({ ...entry("raw", null, true), cleanup_attempted: false })
+    .status,
+  "original",
+);
+assert.equal(
+  getEntryTexts({ ...entry("raw", null, true), cleanup_attempted: true })
+    .status,
+  "cleanupFailed",
+);
 assert.equal(getEntryTexts(entry("raw", "  ", true)).primaryText, "raw");
 
 // Cleanup missed its time limit and is still running: "cleaning up", which

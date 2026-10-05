@@ -933,6 +933,7 @@ mod tests {
             post_processed_text: post_processed.map(|text| text.to_string()),
             post_process_prompt: None,
             post_process_requested: false,
+            cleanup_attempted: None,
             cleanup_state: None,
             context: None,
         }

@@ -422,6 +422,12 @@ pub struct AppSettings {
     /// treated as version 0 and migrated forward.
     #[serde(default = "default_settings_schema_version")]
     pub settings_schema_version: u32,
+    /// Marker for the fork's one-time migrations (see
+    /// `apply_fork_migrations`). Fresh installs start at the current version;
+    /// stores without the key (upstream, or fork builds before the marker)
+    /// read as 0 and are migrated once.
+    #[serde(default)]
+    pub fork_migrations_version: u32,
     /// Defaults to empty on partial stores; the load path merges in the
     /// default bindings for any missing keys before the settings are used.
     #[serde(default)]
@@ -622,6 +628,9 @@ fn default_model() -> String {
 }
 
 const CURRENT_SETTINGS_SCHEMA_VERSION: u32 = 2;
+
+/// Bump when adding a fork one-time migration to `apply_fork_migrations`.
+const CURRENT_FORK_MIGRATIONS_VERSION: u32 = 1;
 
 fn default_settings_schema_version() -> u32 {
     CURRENT_SETTINGS_SCHEMA_VERSION
@@ -1100,6 +1109,7 @@ pub fn get_default_settings() -> AppSettings {
 
     AppSettings {
         settings_schema_version: default_settings_schema_version(),
+        fork_migrations_version: CURRENT_FORK_MIGRATIONS_VERSION,
         bindings,
         shortcut_activation: ShortcutActivation::default(),
         hold_threshold_ms: default_hold_threshold_ms(),
@@ -1368,12 +1378,7 @@ fn apply_settings_migrations(
         }
     }
 
-    // One-time cleanup deadline migration: before the deadline existed,
-    // cleanup always waited for the model. Upgrading users keep that ("No
-    // limit"); only fresh installs (whose store is written with the key) get
-    // the 1.5 s default.
-    if settings_value.get("post_process_timeout_ms").is_none() {
-        settings.post_process_timeout_ms = 0;
+    if apply_fork_migrations(settings, settings_value) {
         updated = true;
     }
 
@@ -1469,16 +1474,6 @@ fn apply_settings_migrations(
         updated = true;
     }
 
-    // One-time fork updater migration, keyed on the first load by a build with
-    // the fork-only `app_rules` key: turn update checks off (see
-    // `default_update_checks_enabled`). Once `app_rules` is stored, a user who
-    // turns update checks back on keeps that choice.
-    if settings_value.get("app_rules").is_none() && settings.update_checks_enabled {
-        info!("Update checks turned off: this fork's updater points at upstream Handy");
-        settings.update_checks_enabled = false;
-        updated = true;
-    }
-
     // One-time overlay migration (only while the new key is absent): the retired
     // overlay_position `none` meant "hide the overlay" → OverlayStyle::None; any
     // other position had it visible → Live. The position enum no longer has a
@@ -1498,6 +1493,42 @@ fn apply_settings_migrations(
     }
 
     updated
+}
+
+/// The fork's one-time migrations, keyed on the stored
+/// `fork_migrations_version` marker rather than on some other key's presence
+/// (stores from fork builds that already had `app_rules` or the cleanup
+/// deadline must still be migrated). Fresh installs are written with the
+/// current marker and keep the new defaults.
+fn apply_fork_migrations(settings: &mut AppSettings, settings_value: &serde_json::Value) -> bool {
+    let stored = settings_value
+        .get("fork_migrations_version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if stored >= u64::from(CURRENT_FORK_MIGRATIONS_VERSION) {
+        return false;
+    }
+    if stored < 1 {
+        // The updater points at upstream Handy (see
+        // `default_update_checks_enabled`): turn checks off once. A user who
+        // turns them back on afterwards keeps that choice.
+        if settings.update_checks_enabled {
+            info!("Update checks turned off: this fork's updater points at upstream Handy");
+            settings.update_checks_enabled = false;
+        }
+        // Before the cleanup deadline existed, cleanup always waited for the
+        // model; upgrading users keep that ("No limit"). Fork builds before
+        // this marker stored the 1.5 s default without asking, so it is
+        // treated the same as a missing key.
+        let stored_timeout = settings_value
+            .get("post_process_timeout_ms")
+            .and_then(|v| v.as_u64());
+        if stored_timeout.is_none_or(|ms| ms == default_post_process_timeout_ms()) {
+            settings.post_process_timeout_ms = 0;
+        }
+    }
+    settings.fork_migrations_version = CURRENT_FORK_MIGRATIONS_VERSION;
+    true
 }
 
 /// Update checks are forced off (without touching the persisted setting) when
@@ -1899,12 +1930,66 @@ mod tests {
     }
 
     #[test]
+    fn fork_migrations_reach_stores_that_already_have_fork_keys() {
+        // A store from a fork build before the marker: it already has
+        // `app_rules` and the stored 1.5 s deadline, with update checks on.
+        let mut raw = default_settings_json();
+        let map = raw.as_object_mut().unwrap();
+        map.remove("fork_migrations_version");
+        map.insert("update_checks_enabled".into(), serde_json::json!(true));
+        map.insert("post_process_timeout_ms".into(), serde_json::json!(1500));
+        assert!(map.contains_key("app_rules"));
+        let mut settings: AppSettings = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(settings.fork_migrations_version, 0);
+        assert!(apply_settings_migrations(&mut settings, &raw));
+        assert!(!settings.update_checks_enabled);
+        assert_eq!(settings.post_process_timeout_ms, 0);
+        assert_eq!(
+            settings.fork_migrations_version,
+            CURRENT_FORK_MIGRATIONS_VERSION
+        );
+
+        // A deliberately chosen non-default deadline is kept.
+        let mut raw = default_settings_json();
+        let map = raw.as_object_mut().unwrap();
+        map.remove("fork_migrations_version");
+        map.insert("post_process_timeout_ms".into(), serde_json::json!(3000));
+        let mut settings: AppSettings = serde_json::from_value(raw.clone()).unwrap();
+        apply_settings_migrations(&mut settings, &raw);
+        assert_eq!(settings.post_process_timeout_ms, 3_000);
+
+        // Once marked, the user's choices stick.
+        let mut raw = serde_json::to_value(&settings).unwrap();
+        raw["update_checks_enabled"] = serde_json::json!(true);
+        raw["post_process_timeout_ms"] = serde_json::json!(1500);
+        let mut settings: AppSettings = serde_json::from_value(raw.clone()).unwrap();
+        apply_settings_migrations(&mut settings, &raw);
+        assert!(settings.update_checks_enabled);
+        assert_eq!(settings.post_process_timeout_ms, 1_500);
+    }
+
+    #[test]
+    fn fresh_install_keeps_new_fork_defaults() {
+        let settings = get_default_settings();
+        assert_eq!(
+            settings.fork_migrations_version,
+            CURRENT_FORK_MIGRATIONS_VERSION
+        );
+        let raw = default_settings_json();
+        let mut loaded: AppSettings = serde_json::from_value(raw.clone()).unwrap();
+        assert!(!apply_fork_migrations(&mut loaded, &raw));
+        assert_eq!(loaded.post_process_timeout_ms, 1_500);
+        assert!(!loaded.update_checks_enabled);
+    }
+
+    #[test]
     fn update_checks_default_off_and_migrate_off_once() {
         assert!(!get_default_settings().update_checks_enabled);
 
         let mut raw = default_settings_json();
         let map = raw.as_object_mut().unwrap();
         map.remove("app_rules");
+        map.remove("fork_migrations_version");
         map.insert("update_checks_enabled".into(), serde_json::json!(true));
         let mut settings: AppSettings = serde_json::from_value(raw.clone()).unwrap();
         assert!(apply_settings_migrations(&mut settings, &raw));
@@ -2123,7 +2208,8 @@ mod tests {
         // A store that already has the keys is left alone.
         let raw = serde_json::json!({
             "post_process_timeout_ms": 1500,
-            "app_rules": []
+            "app_rules": [],
+            "fork_migrations_version": CURRENT_FORK_MIGRATIONS_VERSION
         });
         let mut settings = get_default_settings();
         apply_settings_migrations(&mut settings, &raw);
@@ -2146,7 +2232,8 @@ mod tests {
             "transcribe_accelerator": "gpu",
             "transcribe_gpu_device": settings.transcribe_gpu_device,
             "app_rules": [],
-            "post_process_timeout_ms": 1500
+            "post_process_timeout_ms": 1500,
+            "fork_migrations_version": CURRENT_FORK_MIGRATIONS_VERSION
         });
 
         assert!(!apply_settings_migrations(&mut settings, &raw));

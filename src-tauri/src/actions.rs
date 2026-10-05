@@ -565,15 +565,15 @@ pub(crate) async fn process_transcription_output(
     }
 }
 
-/// Whether History should mark a dictation's cleanup as requested: only when
-/// a request was attempted, so a skipped cleanup (nothing configured) never
-/// shows as "Cleanup failed". A blank transcription keeps the intent so a
-/// retry still cleans up (it shows no badge either way).
-fn cleanup_requested_for_history(cleanup: &CleanupResult, transcription: &str) -> bool {
+/// What History records about a dictation's cleanup: (requested, attempted).
+/// The intent is kept even when nothing was sent (cleanup misconfigured, or a
+/// blank transcription), so a retry cleans up once it is configured; only an
+/// attempted request can read as "Cleanup failed".
+fn cleanup_flags_for_history(cleanup: &CleanupResult) -> (bool, bool) {
     match cleanup {
-        CleanupResult::NotRequested => false,
-        CleanupResult::Done(CleanupOutcome::Skipped) => is_blank_transcription(transcription),
-        CleanupResult::Done(_) | CleanupResult::Missed(_) => true,
+        CleanupResult::NotRequested => (false, false),
+        CleanupResult::Done(CleanupOutcome::Skipped) => (true, false),
+        CleanupResult::Done(_) | CleanupResult::Missed(_) => (true, true),
     }
 }
 
@@ -1241,8 +1241,8 @@ impl ShortcutAction for TranscribeAction {
                             }
 
                             let prompt_text = request_prompt_text(&settings, &request);
-                            let cleanup_requested =
-                                cleanup_requested_for_history(&cleanup, &transcription);
+                            let (cleanup_requested, cleanup_attempted) =
+                                cleanup_flags_for_history(&cleanup);
                             let mut output =
                                 PipelineOutput::new(cleanup, &transcription, prompt_text.clone());
 
@@ -1253,6 +1253,7 @@ impl ShortcutAction for TranscribeAction {
                                     file_name,
                                     transcription.clone(),
                                     cleanup_requested,
+                                    cleanup_attempted,
                                     output.post_processed_text.clone(),
                                     output.post_process_prompt.clone(),
                                     output.late_task.is_some().then_some(CleanupState::Pending),
@@ -1360,6 +1361,7 @@ impl ShortcutAction for TranscribeAction {
                                     file_name,
                                     String::new(),
                                     post_process,
+                                    false,
                                     None,
                                     None,
                                     None,
@@ -1411,6 +1413,7 @@ async fn save_skipped_clip(hm: &Arc<HistoryManager>, samples: Vec<f32>, post_pro
                 file_name,
                 String::new(),
                 post_process,
+                false,
                 None,
                 None,
                 None,
@@ -1496,8 +1499,9 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 #[cfg(test)]
 mod tests {
     use super::{
-        build_screen_context_user_text, complete_unless_cancelled, is_blank_transcription,
-        should_use_streaming_overlay, strip_think_block, with_app_context,
+        build_screen_context_user_text, cleanup_flags_for_history, complete_unless_cancelled,
+        is_blank_transcription, should_use_streaming_overlay, strip_think_block, with_app_context,
+        CleanupOutcome, CleanupResult,
     };
     use crate::settings::OverlayStyle;
     use std::future;
@@ -1505,6 +1509,24 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn history_keeps_cleanup_intent_even_when_nothing_was_sent() {
+        assert_eq!(
+            cleanup_flags_for_history(&CleanupResult::NotRequested),
+            (false, false)
+        );
+        // Requested but misconfigured: the intent survives for a retry, and
+        // it is not a failure.
+        assert_eq!(
+            cleanup_flags_for_history(&CleanupResult::Done(CleanupOutcome::Skipped)),
+            (true, false)
+        );
+        assert_eq!(
+            cleanup_flags_for_history(&CleanupResult::Done(CleanupOutcome::Failed)),
+            (true, true)
+        );
+    }
 
     #[test]
     fn blank_transcription_is_detected() {
