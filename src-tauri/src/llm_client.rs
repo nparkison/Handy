@@ -187,9 +187,15 @@ enum ImageFailure {
 fn classify_image_failure(status: u16, body: &str) -> ImageFailure {
     let body = body.to_lowercase();
     let too_large = status == 413
-        || ["too large", "too big", "exceeds", "maximum size", "max size"]
-            .iter()
-            .any(|needle| body.contains(needle));
+        || [
+            "too large",
+            "too big",
+            "exceeds",
+            "maximum size",
+            "max size",
+        ]
+        .iter()
+        .any(|needle| body.contains(needle));
     if too_large {
         return ImageFailure::TooLarge;
     }
@@ -869,7 +875,10 @@ mod tests {
         let provider = vision_provider("http://suspect-same-fields.test/v1");
         let key = endpoint_key(&provider, "m");
         suspect_image_rejection(key.clone(), true);
-        assert!(!rejects_images(&provider, "m"), "one ambiguous 400 is not proof");
+        assert!(
+            !rejects_images(&provider, "m"),
+            "one ambiguous 400 is not proof"
+        );
         settle_image_suspicion(&key, true, false);
         assert!(rejects_images(&provider, "m"));
     }

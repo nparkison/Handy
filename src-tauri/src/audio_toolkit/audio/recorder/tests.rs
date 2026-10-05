@@ -733,7 +733,10 @@ fn hangover_from_pre_roll_speech_does_not_make_a_silent_tap_speech() {
     // `Speech` for the live frames, but none of them is voiced.
     let live = live_stats_with_smoothed_vad(&[0.5; 4_800], &[0.0; 3_200]);
     assert!(live.vad_active);
-    assert_eq!(live.speech_samples, 0, "hangover-only frames are not speech");
+    assert_eq!(
+        live.speech_samples, 0,
+        "hangover-only frames are not speech"
+    );
     assert!(!live.has_speech());
 }
 

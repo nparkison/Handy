@@ -1555,8 +1555,8 @@ fn build_engine(
             LoadedEngine::Moonshine(engine)
         }
         EngineType::MoonshineStreaming => {
-            let engine =
-                StreamingModel::load(model_path, cpu_threads, &Quantization::default()).map_err(|e| {
+            let engine = StreamingModel::load(model_path, cpu_threads, &Quantization::default())
+                .map_err(|e| {
                     anyhow::anyhow!(
                         "Failed to load moonshine streaming model {}: {}",
                         model_id,
