@@ -640,6 +640,33 @@ fn capture_stats_mark_vad_inactive_when_disabled() {
 }
 
 #[test]
+fn live_stats_exclude_pre_roll_speech_and_level() {
+    let (processor, _streamed) = pre_roll_processor(300, None);
+    let sink = Arc::new(Mutex::new(CaptureStats::default()));
+    let live_sink = Arc::new(Mutex::new(CaptureStats::default()));
+    let mut processor = processor
+        .with_stats_sink(Arc::clone(&sink))
+        .with_live_stats_sink(Arc::clone(&live_sink));
+    // Loud words spoken before the press, then a silent 60 ms tap.
+    processor.process_raw_chunk(&[0.5; 4_800], ChunkDisposition::Discard);
+    let (ready_tx, _ready_rx) = mpsc::channel();
+    processor.begin_recording(VadPolicy::Disabled, ready_tx);
+    processor.process_raw_chunk(&[0.0; 960], ChunkDisposition::Capture);
+    processor.finish_recording();
+
+    let all = *sink.lock().unwrap();
+    let live = *live_sink.lock().unwrap();
+    assert!(all.peak > 0.4, "the full clip includes the pre-roll");
+    assert!(
+        live.peak < 0.01,
+        "post-press audio is silent: {}",
+        live.peak
+    );
+    assert_eq!(live.pre_roll_samples, 0);
+    assert!(live.total_samples >= 960);
+}
+
+#[test]
 fn pre_roll_counts_toward_levels_but_not_press_duration() {
     let (processor, _streamed) = pre_roll_processor(300, None);
     let sink = Arc::new(Mutex::new(CaptureStats::default()));

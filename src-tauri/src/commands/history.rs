@@ -129,17 +129,15 @@ pub async fn retry_history_entry_transcription(
         || crate::settings::get_settings(&app).cleans_up_every_dictation();
     // Reuse the app context stored with the entry (only what was shared at
     // the time): it re-selects the app rule's prompt. No screenshot is retaken.
-    let app_info = entry
+    let match_process = history_manager.find_match_process(id).unwrap_or_else(|e| {
+        log::warn!("Retry: could not read the stored app identifier: {e}");
+        None
+    });
+    let (shared_app, shared_title) = entry
         .context
-        .filter(|ctx| ctx.app.is_some() || ctx.title.is_some())
-        .map(|ctx| {
-            let app_name = ctx.app.unwrap_or_default();
-            AppInfo {
-                process_name: app_name.clone(),
-                app_name,
-                window_title: ctx.title,
-            }
-        });
+        .map(|ctx| (ctx.app, ctx.title))
+        .unwrap_or_default();
+    let app_info = AppInfo::from_history(shared_app, shared_title, match_process);
     let processed =
         process_transcription_output(&app, &transcription, post_process, app_info).await;
     history_manager
@@ -150,7 +148,9 @@ pub async fn retry_history_entry_transcription(
             processed.post_process_prompt,
             // Retry can turn cleanup on for an entry that never had it (every
             // dictation is cleaned up now); record that so a failure shows.
-            post_process,
+            // Only an attempted request counts: a skipped cleanup (nothing
+            // configured) must not read as "Cleanup failed".
+            processed.cleanup_attempted,
             processed.context,
         )
         .map(|_| ())

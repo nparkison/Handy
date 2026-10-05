@@ -112,6 +112,9 @@ pub struct AudioRecorder {
     /// Signal statistics of the most recently finished recording, published
     /// by the consumer before it replies to `Cmd::Stop`.
     last_stats: Arc<Mutex<CaptureStats>>,
+    /// The same statistics for the audio captured after the press only (no
+    /// pre-roll), for tap classification.
+    last_live_stats: Arc<Mutex<CaptureStats>>,
     /// Name of the device the open stream is capturing from.
     device_name: Option<String>,
 }
@@ -130,6 +133,7 @@ impl AudioRecorder {
             stream_error: Arc::new(AtomicBool::new(false)),
             pre_roll_ms: Arc::new(AtomicU64::new(0)),
             last_stats: Arc::new(Mutex::new(CaptureStats::default())),
+            last_live_stats: Arc::new(Mutex::new(CaptureStats::default())),
             device_name: None,
         })
     }
@@ -224,6 +228,7 @@ impl AudioRecorder {
         let stream_error = Arc::clone(&self.stream_error);
         let pre_roll_ms = Arc::clone(&self.pre_roll_ms);
         let stats_sink = Arc::clone(&self.last_stats);
+        let live_stats_sink = Arc::clone(&self.last_live_stats);
 
         let worker = std::thread::spawn(move || {
             let transport = Arc::new(CaptureTransportState::default());
@@ -353,7 +358,8 @@ impl AudioRecorder {
                         stream_running_at,
                     )
                     .with_pre_roll(pre_roll_ms)
-                    .with_stats_sink(stats_sink);
+                    .with_stats_sink(stats_sink)
+                    .with_live_stats_sink(live_stats_sink);
                     run_consumer(
                         processor,
                         sample_consumer,
@@ -432,6 +438,15 @@ impl AudioRecorder {
     /// before replying with the samples.
     pub fn last_capture_stats(&self) -> CaptureStats {
         *self.last_stats.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Like [`AudioRecorder::last_capture_stats`], but only for the audio
+    /// captured after the press (pre-roll excluded).
+    pub fn last_live_capture_stats(&self) -> CaptureStats {
+        *self
+            .last_live_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Name of the device the open stream captures from (`None` when closed
@@ -671,6 +686,7 @@ pub fn is_no_input_device_error(error_message: &str) -> bool {
 
 /// Route one 16 kHz frame through VAD to recording and live outputs.
 /// Kept free-standing to permit disjoint borrows around resampler callbacks.
+/// Returns how many samples VAD forwarded as speech.
 fn handle_frame(
     samples: &[f32],
     vad_policy: VadPolicy,
@@ -678,7 +694,7 @@ fn handle_frame(
     audio_cb: &Option<AudioFrameCallback>,
     out_buf: &mut Vec<f32>,
     stats: &mut CaptureStats,
-) {
+) -> u64 {
     // Pre-VAD level stats for the dead-air guard; one cheap pass per frame.
     stats.observe_frame(samples);
 
@@ -691,7 +707,7 @@ fn handle_frame(
 
     if vad_policy == VadPolicy::Disabled {
         emit(samples);
-        return;
+        return 0;
     }
 
     if let Some(cfg) = vad {
@@ -701,13 +717,16 @@ fn handle_frame(
             .unwrap_or(VadFrame::Speech(samples))
         {
             VadFrame::Speech(buf) => {
-                stats.speech_samples += buf.len() as u64;
-                emit(buf)
+                let speech = buf.len() as u64;
+                stats.speech_samples += speech;
+                emit(buf);
+                speech
             }
-            VadFrame::Noise => {}
+            VadFrame::Noise => 0,
         }
     } else {
         emit(samples);
+        0
     }
 }
 
@@ -778,8 +797,11 @@ struct CaptureProcessor {
     total_dropped_samples: u64,
     overrun_warning_logged: bool,
     stats: CaptureStats,
+    /// `stats` for post-press audio only (no pre-roll).
+    live_stats: CaptureStats,
     /// Where finished-recording stats are published (see `AudioRecorder::last_capture_stats`).
     stats_sink: Option<Arc<Mutex<CaptureStats>>>,
+    live_stats_sink: Option<Arc<Mutex<CaptureStats>>>,
 }
 
 impl CaptureProcessor {
@@ -836,7 +858,9 @@ impl CaptureProcessor {
             total_dropped_samples: 0,
             overrun_warning_logged: false,
             stats: CaptureStats::default(),
+            live_stats: CaptureStats::default(),
             stats_sink: None,
+            live_stats_sink: None,
         }
     }
 
@@ -858,6 +882,11 @@ impl CaptureProcessor {
         self
     }
 
+    fn with_live_stats_sink(mut self, sink: Arc<Mutex<CaptureStats>>) -> Self {
+        self.live_stats_sink = Some(sink);
+        self
+    }
+
     /// Reset per-recording state and arm the first-sample acknowledgement.
     fn begin_recording(&mut self, policy: VadPolicy, ready_tx: mpsc::Sender<()>) {
         self.awaiting_first_captured_chunk = Some(Instant::now());
@@ -868,6 +897,10 @@ impl CaptureProcessor {
         self.processed_samples.clear();
         self.stats = CaptureStats {
             vad_active: policy != VadPolicy::Disabled && self.vad.is_some(),
+            ..CaptureStats::default()
+        };
+        self.live_stats = CaptureStats {
+            vad_active: self.stats.vad_active,
             ..CaptureStats::default()
         };
         self.visualizer.reset();
@@ -926,7 +959,7 @@ impl CaptureProcessor {
                 &self.audio_cb,
                 &mut self.processed_samples,
                 &mut self.stats,
-            )
+            );
         });
         self.stats.pre_roll_samples += self.stats.total_samples - samples_before;
         pre_roll.clear();
@@ -977,14 +1010,15 @@ impl CaptureProcessor {
 
         let vad_policy = self.vad_policy;
         self.frame_resampler.push(raw, |frame: &[f32]| {
-            handle_frame(
+            self.live_stats.observe_frame(frame);
+            self.live_stats.speech_samples += handle_frame(
                 frame,
                 vad_policy,
                 &self.vad,
                 &self.audio_cb,
                 &mut self.processed_samples,
                 &mut self.stats,
-            )
+            );
         });
 
         if let Some(started) = self.awaiting_first_captured_chunk.take() {
@@ -1021,14 +1055,15 @@ impl CaptureProcessor {
     fn finish_recording(&mut self) -> Vec<f32> {
         let vad_policy = self.vad_policy;
         self.frame_resampler.finish(|frame: &[f32]| {
-            handle_frame(
+            self.live_stats.observe_frame(frame);
+            self.live_stats.speech_samples += handle_frame(
                 frame,
                 vad_policy,
                 &self.vad,
                 &self.audio_cb,
                 &mut self.processed_samples,
                 &mut self.stats,
-            )
+            );
         });
 
         // Diagnostic for VAD audio still withheld when capture stopped; it is
@@ -1059,6 +1094,9 @@ impl CaptureProcessor {
         }
         if let Some(sink) = &self.stats_sink {
             *sink.lock().unwrap_or_else(|e| e.into_inner()) = self.stats;
+        }
+        if let Some(sink) = &self.live_stats_sink {
+            *sink.lock().unwrap_or_else(|e| e.into_inner()) = self.live_stats;
         }
         self.idle_samples_since_stop = Some(0);
         std::mem::take(&mut self.processed_samples)

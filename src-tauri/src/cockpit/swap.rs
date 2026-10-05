@@ -17,8 +17,10 @@ pub const MAX_SELECT_BACK_CHARS: usize = 500;
 
 /// Executables (Windows) and app names (macOS/Linux) that are terminals.
 /// Matched case-insensitively against the process file name, with or without
-/// ".exe". VS Code's integrated terminal reports Code.exe and cannot be
-/// detected here; the "no input since paste" guard is the safety net.
+/// ".exe". Terminals embedded in other apps (VS Code, JetBrains IDEs) report
+/// the host app's executable and cannot be detected here; nothing else
+/// guards against them, which is why a swap must also verify the selection
+/// (see `cockpit::swap_last`).
 const TERMINALS: &[&str] = &[
     "windowsterminal",
     "openconsole",
@@ -41,6 +43,15 @@ const TERMINALS: &[&str] = &[
     "bash",
     "ghostty",
     "warp",
+    "conemu",
+    "conemu64",
+    "conemuc",
+    "conemuc64",
+    "mobaxterm",
+    "termius",
+    "xshell",
+    "securecrt",
+    "cmder",
 ];
 
 /// Whether `process_name` (e.g. `C:\\...\\WindowsTerminal.exe`, `pwsh.exe`,
@@ -60,24 +71,37 @@ pub fn is_terminal(process_name: &str) -> bool {
 }
 
 /// Characters for which one Left arrow press is known to move exactly one
-/// character in ordinary text fields: no surrogate pairs (emoji count as two
-/// UTF-16 units in some apps), no combining marks, joiners or complex scripts
-/// whose grapheme clusters span several code points.
+/// character in ordinary text fields. An allow-list of scripts that use one
+/// code point per caret stop: no surrogate pairs (emoji count as two UTF-16
+/// units in some apps), no combining marks (Mn/Me), no format characters (Cf:
+/// soft hyphen, ZWJ/ZWNJ, bidi controls), no variation selectors, and no
+/// complex scripts whose grapheme clusters span several code points. A wrong
+/// count deletes user text, so anything not listed falls back to copying.
 fn is_simple_char(c: char) -> bool {
     let cp = c as u32;
     match cp {
         0x20..=0x7E => true,
-        // Latin-1 .. Cyrillic/Armenian, minus combining diacritics.
-        0xA0..=0x058F => !(0x0300..=0x036F).contains(&cp),
+        // Latin-1 Supplement (minus the soft hyphen, Cf), Latin Extended-A/B,
+        // IPA, spacing modifier letters.
+        0xA0..=0x2FF => cp != 0xAD,
+        // Greek and Coptic (no combining marks in this block).
+        0x370..=0x3FF => true,
+        // Cyrillic minus its combining marks U+0483..U+0489, and the
+        // Cyrillic Supplement.
+        0x400..=0x482 | 0x48A..=0x52F => true,
         // General punctuation (dashes, smart quotes, ellipsis) minus
         // zero-width / bidi controls and invisible operators.
         0x2010..=0x2027 | 0x2030..=0x205E => true,
         // Currency, letterlike symbols, arrows.
-        0x20A0..=0x20BF | 0x2100..=0x214F | 0x2190..=0x21FF => true,
-        // CJK punctuation, kana, unified ideographs, Hangul syllables,
-        // full-width forms: one code point per visible character.
-        0x3000..=0x303F | 0x3040..=0x30FF | 0x4E00..=0x9FFF | 0xAC00..=0xD7A3 => true,
-        0xFF01..=0xFFEF => true,
+        0x20A0..=0x20C0 | 0x2100..=0x214F | 0x2190..=0x21FF => true,
+        // CJK punctuation minus the combining tone marks U+302A..U+302F.
+        0x3000..=0x3029 | 0x3030..=0x303F => true,
+        // Hiragana minus the combining voiced marks U+3099/U+309A; Katakana.
+        0x3041..=0x3096 | 0x309B..=0x309F | 0x30A0..=0x30FF => true,
+        // Unified ideographs and precomposed Hangul syllables.
+        0x4E00..=0x9FFF | 0xAC00..=0xD7A3 => true,
+        // Full-width forms and signs (half-width forms are left out).
+        0xFF01..=0xFF60 | 0xFFE0..=0xFFE6 => true,
         _ => false,
     }
 }
@@ -140,7 +164,8 @@ pub fn plan_swap(check: &SwapCheck<'_>) -> SwapPlan {
     if check.same_window != Some(true) {
         return fail(DifferentWindow);
     }
-    if check.process_name.is_some_and(is_terminal) {
+    // An unknown process could be a terminal: never risk it.
+    if check.process_name.is_none_or(is_terminal) {
         return fail(Terminal);
     }
     if check.input_since_paste != Some(false) {
@@ -241,6 +266,13 @@ mod tests {
             (ok_check("line one\r\n"), MultiLine),
             (ok_check("party 🎉"), UnsafeText),
             (ok_check("e\u{301}"), UnsafeText),
+            (
+                SwapCheck {
+                    process_name: None,
+                    ..ok_check("hi")
+                },
+                Terminal,
+            ),
             (ok_check(""), UnsafeText),
             (
                 SwapCheck {
@@ -265,6 +297,43 @@ mod tests {
     }
 
     #[test]
+    fn invisible_and_combining_characters_are_unsafe() {
+        for text in [
+            "soft\u{AD}hyphen",
+            "\u{0418}\u{0483}", // Cyrillic titlo (Mn)
+            "\u{0488}",         // Cyrillic hundred thousands sign (Me)
+            "a\u{200D}b",       // ZWJ
+            "a\u{200C}b",       // ZWNJ
+            "a\u{FE0F}",        // variation selector
+            "a\u{202E}b",       // bidi override
+            "\u{304B}\u{3099}", // combining kana voiced mark
+            "\u{3000}\u{302A}", // ideographic tone mark
+            "\u{FF76}\u{FF9E}", // half-width katakana + voiced mark
+            "\u{05D0}",         // Hebrew (not allow-listed)
+        ] {
+            assert_eq!(
+                plan_swap(&ok_check(text)),
+                SwapPlan::CopyOnly(CopyReason::UnsafeText),
+                "{text:?}"
+            );
+        }
+        // Precomposed and single-stop characters are fine.
+        for text in [
+            "\u{304C}",
+            "Привет",
+            "Ελλάδα",
+            "日本語の文",
+            "한국어",
+            "naïve",
+        ] {
+            assert!(
+                matches!(plan_swap(&ok_check(text)), SwapPlan::InPlace { .. }),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn terminal_detection() {
         for name in [
             "WindowsTerminal.exe",
@@ -280,6 +349,11 @@ mod tests {
             "iTerm2",
             "Terminal",
             "/Applications/Terminal.app",
+            "ConEmu64.exe",
+            "MobaXterm.exe",
+            "Termius.exe",
+            "Xshell.exe",
+            "SecureCRT.exe",
         ] {
             assert!(is_terminal(name), "{name} should be a terminal");
         }

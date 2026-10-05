@@ -240,18 +240,6 @@ fn should_use_streaming_overlay(style: OverlayStyle, is_streaming: bool) -> bool
     style == OverlayStyle::Live && is_streaming
 }
 
-/// Run AI cleanup on `transcription`. Returns the cleaned text, or `None`
-/// when cleanup was skipped or failed.
-pub(crate) async fn post_process_transcription(
-    settings: &AppSettings,
-    transcription: &str,
-    request: &CleanupRequest,
-) -> Option<String> {
-    run_cleanup(settings, transcription, request, &RequestSent::detached())
-        .await
-        .cleaned()
-}
-
 /// The text of the prompt `request` uses (rule prompt or the selected one),
 /// saved with a cleaned-up History entry.
 fn request_prompt_text(settings: &AppSettings, request: &CleanupRequest) -> Option<String> {
@@ -329,24 +317,37 @@ pub(crate) async fn run_cleanup(
     let context_block = context_block.as_deref();
 
     // Vision path: attach the active-window screenshot a matching app rule
-    // asked for. Falls through to the regular text-only paths on any failure.
+    // asked for. Falls through to the regular text-only paths on any failure,
+    // with a fresh deadline (a model that rejects images answers fast, and
+    // the text request should not inherit a half-spent budget). A model known
+    // to reject images is not sent the screenshot again.
     if provider.supports_vision {
         if let Some(screenshot) = &request.screenshot {
-            request.report.mark_sent(true);
-            sent.mark();
-            if let Some(result) = post_process_with_screen_context(
-                &provider,
-                &api_key,
-                &model,
-                &prompt,
-                transcription,
-                screenshot,
-                context_block,
-                disable_reasoning,
-            )
-            .await
-            {
-                return CleanupOutcome::Cleaned(result);
+            if crate::llm_client::rejects_images(&provider, &model) {
+                debug!(
+                    "Model '{}' does not accept images; cleaning up without the screenshot",
+                    model
+                );
+            } else {
+                request.report.mark_sent(false);
+                sent.mark();
+                if let Some(result) = post_process_with_screen_context(
+                    &provider,
+                    &api_key,
+                    &model,
+                    &prompt,
+                    transcription,
+                    screenshot,
+                    context_block,
+                    disable_reasoning,
+                )
+                .await
+                {
+                    // Only now did the screenshot shape the cleanup.
+                    request.report.mark_sent(true);
+                    return CleanupOutcome::Cleaned(result);
+                }
+                sent.restart();
             }
         }
     }
@@ -520,8 +521,12 @@ pub(crate) async fn run_cleanup(
 pub(crate) struct ProcessedTranscription {
     pub post_processed_text: Option<String>,
     pub post_process_prompt: Option<String>,
-    /// App context the cleanup request carried.
-    pub context: HistoryContext,
+    /// App context the cleanup request carried; `None` when no request went
+    /// out (the stored context is then kept).
+    pub context: Option<HistoryContext>,
+    /// A cleanup request was attempted (it may still have failed). A skipped
+    /// cleanup (no provider/model/prompt) is not a failure.
+    pub cleanup_attempted: bool,
 }
 
 /// Cleanup for a re-transcribed History entry (no deadline: the user is
@@ -537,12 +542,14 @@ pub(crate) async fn process_transcription_output(
     let settings = get_settings(app);
     let mut post_processed_text: Option<String> = None;
     let mut post_process_prompt: Option<String> = None;
+    let mut cleanup_attempted = false;
     let request = CleanupRequest::for_app(&settings, app_info.as_ref());
 
     if post_process {
-        if let Some(processed_text) =
-            post_process_transcription(&settings, transcription, &request).await
-        {
+        let outcome =
+            run_cleanup(&settings, transcription, &request, &RequestSent::detached()).await;
+        cleanup_attempted = outcome != CleanupOutcome::Skipped;
+        if let Some(processed_text) = outcome.cleaned() {
             post_processed_text = Some(processed_text);
             post_process_prompt = request_prompt_text(&settings, &request);
         }
@@ -551,7 +558,20 @@ pub(crate) async fn process_transcription_output(
     ProcessedTranscription {
         post_processed_text,
         post_process_prompt,
-        context: request.history_context(),
+        context: request.report.was_sent().then(|| request.history_context()),
+        cleanup_attempted,
+    }
+}
+
+/// Whether History should mark a dictation's cleanup as requested: only when
+/// a request was attempted, so a skipped cleanup (nothing configured) never
+/// shows as "Cleanup failed". A blank transcription keeps the intent so a
+/// retry still cleans up (it shows no badge either way).
+fn cleanup_requested_for_history(cleanup: &CleanupResult, transcription: &str) -> bool {
+    match cleanup {
+        CleanupResult::NotRequested => false,
+        CleanupResult::Done(CleanupOutcome::Skipped) => is_blank_transcription(transcription),
+        CleanupResult::Done(_) | CleanupResult::Missed(_) => true,
     }
 }
 
@@ -613,11 +633,17 @@ impl PipelineOutput {
     }
 }
 
-/// The background half of a missed cleanup: its cleaned text, if any. The
-/// guard aborts the request if the background cap drops this future.
-async fn late_cleanup_future(mut task: AbortOnDrop<CleanupOutcome>) -> Option<String> {
+/// The background half of a missed cleanup: its cleaned text, if any, and
+/// whether the screenshot was used for it. The guard aborts the request if
+/// the background cap drops this future.
+async fn late_cleanup_future(
+    mut task: AbortOnDrop<CleanupOutcome>,
+    report: Arc<app_context::ContextReport>,
+) -> Option<(String, bool)> {
     match (&mut task.0).await {
-        Ok(outcome) => outcome.cleaned(),
+        Ok(outcome) => outcome
+            .cleaned()
+            .map(|text| (text, report.screenshot_sent())),
         Err(e) => {
             error!("Late cleanup task failed: {e}");
             None
@@ -676,10 +702,14 @@ impl ShortcutAction for TranscribeAction {
         let post_process = self.post_process
             || (binding_id == "transcribe" && settings.cleans_up_every_dictation());
         // Tap gestures: hold back the start cue and overlay for the tap window
-        // so a tap never flashes the recording UI (recording still starts now).
-        let gesture_delay = gestures::active_for(&binding_id, &settings)
-            .then(|| Duration::from_millis(settings.tap_max_duration_ms));
-        gestures::reset_press_overlay();
+        // (plus the auto-repeat release grace, so a release near the end of
+        // the window is confirmed in time) so a tap never flashes the
+        // recording UI. Recording still starts now.
+        let gesture_delay = gestures::active_for(&binding_id, &settings).then(|| {
+            gestures::GestureTiming::from_settings(&settings).tap_max
+                + crate::transcription_coordinator::RELEASE_GRACE
+        });
+        gestures::reset_press_overlay(gesture_delay.is_some());
         if let Some(slot) = app.try_state::<PressContextSlot>() {
             let cleanup_will_run = post_process
                 && settings
@@ -764,14 +794,23 @@ impl ShortcutAction for TranscribeAction {
                         std::thread::sleep(
                             (start_time + delay).saturating_duration_since(Instant::now()),
                         );
-                        if !rm_clone.is_recording_readiness_current(generation)
-                            || gestures::released_since(start_time)
-                        {
+                        if gestures::released_since(start_time) {
                             return;
                         }
-                        show_start_overlay(&app_clone, overlay_style, model_supports_streaming);
-                        gestures::mark_press_overlay_shown();
-                        if ready_emitted.load(Ordering::Acquire) {
+                        // Atomic with stop's working feedback: once stop has
+                        // begun, the recording overlay must not come back.
+                        let shown = gestures::try_show_press_overlay(|| {
+                            rm_clone
+                                .is_recording_readiness_current(generation)
+                                .then(|| {
+                                    show_start_overlay(
+                                        &app_clone,
+                                        overlay_style,
+                                        model_supports_streaming,
+                                    )
+                                })
+                        });
+                        if shown && ready_emitted.load(Ordering::Acquire) {
                             utils::emit_recording_ready(&app_clone);
                         }
                     });
@@ -890,6 +929,8 @@ impl ShortcutAction for TranscribeAction {
         let hm = Arc::clone(&app.state::<Arc<HistoryManager>>());
 
         let settings = get_settings(app);
+        // From here on the held-back recording overlay can no longer appear.
+        let press_overlay_shown = gestures::close_press_overlay();
         // Tap gestures: a short main-binding press may be a tap. Its working
         // feedback (tray, overlay, stop sound) waits until the audio shows
         // whether it had speech, so a tap never flashes the dictation UI.
@@ -915,7 +956,11 @@ impl ShortcutAction for TranscribeAction {
         let style = settings.overlay_style;
         // Capture this before finalizing the stream so every later working state
         // targets the same overlay that was shown for this transcription.
-        let use_streaming_overlay = should_use_streaming_overlay(style, tm.is_streaming());
+        // A Live overlay held back for tap gestures was never shown: its
+        // working states would go to a hidden window, so use the compact
+        // pill (which shows itself) instead.
+        let use_streaming_overlay =
+            should_use_streaming_overlay(style, tm.is_streaming()) && press_overlay_shown;
 
         // Unmute before playing audio feedback so the stop sound is audible
         rm.remove_mute();
@@ -952,6 +997,9 @@ impl ShortcutAction for TranscribeAction {
 
                 if rm.was_cancelled_since(cancel_generation) {
                     debug!("Transcription operation cancelled after recording stop");
+                    if gestures_active {
+                        gestures::abandon();
+                    }
                     tm.cancel_stream();
                     utils::hide_recording_overlay(&ah);
                     set_tray_state(&ah, TrayIconState::Idle);
@@ -962,11 +1010,14 @@ impl ShortcutAction for TranscribeAction {
                 // STT, no History, no dead-air count, no pipeline.
                 if let Some((pressed_at, released_at)) = tap_candidate {
                     let held = released_at.saturating_duration_since(pressed_at);
-                    let has_speech = gestures::clip_has_speech(&stopped.stats);
+                    // Only audio after the press: speech in the pre-roll
+                    // (said before pressing) must not turn a tap into a
+                    // dictation.
+                    let has_speech = gestures::clip_has_speech(&stopped.live_stats);
                     if gestures::GestureMachine::is_tap(held, has_speech, tap_timing) {
                         debug!("Short press without speech: tap gesture");
                         tm.cancel_stream();
-                        if gestures::press_overlay_shown() {
+                        if press_overlay_shown {
                             utils::hide_recording_overlay(&ah);
                         }
                         set_tray_state(&ah, TrayIconState::Idle);
@@ -1188,7 +1239,9 @@ impl ShortcutAction for TranscribeAction {
                             }
 
                             let prompt_text = request_prompt_text(&settings, &request);
-                            let output =
+                            let cleanup_requested =
+                                cleanup_requested_for_history(&cleanup, &transcription);
+                            let mut output =
                                 PipelineOutput::new(cleanup, &transcription, prompt_text.clone());
 
                             // Save to history if WAV was saved
@@ -1197,27 +1250,35 @@ impl ShortcutAction for TranscribeAction {
                                 match hm.save_entry(
                                     file_name,
                                     transcription.clone(),
-                                    post_process,
+                                    cleanup_requested,
                                     output.post_processed_text.clone(),
                                     output.post_process_prompt.clone(),
                                     output.late_task.is_some().then_some(CleanupState::Pending),
                                     request.history_context(),
+                                    request.match_process(),
                                 ) {
                                     Ok(entry) => entry_id = Some(entry.id),
                                     Err(err) => error!("Failed to save history entry: {}", err),
                                 }
                             }
-                            let late_prompt = prompt_text;
+                            // A missed cleanup keeps running in the background
+                            // whatever happens to the paste (cancelled, main
+                            // thread unavailable), so the entry never stays
+                            // "Cleaning up". A result that lands before the
+                            // paste is recorded is picked up by record_paste.
+                            let late_id = output.late_task.take().map(|task| {
+                                let late_id = cockpit::new_late_id();
+                                cockpit::spawn_late_cleanup(
+                                    ah.clone(),
+                                    late_cleanup_future(task, Arc::clone(&request.report)),
+                                    entry_id,
+                                    late_id,
+                                    prompt_text,
+                                );
+                                late_id
+                            });
 
                             if output.final_text.is_empty() {
-                                if let Some(task) = output.late_task {
-                                    cockpit::spawn_late_cleanup(
-                                        ah.clone(),
-                                        late_cleanup_future(task),
-                                        entry_id,
-                                        late_prompt,
-                                    );
-                                }
                                 utils::hide_recording_overlay(&ah);
                                 set_tray_state(&ah, TrayIconState::Idle);
                             } else {
@@ -1232,7 +1293,6 @@ impl ShortcutAction for TranscribeAction {
                                         pasted_version,
                                         polished,
                                         notice,
-                                        late_task,
                                         ..
                                     } = output;
                                     if rm_for_paste.was_cancelled_since(cancel_generation) {
@@ -1242,6 +1302,7 @@ impl ShortcutAction for TranscribeAction {
                                         return;
                                     }
 
+                                    let paste_started = Instant::now();
                                     match utils::paste(final_text.clone(), ah_clone.clone()) {
                                         Ok(()) => {
                                             debug!(
@@ -1250,27 +1311,18 @@ impl ShortcutAction for TranscribeAction {
                                             );
                                             cockpit::record_paste(
                                                 &ah_clone,
-                                                entry_id,
+                                                late_id,
                                                 original,
                                                 polished,
                                                 pasted_version,
                                                 &final_text,
+                                                paste_started,
                                             );
                                         }
                                         Err(e) => {
                                             error!("Failed to paste transcription: {}", e);
                                             let _ = ah_clone.emit("paste-error", ());
                                         }
-                                    }
-                                    // Started after the paste so a very fast late
-                                    // result always finds the paste recorded.
-                                    if let Some(task) = late_task {
-                                        cockpit::spawn_late_cleanup(
-                                            ah_clone.clone(),
-                                            late_cleanup_future(task),
-                                            entry_id,
-                                            late_prompt,
-                                        );
                                     }
                                     let shown = notice
                                         .and_then(|notice| show_overlay_notice(&ah_clone, notice));
@@ -1310,6 +1362,7 @@ impl ShortcutAction for TranscribeAction {
                                     None,
                                     None,
                                     HistoryContext::default(),
+                                    None,
                                 ) {
                                     error!("Failed to save failed history entry: {}", save_err);
                                 }
@@ -1321,6 +1374,9 @@ impl ShortcutAction for TranscribeAction {
                 }
             } else {
                 debug!("No samples retrieved from recording stop");
+                if gestures_active {
+                    gestures::abandon();
+                }
                 // Tear down any streaming worker so its channel doesn't leak.
                 tm.cancel_stream();
                 utils::hide_recording_overlay(&ah);
@@ -1357,6 +1413,7 @@ async fn save_skipped_clip(hm: &Arc<HistoryManager>, samples: Vec<f32>, post_pro
                 None,
                 None,
                 HistoryContext::default(),
+                None,
             ) {
                 error!("Failed to save skipped clip to history: {}", e);
             }

@@ -13,11 +13,19 @@ const KEYLESS_PROVIDER_IDS = ["custom", "apple_intelligence"];
 const DEFAULT_TIMEOUT_MS = 1500;
 
 /**
- * True when cleanup can actually run: a provider is selected, it has a model,
- * and it has an API key (unless the provider works without one). Mirrors the
- * backend's checks before it sends a post-processing request.
+ * True when cleanup can actually run: a usable prompt exists (the selected
+ * one, or the first non-empty one when none is selected), a provider is
+ * selected, it has a model, and it has an API key (unless the provider works
+ * without one). Mirrors the backend's checks before it sends a
+ * post-processing request.
  */
 export const isCleanupConfigured = (settings: AppSettings | null): boolean => {
+  const prompts = settings?.post_process_prompts ?? [];
+  const selected = prompts.find(
+    (p) => p.id === settings?.post_process_selected_prompt_id,
+  );
+  const prompt = selected ?? prompts.find((p) => p.prompt.trim().length > 0);
+  if (!prompt || !prompt.prompt.trim()) return false;
   const providerId = settings?.post_process_provider_id;
   if (!providerId) return false;
   const provider = settings?.post_process_providers?.find(

@@ -50,6 +50,9 @@ const FORK_COLUMNS: &[(&str, &str)] = &[
     ("context_app", "TEXT"),
     ("context_title", "TEXT"),
     ("context_screenshot", "BOOLEAN NOT NULL DEFAULT 0"),
+    // Executable/app identifier rules match on (e.g. `slack.exe`), so a retry
+    // re-selects the same app rule. Local only: never shared or shown.
+    ("context_process", "TEXT"),
 ];
 
 /// Builds before this fix recorded the fork columns as migrations 5 (cleanup
@@ -65,9 +68,11 @@ fn reset_fork_schema_version(conn: &Connection) -> Result<()> {
         return Ok(());
     }
     let present = existing_columns(conn)?;
+    // Migration 5 added cleanup_state; migration 6 the three context_*
+    // columns. Columns added later (context_process) were never migrations.
     let fork_owned = FORK_COLUMNS
         .iter()
-        .take(if version == 5 { 1 } else { FORK_COLUMNS.len() })
+        .take(if version == 5 { 1 } else { 4 })
         .all(|(name, _)| present.iter().any(|c| c == name));
     if fork_owned {
         info!(
@@ -156,6 +161,15 @@ impl HistoryContext {
     pub fn into_option(self) -> Option<Self> {
         (self.app.is_some() || self.title.is_some() || self.screenshot).then_some(self)
     }
+}
+
+/// A deadline-missed cleanup that arrived: its text, the prompt it used, and
+/// whether the screenshot shaped it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LateCleanup {
+    pub text: String,
+    pub prompt: Option<String>,
+    pub screenshot: bool,
 }
 
 /// Where a deadline-missed cleanup stands. `None` on an entry means cleanup
@@ -391,6 +405,7 @@ impl HistoryManager {
         post_process_prompt: Option<String>,
         cleanup_state: Option<CleanupState>,
         context: HistoryContext,
+        match_process: Option<String>,
     ) -> Result<HistoryEntry> {
         let timestamp = Utc::now().timestamp();
         let title = self.format_timestamp_title(timestamp);
@@ -409,8 +424,9 @@ impl HistoryManager {
                 cleanup_state,
                 context_app,
                 context_title,
-                context_screenshot
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                context_screenshot,
+                context_process
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 &file_name,
                 timestamp,
@@ -424,6 +440,7 @@ impl HistoryManager {
                 &context.app,
                 &context.title,
                 context.screenshot,
+                &match_process,
             ],
         )?;
 
@@ -459,6 +476,9 @@ impl HistoryManager {
     }
 
     /// Update an existing history entry with new transcription results (used by retry).
+    /// `post_process_requested` records whether a cleanup request was
+    /// attempted; `context` is what that request shared, or `None` to keep
+    /// the stored context (no request went out, so nothing new was shared).
     pub fn update_transcription(
         &self,
         id: i64,
@@ -466,32 +486,18 @@ impl HistoryManager {
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
         post_process_requested: bool,
-        context: HistoryContext,
+        context: Option<HistoryContext>,
     ) -> Result<HistoryEntry> {
         let conn = self.get_connection()?;
-        let updated = conn.execute(
-            "UPDATE transcription_history
-             SET transcription_text = ?1,
-                 post_processed_text = ?2,
-                 post_process_prompt = ?3,
-                 post_process_requested = ?4,
-                 cleanup_state = NULL,
-                 context_app = ?5,
-                 context_title = ?6,
-                 context_screenshot = ?7
-             WHERE id = ?8",
-            params![
-                transcription_text,
-                post_processed_text,
-                post_process_prompt,
-                post_process_requested,
-                context.app,
-                context.title,
-                context.screenshot,
-                id
-            ],
+        let updated = Self::update_transcription_with_conn(
+            &conn,
+            id,
+            transcription_text,
+            post_processed_text,
+            post_process_prompt,
+            post_process_requested,
+            context,
         )?;
-
         if updated == 0 {
             return Err(anyhow!("History entry {} not found", id));
         }
@@ -520,6 +526,42 @@ impl HistoryManager {
         Ok(entry)
     }
 
+    fn update_transcription_with_conn(
+        conn: &Connection,
+        id: i64,
+        transcription_text: String,
+        post_processed_text: Option<String>,
+        post_process_prompt: Option<String>,
+        post_process_requested: bool,
+        context: Option<HistoryContext>,
+    ) -> Result<usize> {
+        let keep_context = context.is_none();
+        let context = context.unwrap_or_default();
+        Ok(conn.execute(
+            "UPDATE transcription_history
+             SET transcription_text = ?1,
+                 post_processed_text = ?2,
+                 post_process_prompt = ?3,
+                 post_process_requested = ?8,
+                 cleanup_state = NULL,
+                 context_app = CASE WHEN ?9 THEN context_app ELSE ?4 END,
+                 context_title = CASE WHEN ?9 THEN context_title ELSE ?5 END,
+                 context_screenshot = CASE WHEN ?9 THEN context_screenshot ELSE ?6 END
+             WHERE id = ?7",
+            params![
+                transcription_text,
+                post_processed_text,
+                post_process_prompt,
+                context.app,
+                context.title,
+                context.screenshot,
+                id,
+                post_process_requested,
+                keep_context
+            ],
+        )?)
+    }
+
     /// Resolve a deadline-missed cleanup: store the late cleaned-up text
     /// (`Some`) or record that it never arrived (`None`, shown as "Cleanup
     /// failed"). Only touches an entry that is still pending, so a re-transcribe
@@ -528,7 +570,7 @@ impl HistoryManager {
     pub fn resolve_late_cleanup(
         &self,
         id: i64,
-        cleaned: Option<(String, Option<String>)>,
+        cleaned: Option<LateCleanup>,
     ) -> Result<Option<HistoryEntry>> {
         let conn = self.get_connection()?;
         let updated = Self::resolve_late_cleanup_with_conn(&conn, id, cleaned)?;
@@ -548,19 +590,25 @@ impl HistoryManager {
     fn resolve_late_cleanup_with_conn(
         conn: &Connection,
         id: i64,
-        cleaned: Option<(String, Option<String>)>,
+        cleaned: Option<LateCleanup>,
     ) -> Result<Option<HistoryEntry>> {
         let changed = match cleaned {
-            Some((text, prompt)) => conn.execute(
+            Some(LateCleanup {
+                text,
+                prompt,
+                screenshot,
+            }) => conn.execute(
                 "UPDATE transcription_history
-                 SET post_processed_text = ?1, post_process_prompt = ?2, cleanup_state = ?3
+                 SET post_processed_text = ?1, post_process_prompt = ?2, cleanup_state = ?3,
+                     context_screenshot = (context_screenshot OR ?6)
                  WHERE id = ?4 AND cleanup_state = ?5",
                 params![
                     text,
                     prompt,
                     CleanupState::Late.as_db(),
                     id,
-                    CleanupState::Pending.as_db()
+                    CleanupState::Pending.as_db(),
+                    screenshot
                 ],
             )?,
             None => conn.execute(
@@ -894,6 +942,25 @@ impl HistoryManager {
         self.find_entry(id)
     }
 
+    /// The app identifier rules matched on when entry `id` was dictated
+    /// (see `context_process`), for re-selecting the app rule on retry.
+    pub fn find_match_process(&self, id: i64) -> Result<Option<String>> {
+        let conn = self.get_connection()?;
+        Self::find_match_process_with_conn(&conn, id)
+    }
+
+    fn find_match_process_with_conn(conn: &Connection, id: i64) -> Result<Option<String>> {
+        Ok(conn
+            .query_row(
+                "SELECT context_process FROM transcription_history WHERE id = ?1",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .filter(|p| !p.trim().is_empty()))
+    }
+
     /// Synchronous lookup by id, for callers outside an async context (tray).
     pub fn find_entry(&self, id: i64) -> Result<Option<HistoryEntry>> {
         let conn = self.get_connection()?;
@@ -973,7 +1040,8 @@ mod tests {
                 cleanup_state TEXT,
                 context_app TEXT,
                 context_title TEXT,
-                context_screenshot BOOLEAN NOT NULL DEFAULT 0
+                context_screenshot BOOLEAN NOT NULL DEFAULT 0,
+                context_process TEXT
             );",
         )
         .expect("create transcription_history table");
@@ -1178,6 +1246,14 @@ mod tests {
         .expect("mark pending");
     }
 
+    fn late(text: &str, prompt: Option<&str>, screenshot: bool) -> LateCleanup {
+        LateCleanup {
+            text: text.to_string(),
+            prompt: prompt.map(str::to_string),
+            screenshot,
+        }
+    }
+
     #[test]
     fn late_cleanup_saves_text_and_marks_late() {
         let conn = setup_conn();
@@ -1187,19 +1263,21 @@ mod tests {
         let entry = HistoryManager::resolve_late_cleanup_with_conn(
             &conn,
             1,
-            Some(("Hello.".to_string(), Some("prompt".to_string()))),
+            Some(late("Hello.", Some("prompt"), true)),
         )
         .expect("resolve")
         .expect("entry was pending");
         assert_eq!(entry.post_processed_text.as_deref(), Some("Hello."));
         assert_eq!(entry.post_process_prompt.as_deref(), Some("prompt"));
         assert_eq!(entry.cleanup_state, Some(CleanupState::Late));
+        // The screenshot shaped the late result.
+        assert!(entry.context.is_some_and(|c| c.screenshot));
 
         // Already resolved: a second result is ignored.
         let again = HistoryManager::resolve_late_cleanup_with_conn(
             &conn,
             1,
-            Some(("Other.".to_string(), None)),
+            Some(late("Other.", None, false)),
         )
         .expect("resolve");
         assert!(again.is_none());
@@ -1225,7 +1303,7 @@ mod tests {
         let result = HistoryManager::resolve_late_cleanup_with_conn(
             &conn,
             1,
-            Some(("Late.".to_string(), None)),
+            Some(late("Late.", None, false)),
         )
         .expect("resolve");
         assert!(result.is_none());
@@ -1245,6 +1323,30 @@ mod tests {
         for (name, _) in FORK_COLUMNS {
             assert!(columns.iter().any(|c| c == name), "missing {name}");
         }
+    }
+
+    #[test]
+    fn match_process_is_stored_for_retry() {
+        let conn = setup_conn();
+        conn.execute(
+            "INSERT INTO transcription_history (
+                file_name, timestamp, saved, title, transcription_text, context_process
+            ) VALUES ('1.wav', 1, 0, 't', 'hi', 'Slack.exe'), ('2.wav', 2, 0, 't', 'hi', NULL)",
+            [],
+        )
+        .expect("insert");
+        assert_eq!(
+            HistoryManager::find_match_process_with_conn(&conn, 1).unwrap(),
+            Some("Slack.exe".to_string())
+        );
+        assert_eq!(
+            HistoryManager::find_match_process_with_conn(&conn, 2).unwrap(),
+            None
+        );
+        assert_eq!(
+            HistoryManager::find_match_process_with_conn(&conn, 9).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1325,6 +1427,18 @@ mod tests {
     }
 
     #[test]
+    fn version_6_db_from_before_context_process_is_reset_and_completed() {
+        let mut conn = setup_conn();
+        conn.execute_batch("ALTER TABLE transcription_history DROP COLUMN context_process;")
+            .expect("drop column");
+        conn.pragma_update(None, "user_version", 6)
+            .expect("set version");
+        migrate_schema(&mut conn).expect("migrate");
+        assert_eq!(user_version(&conn), 4);
+        assert_fork_columns_present(&conn);
+    }
+
+    #[test]
     fn newer_upstream_version_is_left_alone() {
         let mut conn = setup_conn();
         conn.pragma_update(None, "user_version", 9)
@@ -1393,6 +1507,60 @@ mod tests {
             }
         }
         assert_eq!(seen, vec!["tie 5", "tie 4", "tie 3", "tie 2", "tie 1"]);
+    }
+
+    #[test]
+    fn retry_keeps_stored_context_when_nothing_new_was_shared() {
+        let conn = setup_conn();
+        conn.execute(
+            "INSERT INTO transcription_history (
+                file_name, timestamp, saved, title, transcription_text,
+                post_process_requested, context_app, context_title, context_screenshot
+            ) VALUES ('1.wav', 1, 0, 't', 'um hi', 1, 'slack', '#general', 1)",
+            [],
+        )
+        .expect("insert");
+
+        // Cleanup skipped on retry: no request, keep the context.
+        HistoryManager::update_transcription_with_conn(
+            &conn,
+            1,
+            "hi".into(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("update");
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("fetch")
+            .expect("entry");
+        assert!(!entry.post_process_requested);
+        assert_eq!(
+            entry.context,
+            Some(HistoryContext {
+                app: Some("slack".into()),
+                title: Some("#general".into()),
+                screenshot: true,
+            })
+        );
+
+        // A request went out without app info: that is what was shared now.
+        HistoryManager::update_transcription_with_conn(
+            &conn,
+            1,
+            "hi".into(),
+            Some("Hi.".into()),
+            None,
+            true,
+            Some(HistoryContext::default()),
+        )
+        .expect("update");
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("fetch")
+            .expect("entry");
+        assert!(entry.post_process_requested);
+        assert_eq!(entry.context, None);
     }
 
     #[test]

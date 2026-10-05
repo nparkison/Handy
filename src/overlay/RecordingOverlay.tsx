@@ -69,6 +69,7 @@ const RecordingOverlay: React.FC = () => {
   const [notice, setNotice] = useState<OverlayNotice | null>(null);
   const [noticeHovered, setNoticeHovered] = useState(false);
   const [noticeActionPending, setNoticeActionPending] = useState(false);
+  const noticeCardRef = useRef<HTMLDivElement>(null);
   // Time left on the current notice, keyed by id so a pausing cleanup can't
   // eat into the next notice's budget.
   const noticeRemainingRef = useRef({ id: 0, ms: 0 });
@@ -149,11 +150,23 @@ const RecordingOverlay: React.FC = () => {
             id: event.payload.id,
             ms: event.payload.duration_ms,
           };
-          setNoticeHovered(false);
+          // Keep the hover pause when the pointer is still over the card.
+          setNoticeHovered(noticeCardRef.current?.matches(":hover") ?? false);
           setNoticeActionPending(false);
           setNotice(event.payload);
           setState("notice");
           setIsVisible(true);
+        },
+      );
+
+      // The notice's action finished without anything left to show (or was
+      // no longer available): let the timer run again.
+      const unlistenActionDone = await listen<number>(
+        "overlay-notice-action-done",
+        (event) => {
+          if (noticeRemainingRef.current.id === event.payload) {
+            setNoticeActionPending(false);
+          }
         },
       );
 
@@ -195,6 +208,7 @@ const RecordingOverlay: React.FC = () => {
         unlistenShow();
         unlistenHide();
         unlistenNotice();
+        unlistenActionDone();
         unlistenContext();
         unlistenReady();
         unlistenLevel();
@@ -203,7 +217,16 @@ const RecordingOverlay: React.FC = () => {
       };
     };
 
-    setupEventListeners();
+    let cancelled = false;
+    let cleanup: (() => void) | undefined;
+    setupEventListeners().then((unlisten) => {
+      if (cancelled) unlisten();
+      else cleanup = unlisten;
+    });
+    return () => {
+      cancelled = true;
+      cleanup?.();
+    };
   }, []);
 
   // Elapsed capture timer starts only once microphone samples are flowing.
@@ -384,6 +407,7 @@ const RecordingOverlay: React.FC = () => {
         className={`ov-stage ${position} ov-fade ${isVisible ? "show" : ""}`}
       >
         <div
+          ref={noticeCardRef}
           className={`scard notice ${notice.kind}`}
           onMouseEnter={() => setNoticeHovered(true)}
           onMouseLeave={() => setNoticeHovered(false)}

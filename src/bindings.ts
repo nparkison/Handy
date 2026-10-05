@@ -253,6 +253,17 @@ async changeAppRulesSetting(rules: AppRule[]) : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Hide the one-time "screenshots moved to app rules" note.
+ */
+async dismissScreenContextMovedNote() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("dismiss_screen_context_moved_note") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async changeExperimentalEnabledSetting(enabled: boolean) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("change_experimental_enabled_setting", { enabled }) };
@@ -1201,6 +1212,11 @@ post_process_every_dictation?: boolean;
  * saved to History when it arrives. 0 = no limit (always wait).
  */
 post_process_timeout_ms?: number; 
+/**
+ * Show a one-time note in the Context settings that screenshots moved
+ * from a global toggle to app rules (set for upgraders who had it on).
+ */
+show_screen_context_moved_note?: boolean; 
 /**
  * Tap / double-tap on the main binding pastes / swaps the last dictation.
  * Only active with push-to-talk (Hold) activation.

@@ -684,11 +684,16 @@ struct CleanupContextPayload {
 /// "Cleaning up… · Slack" chip (and its camera icon when a screenshot went
 /// along). Harmless when the overlay is hidden.
 pub fn emit_cleanup_context(app_handle: &AppHandle, app: Option<String>, screenshot: bool) {
-    let _ = app_handle.emit_to(
-        "recording_overlay",
-        "cleanup-context",
-        CleanupContextPayload { app, screenshot },
-    );
+    // Queued on the main thread like the show-overlay events, so a pending
+    // "transcribing" show (which clears the chip) can never overtake it.
+    let handle = app_handle.clone();
+    let _ = app_handle.run_on_main_thread(move || {
+        let _ = handle.emit_to(
+            "recording_overlay",
+            "cleanup-context",
+            CleanupContextPayload { app, screenshot },
+        );
+    });
 }
 
 /// Shows the processing overlay window
