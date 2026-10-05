@@ -47,6 +47,13 @@
         vulkan-loader
         vulkan-headers
         shaderc
+        # xcap (screen context) on Linux: PipeWire portal capture, X11 (xcb),
+        # and the Wayland/GBM/EGL path.
+        pipewire
+        libxcb
+        libgbm
+        libGL
+        wayland
       ];
 
       # GStreamer plugins for WebKitGTK audio/video

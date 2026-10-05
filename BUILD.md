@@ -2,6 +2,19 @@
 
 This guide covers how to set up the development environment and build Handy from source across different platforms.
 
+> **Fork note (screen-aware context build).** This fork keeps upstream's app
+> identifier, so it shares settings, history and models with an upstream
+> install. Keep these in mind:
+>
+> - **Updates:** `tauri.conf.json` still points the updater at upstream Handy's
+>   releases and signing key. Installing one of those "updates" replaces this
+>   build with upstream and drops the fork's features. Update checks are
+>   therefore off by default, and existing installs get them turned off once.
+>   Turn them back on only if you mean to move to upstream.
+> - **History database:** the fork's extra History columns are added outside
+>   upstream's numbered migrations, so an upstream build can still open the
+>   same `history.db`.
+
 ## Prerequisites
 
 ### All Platforms
@@ -70,7 +83,8 @@ ORT_LIB_LOCATION=$(brew --prefix onnxruntime)/lib ORT_PREFER_DYNAMIC_LINK=1 bun 
   ```bash
   # Ubuntu/Debian
   sudo apt update
-  sudo apt install build-essential clang libclang-dev libevdev-dev libasound2-dev pkg-config libssl-dev libvulkan-dev vulkan-tools glslc spirv-headers glslang-tools libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libgtk-layer-shell0 libgtk-layer-shell-dev patchelf cmake
+  sudo apt install build-essential clang libclang-dev libevdev-dev libasound2-dev pkg-config libssl-dev libvulkan-dev vulkan-tools glslc spirv-headers glslang-tools libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libgtk-layer-shell0 libgtk-layer-shell-dev patchelf cmake \
+    libpipewire-0.3-dev libspa-0.2-dev libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev libgbm-dev libegl-dev libwayland-dev
 
   # Fedora/RHEL
   sudo dnf groupinstall "Development Tools"
@@ -79,12 +93,13 @@ ORT_LIB_LOCATION=$(brew --prefix onnxruntime)/lib ORT_PREFER_DYNAMIC_LINK=1 bun 
     spirv-headers-devel spirv-tools-devel glslang \
     gtk3-devel webkit2gtk4.1-devel libappindicator-gtk3-devel librsvg2-devel \
     gtk-layer-shell gtk-layer-shell-devel \
-    cmake
+    cmake \
+    pipewire-devel libxcb-devel mesa-libgbm-devel mesa-libEGL-devel wayland-devel
 
   # Arch Linux
   sudo pacman -S base-devel clang libevdev shaderc spirv-headers glslang alsa-lib pkgconf openssl vulkan-devel \
     gtk3 webkit2gtk-4.1 libappindicator-gtk3 librsvg gtk-layer-shell \
-    cmake
+    cmake libpipewire libxcb mesa wayland
   ```
 
 ## Setup Instructions
