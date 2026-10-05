@@ -189,6 +189,8 @@ const settingUpdaters: {
     commands.changeChineseScriptSetting(value as ChineseScript),
   show_tray_icon: (value) =>
     commands.changeShowTrayIconSetting(value as boolean),
+  show_recent_dictations_in_tray: (value) =>
+    commands.changeShowRecentDictationsInTraySetting(value as boolean),
   transcribe_accelerator: (value) =>
     commands.changeTranscribeAcceleratorSetting(
       value as TranscribeAcceleratorSetting,
