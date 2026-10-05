@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod history;
 pub mod models;
+pub mod replay_bench;
 pub mod transcription;
 
 use crate::settings::{

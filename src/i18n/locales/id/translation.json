@@ -644,6 +644,78 @@
         "verdictOk": "Peristiwa tombol mencapai Handy secara normal.",
         "verdictNoEvents": "Tidak ada peristiwa yang tertangkap — apakah Anda menekan tombol selama pengujian?",
         "failed": "Diagnostik gagal: {{error}}"
+      },
+      "replayBench": {
+        "title": "Replay Bench",
+        "description": "Re-run your saved recordings through installed models to compare them. Results are not saved.",
+        "recordings": {
+          "label": "Recordings",
+          "description": "Which saved recordings to replay, newest first. Recordings whose audio file is gone are skipped.",
+          "last": "Last {{count}}",
+          "starred": "Starred only",
+          "available": "Recordings with audio: {{count}}"
+        },
+        "models": {
+          "label": "Models",
+          "description": "Installed models to run. Each loads separately, so your active model and settings stay unchanged.",
+          "active": "(active)"
+        },
+        "cleanup": {
+          "label": "Include cleanup",
+          "description": "Also re-run AI cleanup. Sends text to your provider and may cost money."
+        },
+        "run": "Run",
+        "stop": "Stop",
+        "copyCsv": "Copy as CSV",
+        "copied": "Copied",
+        "notSaved": "Results are not saved.",
+        "loadNote": "Models load one at a time next to your active model, which stays ready for dictation. Dictating pauses the bench.",
+        "oneModel": "Install another model to compare.",
+        "openModels": "Open Models",
+        "finished": "Run finished.",
+        "stopped": "Run stopped.",
+        "decodeFailed": "Couldn't read this recording",
+        "transcribeFailed": "Transcription failed",
+        "cleanupFailed": "Failed",
+        "loadFailed": "Couldn't load this model: {{error}}",
+        "progress": {
+          "starting": "Starting…",
+          "loading": "Loading {{model}}…",
+          "transcribing": "Recording {{index}} of {{total}} · {{model}}",
+          "cleanup": "Recording {{index}} of {{total}} · {{model}} · cleanup",
+          "paused": "Paused while you dictate"
+        },
+        "empty": {
+          "noRecordings": "No saved recordings yet. Recordings are kept according to Auto-Delete Recordings.",
+          "noStarred": "No starred recordings with audio yet."
+        },
+        "errors": {
+          "alreadyRunning": "A bench run is already in progress.",
+          "noModels": "Select at least one installed model.",
+          "failed": "Couldn't start the bench: {{error}}"
+        },
+        "table": {
+          "summary": "Per model",
+          "recordings": "Recordings (most disagreement first)",
+          "model": "Model",
+          "meanDiffers": "Mean differs",
+          "load": "Load",
+          "transcribeMedianP90": "Transcribe (median / p90)",
+          "rtfMedian": "RTF (median)",
+          "cleanupMedianP90": "Cleanup (median / p90)",
+          "failed": "Failed",
+          "savedText": "Saved text",
+          "differs": "Differs",
+          "transcribe": "Transcribe",
+          "rtf": "RTF",
+          "cleanup": "Cleanup",
+          "showDiff": "Show word diff",
+          "hideDiff": "Hide word diff",
+          "pending": "Not run yet",
+          "empty": "No words",
+          "differsHint": "Differs is the share of words that disagree with the saved text. It is not accuracy: the saved text may itself be wrong.",
+          "rtfHint": "RTF is transcribe time divided by audio length; lower is faster."
+        }
       }
     },
     "about": {

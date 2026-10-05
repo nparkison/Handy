@@ -39,9 +39,15 @@ const NOOP = () => {};
 const renderSettingsContent = (
   section: SidebarSection,
   onPreviewOnboarding: (step: OnboardingPreviewStep) => void,
+  onSectionChange: (section: SidebarSection) => void,
 ) => {
   if (section === "debug") {
-    return <DebugSettings onPreviewOnboarding={onPreviewOnboarding} />;
+    return (
+      <DebugSettings
+        onPreviewOnboarding={onPreviewOnboarding}
+        onOpenModels={() => onSectionChange("models")}
+      />
+    );
   }
 
   const ActiveComponent =
@@ -383,7 +389,11 @@ function App() {
               <div className="flex flex-col items-center p-4 gap-4">
                 <AccessibilityPermissions />
                 <SecureInputWarning />
-                {renderSettingsContent(currentSection, setOnboardingPreview)}
+                {renderSettingsContent(
+                  currentSection,
+                  setOnboardingPreview,
+                  setCurrentSection,
+                )}
               </div>
             </div>
           </div>

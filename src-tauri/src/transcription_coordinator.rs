@@ -2,6 +2,7 @@ use crate::actions::ACTION_MAP;
 use crate::managers::audio::AudioRecordingManager;
 use crate::settings::ShortcutActivation;
 use log::{debug, error, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -236,6 +237,11 @@ impl CoordinatorState {
     }
 
     /// Deadline of the deferred release, if any — drives `recv_timeout`.
+    /// True while a dictation is recording or being processed.
+    fn is_busy(&self) -> bool {
+        self.stage != Stage::Idle
+    }
+
     fn grace_deadline(&self) -> Option<Instant> {
         self.pending_release.as_ref().map(|p| p.deadline)
     }
@@ -532,6 +538,9 @@ impl CoordinatorState {
 /// returned [`Effect`]s.
 pub struct TranscriptionCoordinator {
     tx: Sender<Command>,
+    /// Mirrors "the pipeline is not idle" (recording or processing) for
+    /// background work that must yield to dictation, e.g. the replay bench.
+    busy: Arc<AtomicBool>,
 }
 
 pub fn is_transcribe_binding(id: &str) -> bool {
@@ -541,12 +550,15 @@ pub fn is_transcribe_binding(id: &str) -> bool {
 impl TranscriptionCoordinator {
     pub fn new(app: AppHandle) -> Self {
         let (tx, rx) = mpsc::channel();
+        let busy = Arc::new(AtomicBool::new(false));
+        let busy_flag = Arc::clone(&busy);
 
         thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut state = CoordinatorState::new();
 
                 loop {
+                    busy_flag.store(state.is_busy(), Ordering::Release);
                     let cmd = if let Some(deadline) = state.grace_deadline() {
                         match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                             Ok(cmd) => cmd,
@@ -583,12 +595,18 @@ impl TranscriptionCoordinator {
                 }
                 debug!("Transcription coordinator exited");
             }));
+            busy_flag.store(false, Ordering::Release);
             if let Err(e) = result {
                 error!("Transcription coordinator panicked: {e:?}");
             }
         });
 
-        Self { tx }
+        Self { tx, busy }
+    }
+
+    /// True while a dictation is recording or being processed.
+    pub fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::Acquire)
     }
 
     /// Send a keyboard input event for a transcribe binding. `hold_threshold`
@@ -1203,6 +1221,23 @@ mod tests {
 
         state.on_start_result(BINDING, false);
         assert_eq!(state.stage, Stage::Idle);
+    }
+
+    /// The replay bench yields to dictation via `is_busy`.
+    #[test]
+    fn busy_tracks_recording_and_processing() {
+        let mut state = CoordinatorState::new();
+        assert!(!state.is_busy());
+
+        state.on_input(ptt_input(true), Instant::now());
+        state.on_start_result(BINDING, true);
+        assert!(state.is_busy());
+
+        state.stage = Stage::Processing;
+        assert!(state.is_busy());
+
+        state.on_processing_finished();
+        assert!(!state.is_busy());
     }
 
     // ---------------------------------------------------------------------
