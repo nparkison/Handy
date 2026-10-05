@@ -580,6 +580,11 @@
         "title": "Надійна вставка (Beta)",
         "description": "Відновлювати буфер обміну лише після того, як цільова програма справді прочитає транскрипцію, а не через фіксовану затримку. Призначено для усунення вставки старого вмісту буфера обміну під навантаженням на систему. Потрібен метод вставки через буфер обміну; лише macOS і Windows."
       },
+      "prePressBuffer": {
+        "title": "Pre-Press Buffer",
+        "description": "Keep this much audio from just before you press the shortcut, so your first word isn't clipped. Only works while the microphone is already open. 0 = off.",
+        "needsWarmMic": "Needs Always-On Microphone or Keep Mic Open Between Transcriptions."
+      },
       "recordingBuffer": {
         "title": "Додатковий буфер запису",
         "description": "Додатковий час (у мілісекундах) для продовження запису після відпускання клавіші, щоб захопити завершальний звук. 0 = без додаткового буфера."

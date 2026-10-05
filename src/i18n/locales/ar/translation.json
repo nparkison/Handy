@@ -557,6 +557,11 @@
         "title": "لصق موثوق (Beta)",
         "description": "استعادة الحافظة فقط بعد أن يقرأ التطبيق المستهدف النص المُفرَّغ فعلياً، بدلاً من الاعتماد على تأخير ثابت. يهدف إلى إصلاح لصق محتوى الحافظة القديم عند وجود حمل على النظام. يتطلب طريقة لصق تعتمد على الحافظة؛ على macOS وWindows فقط."
       },
+      "prePressBuffer": {
+        "title": "Pre-Press Buffer",
+        "description": "Keep this much audio from just before you press the shortcut, so your first word isn't clipped. Only works while the microphone is already open. 0 = off.",
+        "needsWarmMic": "Needs Always-On Microphone or Keep Mic Open Between Transcriptions."
+      },
       "recordingBuffer": {
         "title": "مخزن التسجيل الإضافي",
         "description": "وقت إضافي (بالمللي ثانية) للاستمرار في التسجيل بعد تحرير المفتاح، لالتقاط الصوت المتبقي. 0 = لا مخزن إضافي."

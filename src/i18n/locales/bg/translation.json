@@ -580,6 +580,11 @@
         "title": "Надеждно поставяне (Beta)",
         "description": "Възстановява клипборда само след като целевото приложение действително прочете транскрипцията, вместо след фиксирано забавяне. Предназначено да отстрани поставянето на старото съдържание на клипборда при натоварване на системата. Изисква начин на поставяне през клипборда; само за macOS и Windows."
       },
+      "prePressBuffer": {
+        "title": "Pre-Press Buffer",
+        "description": "Keep this much audio from just before you press the shortcut, so your first word isn't clipped. Only works while the microphone is already open. 0 = off.",
+        "needsWarmMic": "Needs Always-On Microphone or Keep Mic Open Between Transcriptions."
+      },
       "recordingBuffer": {
         "title": "Допълнителен буфер на записа",
         "description": "Допълнително време (в милисекунди) за запис след пускане на клавиша, за да се улови краят на аудиото. 0 = без допълнителен буфер."

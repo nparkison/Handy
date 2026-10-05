@@ -141,6 +141,14 @@ async changeExtraRecordingBufferSetting(ms: number) : Promise<Result<null, strin
     else return { status: "error", error: e  as any };
 }
 },
+async changePreRollSetting(ms: number) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_pre_roll_setting", { ms }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async changePasteDelayMsSetting(ms: number) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("change_paste_delay_ms_setting", { ms }) };
@@ -1015,7 +1023,13 @@ chinese_script?: ChineseScript; transcribe_accelerator?: TranscribeAcceleratorSe
  * `device_id` when available (or its name for backends such as Metal),
  * never from the process-local device registry index.
  */
-transcribe_gpu_device?: string | null; extra_recording_buffer_ms?: number; vad_enabled?: boolean; 
+transcribe_gpu_device?: string | null; extra_recording_buffer_ms?: number; 
+/**
+ * Press-time pre-roll: how much already-captured audio from just before
+ * the shortcut press to prepend to a recording (0 = off, max 1000). Only
+ * effective while the microphone stream is already open.
+ */
+pre_roll_ms?: number; vad_enabled?: boolean; 
 /**
  * Experimental detector implementation. Silero remains the stable default.
  */

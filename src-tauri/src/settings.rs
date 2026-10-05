@@ -524,6 +524,11 @@ pub struct AppSettings {
     pub transcribe_gpu_device: Option<String>,
     #[serde(default)]
     pub extra_recording_buffer_ms: u64,
+    /// Press-time pre-roll: how much already-captured audio from just before
+    /// the shortcut press to prepend to a recording (0 = off, max 1000). Only
+    /// effective while the microphone stream is already open.
+    #[serde(default = "default_pre_roll_ms")]
+    pub pre_roll_ms: u64,
     #[serde(default = "default_vad_enabled")]
     pub vad_enabled: bool,
     /// Experimental detector implementation. Silero remains the stable default.
@@ -599,6 +604,10 @@ fn default_overlay_style() -> OverlayStyle {
 
 fn default_vad_enabled() -> bool {
     true
+}
+
+fn default_pre_roll_ms() -> u64 {
+    300
 }
 
 fn default_filler_word_removal_enabled() -> bool {
@@ -1013,6 +1022,7 @@ pub fn get_default_settings() -> AppSettings {
         ort_accelerator: OrtAcceleratorSetting::default(),
         transcribe_gpu_device: default_transcribe_gpu_device(),
         extra_recording_buffer_ms: 0,
+        pre_roll_ms: default_pre_roll_ms(),
         vad_enabled: default_vad_enabled(),
         vad_backend: VadBackend::default(),
         overlay_style: default_overlay_style(),

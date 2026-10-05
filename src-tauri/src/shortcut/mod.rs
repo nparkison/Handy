@@ -909,6 +909,22 @@ pub fn change_extra_recording_buffer_setting(app: AppHandle, ms: u64) -> Result<
 
 #[tauri::command]
 #[specta::specta]
+pub fn change_pre_roll_setting(app: AppHandle, ms: u64) -> Result<(), String> {
+    let ms = ms.min(crate::audio_toolkit::MAX_PRE_ROLL_MS);
+    let mut settings = settings::get_settings(&app);
+    settings.pre_roll_ms = ms;
+    settings::write_settings(&app, settings);
+    // Apply to the live capture stream without reopening the microphone.
+    if let Some(manager) =
+        app.try_state::<std::sync::Arc<crate::managers::audio::AudioRecordingManager>>()
+    {
+        manager.set_pre_roll_ms(ms);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn change_paste_delay_ms_setting(app: AppHandle, ms: u64) -> Result<(), String> {
     let mut settings = settings::get_settings(&app);
     settings.paste_delay_ms = ms;

@@ -580,6 +580,11 @@
         "title": "הדבקה אמינה (Beta)",
         "description": "שחזור הלוח רק אחרי שאפליקציית היעד קוראת בפועל את התמלול, במקום אחרי השהיה קבועה. נועד לתקן הדבקה של תוכן לוח ישן כשהמערכת עמוסה. דורש שיטת הדבקה דרך הלוח; ב-macOS וב-Windows בלבד."
       },
+      "prePressBuffer": {
+        "title": "Pre-Press Buffer",
+        "description": "Keep this much audio from just before you press the shortcut, so your first word isn't clipped. Only works while the microphone is already open. 0 = off.",
+        "needsWarmMic": "Needs Always-On Microphone or Keep Mic Open Between Transcriptions."
+      },
       "recordingBuffer": {
         "title": "באפר הקלטה נוסף",
         "description": "זמן נוסף (במילישניות) להמשך הקלטה אחרי שחרור המקש, כדי ללכוד סוף דיבור. 0 = בלי באפר נוסף."
