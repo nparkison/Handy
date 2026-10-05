@@ -13,7 +13,9 @@ use cpal::{
 };
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use super::pre_roll::{pre_roll_capacity_samples, PreRollBuffer};
+use super::pre_roll::{
+    pre_roll_capacity_samples, PreRollBuffer, POST_STOP_GUARD_MS, PRE_ROLL_STALE_SLACK_MS,
+};
 use crate::audio_toolkit::{
     audio::{AudioVisualiser, CaptureStats, FrameResampler},
     constants,
@@ -763,6 +765,10 @@ struct CaptureProcessor {
     pre_roll: PreRollBuffer,
     /// Reused scratch space for handing the pre-roll to the resampler.
     pre_roll_scratch: Vec<f32>,
+    /// Device-rate idle samples seen since the last recording stopped (`None`
+    /// before the first recording). Lets the next start drop pre-roll audio
+    /// from the [`POST_STOP_GUARD_MS`] window right after that stop.
+    idle_samples_since_stop: Option<u64>,
 
     // ---- recording-scoped: reset by `begin_recording` ------------------- //
     vad_policy: VadPolicy,
@@ -822,6 +828,7 @@ impl CaptureProcessor {
             pre_roll_ms: Arc::new(AtomicU64::new(0)),
             pre_roll: PreRollBuffer::new(),
             pre_roll_scratch: Vec::new(),
+            idle_samples_since_stop: None,
             vad_policy: VadPolicy::Offline,
             processed_samples: Vec::new(),
             awaiting_first_captured_chunk: None,
@@ -884,6 +891,19 @@ impl CaptureProcessor {
     /// describe live capture, not buffered history.
     fn prepend_pre_roll(&mut self) {
         self.sync_pre_roll_capacity();
+        // The window should hold the last `pre_roll_ms`; a little slack covers
+        // normal callback jitter.
+        let window_ms = self.pre_roll_ms.load(Ordering::Relaxed);
+        self.pre_roll.clear_if_stale(
+            Instant::now(),
+            Duration::from_millis(window_ms.saturating_add(PRE_ROLL_STALE_SLACK_MS)),
+        );
+        if let Some(idle) = self.idle_samples_since_stop.take() {
+            // Keep only audio captured after the post-stop guard window.
+            let guard = u64::from(self.in_sample_rate) * POST_STOP_GUARD_MS / 1_000;
+            let fresh = usize::try_from(idle.saturating_sub(guard)).unwrap_or(usize::MAX);
+            self.pre_roll.keep_newest(fresh);
+        }
         if self.pre_roll.is_empty() {
             return;
         }
@@ -943,6 +963,9 @@ impl CaptureProcessor {
         if disposition == ChunkDisposition::Discard {
             self.sync_pre_roll_capacity();
             self.pre_roll.push(raw);
+            if let Some(idle) = &mut self.idle_samples_since_stop {
+                *idle = idle.saturating_add(raw.len() as u64);
+            }
             return;
         }
 
@@ -1037,6 +1060,7 @@ impl CaptureProcessor {
         if let Some(sink) = &self.stats_sink {
             *sink.lock().unwrap_or_else(|e| e.into_inner()) = self.stats;
         }
+        self.idle_samples_since_stop = Some(0);
         std::mem::take(&mut self.processed_samples)
     }
 }

@@ -7,8 +7,8 @@ pub mod vad;
 
 pub use audio::{
     classify_clip, is_microphone_access_denied, is_no_input_device_error, list_input_devices,
-    list_output_devices, read_wav_samples, save_wav_file, verify_wav_file, AudioRecorder,
-    CaptureStats, ClipVerdict, CpalDeviceInfo, VadPolicy, MAX_PRE_ROLL_MS,
+    list_output_devices, read_wav_samples, save_wav_file, verify_wav_file, worth_keeping,
+    AudioRecorder, CaptureStats, ClipVerdict, CpalDeviceInfo, VadPolicy, MAX_PRE_ROLL_MS,
 };
 pub use lang_id::detect_output_language;
 pub use text::{

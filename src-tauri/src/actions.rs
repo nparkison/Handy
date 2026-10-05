@@ -3,7 +3,8 @@ use crate::app_context::{self, CleanupRequest};
 use crate::apple_intelligence;
 use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, SoundType};
 use crate::audio_toolkit::{
-    classify_clip, is_microphone_access_denied, is_no_input_device_error, ClipVerdict, VadPolicy,
+    classify_clip, is_microphone_access_denied, is_no_input_device_error, worth_keeping,
+    ClipVerdict, VadPolicy,
 };
 use crate::cockpit::deadline::{race_with_deadline, AbortOnDrop, CleanupOutcome, RequestSent};
 use crate::cockpit::{self, gestures};
@@ -993,12 +994,18 @@ impl ShortcutAction for TranscribeAction {
                     stopped.stats.speech_samples
                 );
                 if verdict.is_dead_air() && get_settings(&ah).silent_mic_warning {
-                    // Skip STT, cleanup, paste and History. Any live-preview
-                    // text is discarded with the stream; the notice replaces
-                    // the Live panel.
+                    // Skip STT, cleanup and paste. Any live-preview text is
+                    // discarded with the stream; the notice replaces the Live
+                    // panel.
                     tm.cancel_stream();
                     set_tray_state(&ah, TrayIconState::Idle);
+                    let keep = worth_keeping(&stopped.stats, samples.len());
                     crate::dead_air::on_silent_clip(&ah, verdict, stopped.device_name);
+                    // Never destroy real audio on a guess: keep it in History
+                    // (empty text, so Retry is offered). Zeros are not kept.
+                    if keep {
+                        save_skipped_clip(&hm, samples, post_process).await;
+                    }
                     return;
                 }
                 if verdict != ClipVerdict::TooShort {
@@ -1325,6 +1332,37 @@ impl ShortcutAction for TranscribeAction {
             "TranscribeAction::stop completed in {:?}",
             stop_time.elapsed()
         );
+    }
+}
+
+/// Save a clip the dead-air guard skipped as a History entry with empty text
+/// (shown as a failed transcription, so it can be retried). Runs after the
+/// notice is shown, off the normal dictation path.
+async fn save_skipped_clip(hm: &Arc<HistoryManager>, samples: Vec<f32>, post_process: bool) {
+    let file_name = format!("handy-{}.wav", chrono::Utc::now().timestamp());
+    let wav_path = hm.recordings_dir().join(&file_name);
+    let sample_count = samples.len();
+    let saved = tauri::async_runtime::spawn_blocking(move || {
+        crate::audio_toolkit::save_wav_file(&wav_path, &samples)?;
+        crate::audio_toolkit::verify_wav_file(&wav_path, sample_count)
+    })
+    .await;
+    match saved {
+        Ok(Ok(())) => {
+            if let Err(e) = hm.save_entry(
+                file_name,
+                String::new(),
+                post_process,
+                None,
+                None,
+                None,
+                HistoryContext::default(),
+            ) {
+                error!("Failed to save skipped clip to history: {}", e);
+            }
+        }
+        Ok(Err(e)) => error!("Failed to save skipped clip: {}", e),
+        Err(e) => error!("Skipped clip save task panicked: {}", e),
     }
 }
 

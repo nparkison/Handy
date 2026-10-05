@@ -15,7 +15,7 @@ export const UpdateChecksToggle: React.FC<UpdateChecksToggleProps> = ({
   const { t } = useTranslation();
   const { getSetting, updateSetting, isUpdating, updateChecksLocked } =
     useSettings();
-  const updateChecksEnabled = getSetting("update_checks_enabled") ?? true;
+  const updateChecksEnabled = getSetting("update_checks_enabled") ?? false;
 
   return (
     <ToggleSwitch

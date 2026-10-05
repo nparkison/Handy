@@ -422,6 +422,12 @@ pub struct AudioRecordingManager {
     /// When the active recording was requested; read at stop for the
     /// dead-air guard's "no samples at all" check.
     recording_started_at: Arc<Mutex<Option<Instant>>>,
+    /// Set when a device change restarted the capture stream while a
+    /// recording was active. That recording's stop then talks to a fresh
+    /// consumer that never began, so it is reported as a device error (no
+    /// samples, no wall time) instead of being charged to the new mic as
+    /// dead air.
+    stream_restarted_mid_recording: Arc<AtomicBool>,
 }
 
 impl AudioRecordingManager {
@@ -455,6 +461,7 @@ impl AudioRecordingManager {
             cached_device: Arc::new(Mutex::new(None)),
             pre_roll_ms: Arc::new(AtomicU64::new(settings.pre_roll_ms.min(MAX_PRE_ROLL_MS))),
             recording_started_at: Arc::new(Mutex::new(None)),
+            stream_restarted_mid_recording: Arc::new(AtomicBool::new(false)),
         };
 
         // Always-on?  Open immediately.
@@ -869,7 +876,12 @@ impl AudioRecordingManager {
                     Ok(receiver) => {
                         let generation = self.capture_generation.fetch_add(1, Ordering::AcqRel) + 1;
                         *self.is_recording.lock().unwrap() = true;
-                        *self.recording_started_at.lock().unwrap() = Some(Instant::now());
+                        *self
+                            .recording_started_at
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+                        self.stream_restarted_mid_recording
+                            .store(false, Ordering::Release);
                         self.set_state(
                             &mut state,
                             RecordingState::Recording {
@@ -951,6 +963,10 @@ impl AudioRecordingManager {
         self.invalidate_device_cache();
         let was_open = *self.is_open.lock().unwrap();
         if was_open {
+            if self.is_recording() {
+                self.stream_restarted_mid_recording
+                    .store(true, Ordering::Release);
+            }
             self.close_generation.fetch_add(1, Ordering::SeqCst);
             self.stop_microphone_stream();
             self.start_microphone_stream()?;
@@ -1031,7 +1047,7 @@ impl AudioRecordingManager {
                 let wall_ms = self
                     .recording_started_at
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .take()
                     .map(|started| started.elapsed().as_millis() as u64)
                     .unwrap_or(0);
@@ -1073,6 +1089,15 @@ impl AudioRecordingManager {
                         error!("Recorder not available");
                         (Vec::new(), CaptureStats::default(), None, 0)
                     };
+                let (samples, stats, wall_ms) = if self
+                    .stream_restarted_mid_recording
+                    .swap(false, Ordering::AcqRel)
+                {
+                    warn!("Capture stream restarted during the recording; discarding it");
+                    (Vec::new(), CaptureStats::default(), 0)
+                } else {
+                    (samples, stats, wall_ms)
+                };
 
                 *self.is_recording.lock().unwrap() = false;
                 self.set_state(&mut self.state.lock().unwrap(), RecordingState::Idle);

@@ -7,7 +7,9 @@ mod resampler;
 mod utils;
 mod visualizer;
 
-pub use clip_stats::{classify_clip, CaptureStats, ClipVerdict, NOISE_FLOOR_PEAK, NOISE_FLOOR_RMS};
+pub use clip_stats::{
+    classify_clip, worth_keeping, CaptureStats, ClipVerdict, NOISE_FLOOR_PEAK, NOISE_FLOOR_RMS,
+};
 pub use device::{list_input_devices, list_output_devices, CpalDeviceInfo};
 pub use pre_roll::MAX_PRE_ROLL_MS;
 pub use recorder::{

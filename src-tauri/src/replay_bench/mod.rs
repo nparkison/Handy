@@ -10,19 +10,22 @@
 
 pub mod metrics;
 
+use crate::cockpit::deadline::{CleanupOutcome, RequestSent};
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::history::{HistoryEntry, HistoryManager};
 use crate::managers::model::ModelManager;
 use crate::managers::transcription::IsolatedEngine;
 use crate::settings::{get_settings, AppSettings};
 use crate::TranscriptionCoordinator;
-use log::{info, warn};
+use log::{error, info, warn};
 use metrics::{
     mean, median, percentile, real_time_factor, reference_text, select_entries, word_diff,
     Candidate, ReplayBenchSelection, WordDiffToken,
 };
 use serde::{Deserialize, Serialize};
 use specta::Type;
+use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -160,16 +163,14 @@ fn cancelled() -> bool {
     CANCEL.load(Ordering::Acquire)
 }
 
-fn audio_present(history: &HistoryManager, entry: &HistoryEntry) -> bool {
-    history.get_audio_file_path(&entry.file_name).is_file()
-}
-
-/// Pick the recordings a selection would replay.
+/// Pick the recordings a selection would replay. Only the entries the
+/// selection could actually use have their WAV checked on disk.
 pub fn pick_entries(
     history: &HistoryManager,
     entries: &[HistoryEntry],
     selection: ReplayBenchSelection,
 ) -> Vec<HistoryEntry> {
+    let by_id: HashMap<i64, &HistoryEntry> = entries.iter().map(|e| (e.id, e)).collect();
     let candidates: Vec<Candidate<'_>> = entries
         .iter()
         .map(|entry| Candidate {
@@ -177,13 +178,16 @@ pub fn pick_entries(
             timestamp: entry.timestamp,
             saved: entry.saved,
             transcription_text: &entry.transcription_text,
-            audio_present: audio_present(history, entry),
         })
         .collect();
-    select_entries(&candidates, selection)
-        .into_iter()
-        .filter_map(|id| entries.iter().find(|entry| entry.id == id).cloned())
-        .collect()
+    select_entries(&candidates, selection, |c| {
+        by_id
+            .get(&c.id)
+            .is_some_and(|entry| history.get_audio_file_path(&entry.file_name).is_file())
+    })
+    .into_iter()
+    .filter_map(|id| by_id.get(&id).map(|entry| (*entry).clone()))
+    .collect()
 }
 
 /// Read the WAV header only: duration and whether it is the 16 kHz mono
@@ -285,12 +289,59 @@ pub async fn start(app: &AppHandle, request: ReplayBenchRequest) -> Result<(), S
     let spawned = thread::Builder::new()
         .name("replay-bench".to_string())
         .spawn(move || {
-            let _guard = guard;
-            run(&app, &model_manager, &planned, &models, include_cleanup);
+            lower_current_thread_priority();
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                run(&app, &model_manager, &planned, &models, include_cleanup)
+            }));
+            if outcome.is_err() {
+                error!("Replay bench panicked; ending the run");
+            }
+            let was_cancelled = cancelled() || outcome.is_err();
+            CANCEL.store(false, Ordering::Release);
+            // Clear RUNNING before announcing the end, so a Run clicked the
+            // moment the UI shows "finished" is not refused as already running.
+            drop(guard);
+            info!("Replay bench finished (cancelled: {})", was_cancelled);
+            emit(
+                &app,
+                ReplayBenchEvent::Finished {
+                    cancelled: was_cancelled,
+                },
+            );
         });
     // On spawn failure the closure (and the guard inside it) is dropped,
     // which clears RUNNING again.
     spawned.map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Best effort: run the bench below normal priority so a dictation that
+/// starts mid-clip (load, transcribe and cleanup can't be interrupted) wins
+/// the CPU. On Linux, threads the engine spawns from here inherit it.
+fn lower_current_thread_priority() {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        // SAFETY: GetCurrentThread returns a pseudo-handle that is always
+        // valid for the calling thread and needs no closing.
+        if let Err(e) =
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) }
+        {
+            warn!("Replay bench could not lower its thread priority: {}", e);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // On Linux, PRIO_PROCESS with id 0 sets the calling thread's nice value.
+        // SAFETY: plain syscall with no pointers.
+        if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 10) } != 0 {
+            warn!(
+                "Replay bench could not lower its thread priority: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
 }
 
 fn emit(app: &AppHandle, event: ReplayBenchEvent) {
@@ -374,7 +425,7 @@ fn run(
         }
         emit(app, progress(model, 0, total, ReplayBenchPhase::Loading));
         let load_start = Instant::now();
-        let mut engine = match IsolatedEngine::load(app, model_manager, &model.model_id) {
+        let mut engine = match load_engine(app, model_manager, &model.model_id) {
             Ok(engine) => engine,
             Err(e) => {
                 warn!("Replay bench could not load {}: {}", model.model_id, e);
@@ -392,7 +443,29 @@ fn run(
         let mut results = Vec::with_capacity(entries.len());
         for (index, planned) in entries.iter().enumerate() {
             let entry_index = u32::try_from(index + 1).unwrap_or(u32::MAX);
-            if !wait_for_dictation(app, model, entry_index, total) {
+            if dictation_active(app) {
+                // Free the bench model while the user dictates so the live
+                // model has the memory (and VRAM) to itself, then reload.
+                drop(engine);
+                crate::memory::trim_freed_memory();
+                if !wait_for_dictation(app, model, entry_index, total) {
+                    emit_model_finished(app, model, load_ms, &results);
+                    break 'models;
+                }
+                emit(
+                    app,
+                    progress(model, entry_index, total, ReplayBenchPhase::Loading),
+                );
+                engine = match load_engine(app, model_manager, &model.model_id) {
+                    Ok(engine) => engine,
+                    Err(e) => {
+                        warn!("Replay bench could not reload {}: {}", model.model_id, e);
+                        emit_model_finished(app, model, load_ms, &results);
+                        continue 'models;
+                    }
+                };
+            }
+            if cancelled() {
                 drop(engine);
                 emit_model_finished(app, model, load_ms, &results);
                 break 'models;
@@ -425,16 +498,17 @@ fn run(
         crate::memory::trim_freed_memory();
         emit_model_finished(app, model, load_ms, &results);
     }
+}
 
-    let was_cancelled = cancelled();
-    CANCEL.store(false, Ordering::Release);
-    info!("Replay bench finished (cancelled: {})", was_cancelled);
-    emit(
-        app,
-        ReplayBenchEvent::Finished {
-            cancelled: was_cancelled,
-        },
-    );
+/// Load a bench engine with the current accelerator settings (the live
+/// pipeline only re-applies them on its own loads).
+fn load_engine(
+    app: &AppHandle,
+    model_manager: &ModelManager,
+    model_id: &str,
+) -> anyhow::Result<IsolatedEngine> {
+    crate::managers::transcription::apply_accelerator_settings(app);
+    IsolatedEngine::load(app, model_manager, model_id)
 }
 
 fn emit_model_finished(
@@ -511,7 +585,10 @@ fn bench_entry(
     result.rtf = real_time_factor(transcribe_ms, audio_secs);
 
     let mut compared = text.clone();
-    if include_cleanup && !cancelled() {
+    // A dictation may have started during transcription. Cleanup can't be
+    // interrupted once sent, and a single-slot local LLM would make the live
+    // cleanup queue behind it, so wait for the dictation to finish first.
+    if include_cleanup && wait_for_dictation(app, model, entry_index, total) {
         emit(
             app,
             progress(model, entry_index, total, ReplayBenchPhase::Cleanup),
@@ -519,18 +596,24 @@ fn bench_entry(
         let start = Instant::now();
         // No app context: the bench replays audio outside the app it was
         // dictated into, so it always measures the selected prompt.
-        let cleaned = tauri::async_runtime::block_on(crate::actions::post_process_transcription(
+        let outcome = tauri::async_runtime::block_on(crate::actions::run_cleanup(
             settings,
             &text,
             &crate::app_context::CleanupRequest::plain(),
+            &RequestSent::detached(),
         ));
-        result.cleanup_ms = Some(elapsed_ms(start));
-        match cleaned {
-            Some(cleaned) => {
+        match outcome {
+            CleanupOutcome::Cleaned(cleaned) => {
+                result.cleanup_ms = Some(elapsed_ms(start));
                 compared = cleaned.clone();
                 result.cleanup_text = Some(cleaned);
             }
-            None => result.cleanup_failed = true,
+            CleanupOutcome::Failed => {
+                result.cleanup_ms = Some(elapsed_ms(start));
+                result.cleanup_failed = true;
+            }
+            // Nothing configured (or blank text): not a failure, no timing.
+            CleanupOutcome::Skipped => {}
         }
     }
 

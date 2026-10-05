@@ -100,7 +100,9 @@ pub enum ClipVerdict {
     /// The device delivered digital zeros, or nothing at all. Points at OS
     /// microphone access / a hardware mute rather than at the user.
     NoAudio,
-    /// Real (non-zero) input, but no speech and a level at the noise floor.
+    /// Real (non-zero) input, VAD found no speech, and the level is at the
+    /// noise floor. Only produced when VAD ran: level alone can't tell a quiet
+    /// room from a soft speaker or a low-gain mic.
     NoSpeech,
 }
 
@@ -109,6 +111,16 @@ impl ClipVerdict {
     pub fn is_dead_air(self) -> bool {
         matches!(self, ClipVerdict::NoAudio | ClipVerdict::NoSpeech)
     }
+}
+
+/// Whether a clip the dead-air guard skips still holds real audio (it reached
+/// the recording buffer and is above digital silence). Such a clip is saved to
+/// History with an empty transcription so it can be retried, instead of being
+/// discarded. With VAD on, a skipped clip's buffer is empty (VAD dropped every
+/// frame), so this only matters for edge cases such as pre-roll audio
+/// followed by a device stall.
+pub fn worth_keeping(stats: &CaptureStats, recorded_samples: usize) -> bool {
+    recorded_samples > 0 && stats.peak > DIGITAL_SILENCE_PEAK
 }
 
 /// Classify a finished recording.
@@ -124,8 +136,9 @@ impl ClipVerdict {
 /// - Under [`MIN_CLASSIFIED_CLIP_MS`] of captured audio: `TooShort`.
 /// - Peak at or below [`DIGITAL_SILENCE_PEAK`]: `NoAudio` (digital zeros).
 /// - VAD ran, found no speech, and peak or RMS is at the noise floor: `NoSpeech`.
-/// - VAD did not run: `NoSpeech` only when both peak and RMS are at the noise
-///   floor, since there is no speech signal to corroborate.
+///   (VAD already dropped every frame, so nothing transcribable is lost.)
+/// - VAD did not run: never `NoSpeech`. Without a speech signal, a quiet clip
+///   may be soft speech, and skipping it would lose the dictation for good.
 /// - Otherwise `Usable`.
 pub fn classify_clip(stats: &CaptureStats, wall_ms: u64) -> ClipVerdict {
     if stats.live_samples() == 0 {
@@ -142,15 +155,8 @@ pub fn classify_clip(stats: &CaptureStats, wall_ms: u64) -> ClipVerdict {
         return ClipVerdict::NoAudio;
     }
 
-    let quiet_peak = stats.peak < NOISE_FLOOR_PEAK;
-    let quiet_rms = stats.rms() < NOISE_FLOOR_RMS;
-    let silent = if stats.vad_active {
-        stats.speech_samples == 0 && (quiet_peak || quiet_rms)
-    } else {
-        quiet_peak && quiet_rms
-    };
-
-    if silent {
+    let quiet = stats.peak < NOISE_FLOOR_PEAK || stats.rms() < NOISE_FLOOR_RMS;
+    if stats.vad_active && stats.speech_samples == 0 && quiet {
         ClipVerdict::NoSpeech
     } else {
         ClipVerdict::Usable
@@ -262,11 +268,16 @@ mod tests {
     }
 
     #[test]
-    fn without_vad_only_a_fully_quiet_clip_is_flagged() {
+    fn without_vad_only_digital_silence_is_flagged() {
+        // -60 dBFS: a quiet room, or a soft speaker on a low-gain mic. With
+        // no VAD to tell them apart, it is transcribed rather than dropped.
         let stats = stats_for(&tone(0.001, 2.0), false, 0);
-        assert_eq!(classify_clip(&stats, 2_000), ClipVerdict::NoSpeech);
+        assert_eq!(classify_clip(&stats, 2_000), ClipVerdict::Usable);
 
-        // A click (high peak) without VAD corroboration stays usable.
+        // Soft speech: peak about -40 dBFS, RMS about -43 dBFS.
+        let stats = stats_for(&tone(0.01, 2.0), false, 0);
+        assert_eq!(classify_clip(&stats, 2_000), ClipVerdict::Usable);
+
         let mut samples = tone(0.001, 2.0);
         samples[100] = 0.4;
         let stats = stats_for(&samples, false, 0);
@@ -274,6 +285,25 @@ mod tests {
 
         let stats = stats_for(&tone(0.3, 2.0), false, 0);
         assert_eq!(classify_clip(&stats, 2_000), ClipVerdict::Usable);
+
+        // Digital zeros and a dead device are still caught.
+        let stats = stats_for(&vec![0.0; RATE * 2], false, 0);
+        assert_eq!(classify_clip(&stats, 2_000), ClipVerdict::NoAudio);
+        let stats = CaptureStats::default();
+        assert_eq!(classify_clip(&stats, 3_000), ClipVerdict::NoAudio);
+    }
+
+    #[test]
+    fn skipped_clips_keep_real_audio() {
+        // Digital zeros hold nothing worth keeping.
+        let zeros = stats_for(&vec![0.0; RATE], false, 0);
+        assert!(!worth_keeping(&zeros, RATE));
+        // Nothing reached the recording buffer (VAD dropped every frame).
+        let quiet = stats_for(&tone(0.001, 1.0), true, 0);
+        assert!(!worth_keeping(&quiet, 0));
+        // Real signal in the buffer: keep it so it can be retried.
+        let pre_roll_only = stats_for(&tone(0.2, 0.5), false, 0);
+        assert!(worth_keeping(&pre_roll_only, RATE / 2));
     }
 
     #[test]

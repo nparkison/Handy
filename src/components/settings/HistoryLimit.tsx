@@ -1,5 +1,6 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { useSettings } from "../../hooks/useSettings";
 import { Input } from "../ui/Input";
 import { SettingContainer } from "../ui/SettingContainer";
@@ -17,12 +18,39 @@ export const HistoryLimit: React.FC<HistoryLimitProps> = ({
   const { getSetting, updateSetting, isUpdating } = useSettings();
 
   const historyLimit = getSetting("history_limit") ?? 200;
+  const retention = getSetting("recording_retention_period");
+  // Typing is only a draft: saving prunes History right away, so committing
+  // each keystroke (e.g. the "1" of "150") would delete almost everything.
+  const [draft, setDraft] = useState(String(historyLimit));
 
-  const handleChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const value = parseInt(event.target.value, 10);
-    if (!isNaN(value) && value >= 0) {
-      updateSetting("history_limit", value);
+  useEffect(() => {
+    setDraft(String(historyLimit));
+  }, [historyLimit]);
+
+  const commit = async () => {
+    const value = parseInt(draft, 10);
+    if (isNaN(value) || value < 0 || value === historyLimit) {
+      setDraft(String(historyLimit));
+      return;
     }
+    // The limit only prunes under the count-based retention setting.
+    const prunes =
+      (retention ?? "preserve_limit") === "preserve_limit" &&
+      value < historyLimit;
+    if (prunes) {
+      const confirmed = await ask(
+        t("settings.debug.historyLimit.lowerConfirm", { count: value }),
+        {
+          title: t("settings.debug.historyLimit.lowerTitle"),
+          kind: "warning",
+        },
+      );
+      if (!confirmed) {
+        setDraft(String(historyLimit));
+        return;
+      }
+    }
+    updateSetting("history_limit", value);
   };
 
   return (
@@ -38,8 +66,16 @@ export const HistoryLimit: React.FC<HistoryLimitProps> = ({
           type="number"
           min="0"
           max="1000"
-          value={historyLimit}
-          onChange={handleChange}
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={() => void commit()}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.currentTarget.blur();
+            } else if (event.key === "Escape") {
+              setDraft(String(historyLimit));
+            }
+          }}
           disabled={isUpdating("history_limit")}
           className="w-20"
         />

@@ -327,7 +327,9 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
             }
           />
         </div>
-        {showMouseHint && (
+        {/* Only while this shortcut is being recorded: commit, cancel and
+            click-away all end editing, which hides the hint. */}
+        {showMouseHint && editingShortcutId === shortcutId && (
           <p className="text-xs text-mid-gray" role="status">
             {t("settings.general.shortcut.mouseNeedsHandyKeys")}
           </p>

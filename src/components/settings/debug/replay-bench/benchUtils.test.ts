@@ -77,4 +77,10 @@ assert.ok(lines[1].includes('"say ""hi"""'));
 assert.ok(lines[1].includes('"text, with comma"'));
 assert.ok(lines[1].startsWith("1,10,a,Model A,"));
 
+// Spreadsheet formula injection: text cells starting with = + - @ are quoted.
+const risky = buildCsv([entry(1, "=HYPERLINK(1)")], models, results, {});
+assert.ok(risky.split("\n")[1].includes(",'=HYPERLINK(1),"));
+const minus = buildCsv([entry(1, "-1+2")], models, results, {});
+assert.ok(minus.split("\n")[1].includes(",'-1+2,"));
+
 console.log("replay bench utils: all assertions passed");

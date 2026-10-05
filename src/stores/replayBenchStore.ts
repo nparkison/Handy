@@ -44,6 +44,8 @@ interface ReplayBenchStore {
  * while the user switches settings pages. Results are never persisted.
  */
 export const useReplayBenchStore = create<ReplayBenchStore>()((set, get) => {
+  let initializing: Promise<void> | null = null;
+
   const handleEvent = (event: ReplayBenchEvent) => {
     switch (event.type) {
       case "started":
@@ -108,20 +110,40 @@ export const useReplayBenchStore = create<ReplayBenchStore>()((set, get) => {
 
     initialize: async () => {
       if (get().initialized) return;
-      set({ initialized: true });
-      await events.replayBenchEvent.listen((event) =>
-        handleEvent(event.payload),
-      );
-      try {
-        if (await commands.isReplayBenchRunning()) {
-          set({ status: "running" });
-        }
-      } catch (e) {
-        console.error("Failed to query replay bench state:", e);
+      // Concurrent callers share one attempt; a failed attempt can be retried.
+      if (initializing === null) {
+        initializing = (async () => {
+          try {
+            await events.replayBenchEvent.listen((event) =>
+              handleEvent(event.payload),
+            );
+            set({ initialized: true });
+          } catch (e) {
+            console.error("Failed to listen for replay bench events:", e);
+            return;
+          } finally {
+            initializing = null;
+          }
+          // Reconcile with the backend: a run may have started (or ended)
+          // before the listener existed.
+          try {
+            const running = await commands.isReplayBenchRunning();
+            if (running) {
+              set({ status: "running" });
+            } else if (get().status === "running") {
+              set({ status: "idle", progress: null });
+            }
+          } catch (e) {
+            console.error("Failed to query replay bench state:", e);
+          }
+        })();
       }
+      await initializing;
     },
 
     start: async (request) => {
+      // Listen first so the "started" event can't be missed.
+      await get().initialize();
       set({ status: "starting", error: null });
       try {
         const result = await commands.startReplayBench(request);
@@ -136,6 +158,14 @@ export const useReplayBenchStore = create<ReplayBenchStore>()((set, get) => {
     stop: async () => {
       try {
         await commands.stopReplayBench();
+        // If the backend run already ended without a "finished" event
+        // reaching us, don't leave the page stuck on "running".
+        if (!(await commands.isReplayBenchRunning())) {
+          const { status } = get();
+          if (status === "running" || status === "starting") {
+            set({ status: "stopped", progress: null });
+          }
+        }
       } catch (e) {
         console.error("Failed to stop replay bench:", e);
       }

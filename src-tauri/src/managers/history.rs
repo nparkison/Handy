@@ -14,6 +14,14 @@ use tauri_specta::Event;
 /// Each migration is applied in order. The library tracks which migrations
 /// have been applied using SQLite's user_version pragma.
 ///
+/// This list must stay identical to upstream Handy's (v0.9.8: four entries).
+/// The fork shares `history.db` with upstream builds (same app identifier and
+/// data dir), so a fork-only entry here would push `user_version` past what
+/// upstream knows: an upstream build would then refuse to open the database
+/// (`DatabaseTooFarAhead`, a panic at startup), and a future upstream
+/// migration with the same number would be skipped. Fork-only columns are
+/// added by [`ensure_fork_columns`] instead.
+///
 /// Note: For users upgrading from tauri-plugin-sql, migrate_from_tauri_plugin_sql()
 /// converts the old _sqlx_migrations table tracking to the user_version pragma,
 /// ensuring migrations don't re-run on existing databases.
@@ -31,13 +39,99 @@ static MIGRATIONS: &[M] = &[
     M::up("ALTER TABLE transcription_history ADD COLUMN post_processed_text TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN post_process_prompt TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN post_process_requested BOOLEAN NOT NULL DEFAULT 0;"),
-    M::up("ALTER TABLE transcription_history ADD COLUMN cleanup_state TEXT;"),
-    M::up(
-        "ALTER TABLE transcription_history ADD COLUMN context_app TEXT;
-         ALTER TABLE transcription_history ADD COLUMN context_title TEXT;
-         ALTER TABLE transcription_history ADD COLUMN context_screenshot BOOLEAN NOT NULL DEFAULT 0;",
-    ),
 ];
+
+/// Fork-only columns, added idempotently after upstream's migrations without
+/// touching `user_version`. Upstream builds ignore extra columns: their
+/// INSERTs name columns explicitly and every one of these is nullable or has
+/// a default.
+const FORK_COLUMNS: &[(&str, &str)] = &[
+    ("cleanup_state", "TEXT"),
+    ("context_app", "TEXT"),
+    ("context_title", "TEXT"),
+    ("context_screenshot", "BOOLEAN NOT NULL DEFAULT 0"),
+];
+
+/// Builds before this fix recorded the fork columns as migrations 5 (cleanup
+/// state) and 6 (context). Such a database is upstream schema 4 plus fork
+/// columns, so its `user_version` is put back to 4 to stay openable by
+/// upstream builds.
+fn reset_fork_schema_version(conn: &Connection) -> Result<()> {
+    let upstream_version = MIGRATIONS.len() as i32;
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if !matches!(version, 5 | 6) {
+        // Anything else is either current or belongs to a newer upstream;
+        // leave the latter for rusqlite_migration to report.
+        return Ok(());
+    }
+    let present = existing_columns(conn)?;
+    let fork_owned = FORK_COLUMNS
+        .iter()
+        .take(if version == 5 { 1 } else { FORK_COLUMNS.len() })
+        .all(|(name, _)| present.iter().any(|c| c == name));
+    if fork_owned {
+        info!(
+            "History database at fork schema version {}; resetting to upstream version {}",
+            version, upstream_version
+        );
+        conn.pragma_update(None, "user_version", upstream_version)?;
+    }
+    Ok(())
+}
+
+fn existing_columns(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('transcription_history')")?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(names)
+}
+
+/// Add any missing [`FORK_COLUMNS`]. Safe to run on every start.
+fn ensure_fork_columns(conn: &Connection) -> Result<()> {
+    let present = existing_columns(conn)?;
+    for (name, definition) in FORK_COLUMNS {
+        if !present.iter().any(|c| c == name) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE transcription_history ADD COLUMN {name} {definition};"
+            ))?;
+            debug!("Added fork history column {}", name);
+        }
+    }
+    Ok(())
+}
+
+/// Bring a database to the current schema: upstream migrations, then the
+/// fork's columns. See [`MIGRATIONS`] for why the two are kept apart.
+fn migrate_schema(conn: &mut Connection) -> Result<()> {
+    reset_fork_schema_version(conn)?;
+    let migrations = Migrations::new(MIGRATIONS.to_vec());
+    // Validate migrations in debug builds
+    #[cfg(debug_assertions)]
+    migrations.validate().expect("Invalid migrations");
+    migrations.to_latest(conn)?;
+    ensure_fork_columns(conn)
+}
+
+/// Registers `handy_lower(text)`, a Unicode lowercase for search. SQLite's
+/// own `lower()` and `LIKE` only fold ASCII, while History's highlighter
+/// folds all of Unicode.
+fn register_search_functions(conn: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "handy_lower",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            Ok(match ctx.get_raw(0) {
+                rusqlite::types::ValueRef::Text(bytes) => {
+                    Some(String::from_utf8_lossy(bytes).to_lowercase())
+                }
+                _ => None,
+            })
+        },
+    )
+}
 
 /// Columns read by [`HistoryManager::map_history_entry`], in SELECT order.
 macro_rules! entry_columns {
@@ -167,20 +261,13 @@ impl HistoryManager {
         // tauri-plugin-sql used _sqlx_migrations table, rusqlite_migration uses user_version pragma
         self.migrate_from_tauri_plugin_sql(&conn)?;
 
-        // Create migrations object and run to latest version
-        let migrations = Migrations::new(MIGRATIONS.to_vec());
-
-        // Validate migrations in debug builds
-        #[cfg(debug_assertions)]
-        migrations.validate().expect("Invalid migrations");
-
         // Get current version before migration
         let version_before: i32 =
             conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         debug!("Database version before migration: {}", version_before);
 
-        // Apply any pending migrations
-        migrations.to_latest(&mut conn)?;
+        // Apply any pending upstream migrations, then the fork's columns.
+        migrate_schema(&mut conn)?;
 
         // A cleanup still pending from a previous run will never arrive.
         let stale = conn.execute(
@@ -378,6 +465,7 @@ impl HistoryManager {
         transcription_text: String,
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
+        post_process_requested: bool,
         context: HistoryContext,
     ) -> Result<HistoryEntry> {
         let conn = self.get_connection()?;
@@ -386,15 +474,17 @@ impl HistoryManager {
              SET transcription_text = ?1,
                  post_processed_text = ?2,
                  post_process_prompt = ?3,
+                 post_process_requested = ?4,
                  cleanup_state = NULL,
-                 context_app = ?4,
-                 context_title = ?5,
-                 context_screenshot = ?6
-             WHERE id = ?7",
+                 context_app = ?5,
+                 context_title = ?6,
+                 context_screenshot = ?7
+             WHERE id = ?8",
             params![
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
+                post_process_requested,
                 context.app,
                 context.title,
                 context.screenshot,
@@ -548,9 +638,10 @@ impl HistoryManager {
     fn cleanup_by_count(&self, limit: usize) -> Result<()> {
         let conn = self.get_connection()?;
 
-        // Get all entries that are not saved, ordered by timestamp desc
+        // Unsaved entries, newest first. `id` is the insertion order and never
+        // ties; `timestamp` has one-second resolution and follows the wall clock.
         let mut stmt = conn.prepare(
-            "SELECT id, file_name FROM transcription_history WHERE saved = 0 ORDER BY timestamp DESC"
+            "SELECT id, file_name FROM transcription_history WHERE saved = 0 ORDER BY id DESC",
         )?;
 
         let rows = stmt.query_map([], |row| {
@@ -624,9 +715,9 @@ impl HistoryManager {
         Self::query_history_page(&conn, cursor, limit, None)
     }
 
-    /// Page through entries whose raw or polished text contains `query`
-    /// (case-insensitive for ASCII, per SQLite `LIKE`). Searches every retained
-    /// entry, not just the page the UI has loaded.
+    /// Page through entries whose raw or polished text contains `query`,
+    /// case-insensitively across Unicode (é/É, Cyrillic, ẞ/ß). Searches every
+    /// retained entry, not just the page the UI has loaded.
     pub async fn search_history_entries(
         &self,
         query: &str,
@@ -640,8 +731,14 @@ impl HistoryManager {
     }
 
     /// Shared cursor-paginated query. `cursor` is the id of the last entry of
-    /// the previous page (entries are returned newest-first by id), `limit`
-    /// is capped at 100, and `search` filters on both text columns.
+    /// the previous page (entries are returned newest-first by id, which is
+    /// unique, so pages never skip or repeat entries that share a timestamp),
+    /// `limit` is capped at 100, and `search` filters on both text columns.
+    ///
+    /// Matching lowercases both sides with Rust's Unicode `to_lowercase` (the
+    /// same mapping as the frontend's `toLowerCase`) and uses `instr`, so user
+    /// input never acts as a `LIKE` wildcard. `ß` matches `ß`/`ẞ` but not `ss`
+    /// (lowercasing, not full case folding).
     fn query_history_page(
         conn: &Connection,
         cursor: Option<i64>,
@@ -652,7 +749,9 @@ impl HistoryManager {
         // Fetch one extra row to learn whether another page exists.
         // SQLite treats a negative LIMIT as "no limit".
         let fetch_count: i64 = limit.map_or(-1, |lim| lim as i64 + 1);
-        let pattern = search.map(like_contains_pattern);
+        let needle = search.map(str::to_lowercase);
+        // The statement references the function even when not searching.
+        register_search_functions(conn)?;
 
         let mut stmt = conn.prepare(concat!(
             "SELECT ",
@@ -660,14 +759,14 @@ impl HistoryManager {
             " FROM transcription_history
              WHERE (?1 IS NULL OR id < ?1)
                AND (?2 IS NULL
-                    OR transcription_text LIKE ?2 ESCAPE '\\'
-                    OR COALESCE(post_processed_text, '') LIKE ?2 ESCAPE '\\')
+                    OR instr(handy_lower(transcription_text), ?2) > 0
+                    OR instr(handy_lower(COALESCE(post_processed_text, '')), ?2) > 0)
              ORDER BY id DESC
              LIMIT ?3"
         ))?;
         let mut entries = stmt
             .query_map(
-                params![cursor, pattern, fetch_count],
+                params![cursor, needle, fetch_count],
                 Self::map_history_entry,
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -732,7 +831,7 @@ impl HistoryManager {
             "SELECT ",
             entry_columns!(),
             " FROM transcription_history
-             ORDER BY timestamp DESC
+             ORDER BY id DESC
              LIMIT 1"
         ))?;
 
@@ -752,7 +851,7 @@ impl HistoryManager {
             entry_columns!(),
             " FROM transcription_history
              WHERE transcription_text != ''
-             ORDER BY timestamp DESC
+             ORDER BY id DESC
              LIMIT 1"
         ))?;
 
@@ -853,22 +952,6 @@ impl HistoryManager {
     }
 }
 
-/// Builds a `LIKE ... ESCAPE '\'` pattern matching `query` anywhere in the
-/// text. `%`, `_` and the escape character itself are escaped so user input is
-/// always matched literally.
-fn like_contains_pattern(query: &str) -> String {
-    let mut pattern = String::with_capacity(query.len() + 2);
-    pattern.push('%');
-    for ch in query.chars() {
-        if matches!(ch, '%' | '_' | '\\') {
-            pattern.push('\\');
-        }
-        pattern.push(ch);
-    }
-    pattern.push('%');
-    pattern
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -964,14 +1047,6 @@ mod tests {
             .iter()
             .map(|e| e.transcription_text.as_str())
             .collect()
-    }
-
-    #[test]
-    fn like_pattern_escapes_wildcards() {
-        assert_eq!(like_contains_pattern("abc"), "%abc%");
-        assert_eq!(like_contains_pattern("50%"), "%50\\%%");
-        assert_eq!(like_contains_pattern("a_b"), "%a\\_b%");
-        assert_eq!(like_contains_pattern("c:\\x"), "%c:\\\\x%");
     }
 
     #[test]
@@ -1160,23 +1235,164 @@ mod tests {
         assert_eq!(entry.post_processed_text.as_deref(), Some("Hello."));
     }
 
-    #[test]
-    fn migrations_add_context_columns_to_an_existing_db() {
-        let mut conn = Connection::open_in_memory().expect("open in-memory db");
-        // An existing DB at the previous schema version.
-        let previous = MIGRATIONS[..MIGRATIONS.len() - 1].to_vec();
-        Migrations::new(previous)
-            .to_latest(&mut conn)
-            .expect("old schema");
-        insert_entry(&conn, 100, "old entry", None);
+    fn user_version(conn: &Connection) -> i32 {
+        conn.pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("user_version")
+    }
 
+    fn assert_fork_columns_present(conn: &Connection) {
+        let columns = existing_columns(conn).expect("columns");
+        for (name, _) in FORK_COLUMNS {
+            assert!(columns.iter().any(|c| c == name), "missing {name}");
+        }
+    }
+
+    #[test]
+    fn migration_list_matches_upstream() {
+        // Upstream v0.9.8 has four migrations; see MIGRATIONS.
+        assert_eq!(MIGRATIONS.len(), 4);
+    }
+
+    #[test]
+    fn fresh_db_gets_upstream_version_and_fork_columns() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        migrate_schema(&mut conn).expect("migrate");
+        assert_eq!(user_version(&conn), 4);
+        assert_fork_columns_present(&conn);
+        insert_entry(&conn, 100, "new entry", None);
+        // Idempotent on the next start.
+        migrate_schema(&mut conn).expect("migrate again");
+        assert_eq!(user_version(&conn), 4);
+    }
+
+    #[test]
+    fn upstream_db_gains_fork_columns_and_keeps_entries() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        // An upstream v0.9.8 database.
         Migrations::new(MIGRATIONS.to_vec())
             .to_latest(&mut conn)
-            .expect("migrate");
+            .expect("upstream schema");
+        conn.execute(
+            "INSERT INTO transcription_history
+                (file_name, timestamp, saved, title, transcription_text)
+             VALUES ('a.wav', 100, 0, 't', 'old entry')",
+            [],
+        )
+        .expect("insert");
+
+        migrate_schema(&mut conn).expect("migrate");
+        assert_eq!(user_version(&conn), 4);
+        assert_fork_columns_present(&conn);
         let entry = HistoryManager::get_latest_entry_with_conn(&conn)
             .expect("fetch")
             .expect("entry");
+        assert_eq!(entry.transcription_text, "old entry");
         assert_eq!(entry.context, None);
+        assert_eq!(entry.cleanup_state, None);
+    }
+
+    #[test]
+    fn older_fork_db_at_version_3_is_upgraded() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        Migrations::new(MIGRATIONS[..3].to_vec())
+            .to_latest(&mut conn)
+            .expect("old fork schema");
+        migrate_schema(&mut conn).expect("migrate");
+        assert_eq!(user_version(&conn), 4);
+        assert_fork_columns_present(&conn);
+    }
+
+    #[test]
+    fn db_with_fork_migrations_is_reset_to_upstream_version() {
+        for version in [5, 6] {
+            let mut conn = setup_conn();
+            conn.pragma_update(None, "user_version", version)
+                .expect("set version");
+            insert_entry(&conn, 100, "kept", None);
+
+            migrate_schema(&mut conn).expect("migrate");
+            assert_eq!(user_version(&conn), 4);
+            assert_fork_columns_present(&conn);
+            // Upstream's migrator now accepts it as up to date.
+            Migrations::new(MIGRATIONS.to_vec())
+                .to_latest(&mut conn)
+                .expect("upstream opens it");
+            let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+                .expect("fetch")
+                .expect("entry");
+            assert_eq!(entry.transcription_text, "kept");
+        }
+    }
+
+    #[test]
+    fn newer_upstream_version_is_left_alone() {
+        let mut conn = setup_conn();
+        conn.pragma_update(None, "user_version", 9)
+            .expect("set version");
+        assert!(migrate_schema(&mut conn).is_err());
+        assert_eq!(user_version(&conn), 9);
+    }
+
+    #[test]
+    fn latest_entries_break_same_second_ties_by_id() {
+        let conn = setup_conn();
+        insert_entry(&conn, 100, "older", None);
+        insert_entry(&conn, 100, "newer", None);
+
+        let latest = HistoryManager::get_latest_completed_entry_with_conn(&conn)
+            .expect("fetch")
+            .expect("entry");
+        assert_eq!(latest.transcription_text, "newer");
+        let latest = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("fetch")
+            .expect("entry");
+        assert_eq!(latest.transcription_text, "newer");
+    }
+
+    #[test]
+    fn search_is_unicode_case_insensitive() {
+        let conn = setup_conn();
+        insert_entry(&conn, 100, "Café ÉCLAIR", None);
+        insert_entry(&conn, 200, "Привет, мир", None);
+        insert_entry(&conn, 300, "GROẞE Straße", None);
+        insert_entry(&conn, 400, "plain ascii", Some("ÜBER polished"));
+
+        let texts = |q: &str| {
+            let page = HistoryManager::query_history_page(&conn, None, None, Some(q)).unwrap();
+            page.entries
+                .into_iter()
+                .map(|e| e.transcription_text)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(texts("éclair"), vec!["Café ÉCLAIR"]);
+        assert_eq!(texts("CAFÉ"), vec!["Café ÉCLAIR"]);
+        assert_eq!(texts("привет"), vec!["Привет, мир"]);
+        assert_eq!(texts("МИР"), vec!["Привет, мир"]);
+        // Capital sharp s lowercases to ß; lowercasing never expands to "ss".
+        assert_eq!(texts("große"), vec!["GROẞE Straße"]);
+        assert_eq!(texts("STRAẞE"), vec!["GROẞE Straße"]);
+        assert!(texts("strasse").is_empty());
+        assert_eq!(texts("über"), vec!["plain ascii"]);
+    }
+
+    #[test]
+    fn search_paging_cursor_is_stable_with_same_second_entries() {
+        let conn = setup_conn();
+        for i in 1..=5 {
+            insert_entry(&conn, 100, &format!("tie {i}"), None);
+        }
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page =
+                HistoryManager::query_history_page(&conn, cursor, Some(2), Some("TIE")).unwrap();
+            seen.extend(page.entries.iter().map(|e| e.transcription_text.clone()));
+            cursor = page.entries.last().map(|e| e.id);
+            if !page.has_more {
+                break;
+            }
+        }
+        assert_eq!(seen, vec!["tie 5", "tie 4", "tie 3", "tie 2", "tie 1"]);
     }
 
     #[test]

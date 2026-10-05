@@ -547,7 +547,7 @@ fn build_menu(app: &AppHandle, inputs: &MenuInputs) -> tauri::Result<(Menu<tauri
             Some(MenuItem::with_id(
                 app,
                 "mic_silent_warning",
-                template.replace("{{mic}}", mic),
+                mic_silent_label(&template, mic),
                 true,
                 None::<&str>,
             )?)
@@ -730,6 +730,17 @@ fn last_transcript_text(entry: &HistoryEntry) -> &str {
         .unwrap_or(&entry.transcription_text)
 }
 
+/// Doubles `&` so a menu shows it literally instead of as a mnemonic.
+fn escape_menu_mnemonic(text: &str) -> String {
+    text.replace('&', "&&")
+}
+
+/// The silent-mic warning label. The device name is user/OS supplied, so its
+/// `&` is escaped like recent dictations (e.g. "Speakers & Mic Array").
+fn mic_silent_label(template: &str, mic: &str) -> String {
+    template.replace("{{mic}}", &escape_menu_mnemonic(mic))
+}
+
 /// Single-line, length-limited menu label for a dictation. Whitespace runs
 /// (including newlines) collapse to one space, text longer than
 /// [`RECENT_DICTATION_LABEL_CHARS`] characters is cut with an ellipsis, and
@@ -745,7 +756,7 @@ fn recent_dictation_label(text: &str) -> String {
     } else {
         single_line
     };
-    label.replace('&', "&&")
+    escape_menu_mnemonic(&label)
 }
 
 fn recent_dictations_from_entries(entries: &[HistoryEntry]) -> Vec<RecentDictation> {
@@ -906,7 +917,7 @@ pub fn copy_last_transcript(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        last_transcript_text, load_tray_icon, recent_dictation_label,
+        last_transcript_text, load_tray_icon, mic_silent_label, recent_dictation_label,
         recent_dictations_from_entries, MenuInputs, TrayDesired, TrayIconState,
     };
     use crate::managers::history::HistoryEntry;
@@ -1001,6 +1012,14 @@ mod tests {
     #[test]
     fn recent_label_escapes_mnemonic_ampersand() {
         assert_eq!(recent_dictation_label("Q&A notes"), "Q&&A notes");
+    }
+
+    #[test]
+    fn mic_silent_label_escapes_mnemonic_ampersand() {
+        assert_eq!(
+            mic_silent_label("Check {{mic}}", "Speakers & Mic Array"),
+            "Check Speakers && Mic Array"
+        );
     }
 
     #[test]

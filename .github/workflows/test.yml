@@ -25,8 +25,11 @@ jobs:
           # libvulkan-dev + glslc + spirv-headers let transcribe-cpp-sys build
           # ggml's Vulkan backend (the Linux `vulkan` feature). Mirrors the apt
           # set transcribe.cpp's native-ci uses to build -DTRANSCRIBE_VULKAN=ON.
+          # The second line is for xcap (screen context): pipewire/spa via
+          # bindgen (libclang), xcb, gbm, egl and wayland.
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libasound2-dev libssl-dev libgtk-layer-shell-dev \
-            libvulkan-dev glslc spirv-headers
+            libvulkan-dev glslc spirv-headers \
+            libpipewire-0.3-dev libspa-0.2-dev libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev libgbm-dev libegl-dev libwayland-dev libclang-dev
 
       - uses: swatinem/rust-cache@v2
         with:
