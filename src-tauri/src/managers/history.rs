@@ -393,6 +393,15 @@ impl HistoryManager {
         &self.recordings_dir
     }
 
+    /// A fresh, unused WAV file name for a new recording. Millisecond
+    /// resolution keeps a clip skipped by the dead-air guard and a dictation
+    /// started right after it from overwriting each other's audio (the old
+    /// whole-second `handy-{secs}.wav` names collided). The name is stored
+    /// per entry, so existing second-resolution files keep working.
+    pub fn new_recording_file_name(&self) -> String {
+        unique_recording_file_name(&self.recordings_dir, chrono::Utc::now().timestamp_millis())
+    }
+
     /// Save a new history entry to the database.
     /// The WAV file should already have been written to the recordings directory.
     #[allow(clippy::too_many_arguments)]
@@ -1019,10 +1028,39 @@ impl HistoryManager {
     }
 }
 
+/// `handy-{millis}.wav`, with a numeric suffix if that name is already taken
+/// in `dir` (two recordings within the same millisecond).
+fn unique_recording_file_name(dir: &std::path::Path, timestamp_millis: i64) -> String {
+    let base = format!("handy-{}", timestamp_millis);
+    let mut name = format!("{}.wav", base);
+    let mut suffix = 1u32;
+    while dir.join(&name).exists() && suffix < 1_000 {
+        name = format!("{}-{}.wav", base, suffix);
+        suffix += 1;
+    }
+    name
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rusqlite::{params, Connection};
+
+    #[test]
+    fn recording_file_names_use_millis_and_never_reuse_a_taken_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "handy-names-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = unique_recording_file_name(&dir, 1_700_000_000_123);
+        assert_eq!(first, "handy-1700000000123.wav");
+        std::fs::write(dir.join(&first), b"x").unwrap();
+        let second = unique_recording_file_name(&dir, 1_700_000_000_123);
+        assert_eq!(second, "handy-1700000000123-1.wav");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn setup_conn() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory db");

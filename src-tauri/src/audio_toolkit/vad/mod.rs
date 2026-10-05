@@ -52,6 +52,16 @@ pub trait VoiceActivityDetector: Send + Sync {
         None
     }
 
+    /// Raw (pre-smoothing) verdict for the frame most recently pushed.
+    /// Smoothing detectors keep emitting `Speech` during their hangover tail
+    /// even when the inner model hears silence; callers that need "was there
+    /// actual voice in this frame" (tap classification) use this to tell the
+    /// two apart. Detectors without smoothing return None: their `Speech`
+    /// verdict is already the raw one.
+    fn last_frame_voiced(&self) -> Option<bool> {
+        None
+    }
+
     fn reset(&mut self) {}
 }
 

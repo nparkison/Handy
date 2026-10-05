@@ -684,3 +684,64 @@ fn pre_roll_counts_toward_levels_but_not_press_duration() {
     assert_eq!(stats.duration_ms(), 60);
     assert_eq!(stats.peak, 0.5);
 }
+
+/// Live tap stats with a real smoothing VAD in front of an amplitude-keyed
+/// inner model: pre-press speech, then `live` captured after the press.
+fn live_stats_with_smoothed_vad(pre_press: &[f32], live: &[f32]) -> CaptureStats {
+    use crate::audio_toolkit::vad::SmoothedVad;
+    // 15 frames = the offline 450 ms hangover at 30 ms frames.
+    let detector = SmoothedVad::new(Box::new(LoudVad), 15, 15, 2);
+    let vad = VadConfig {
+        detector: Arc::new(Mutex::new(Box::new(detector))),
+        frame_samples: 480,
+        offline_hangover_frames: 15,
+        streaming_hangover_frames: 55,
+    };
+    let (processor, _streamed) = pre_roll_processor(300, Some(vad));
+    let live_sink = Arc::new(Mutex::new(CaptureStats::default()));
+    let mut processor = processor.with_live_stats_sink(Arc::clone(&live_sink));
+    processor.process_raw_chunk(pre_press, ChunkDisposition::Discard);
+    let (ready_tx, _ready_rx) = mpsc::channel();
+    processor.begin_recording(VadPolicy::Offline, ready_tx);
+    processor.process_raw_chunk(live, ChunkDisposition::Capture);
+    processor.finish_recording();
+    let stats = *live_sink.lock().unwrap();
+    stats
+}
+
+/// Inner model: voice whenever the frame is clearly above silence.
+struct LoudVad;
+
+impl VoiceActivityDetector for LoudVad {
+    fn push_frame<'a>(&'a mut self, frame: &'a [f32]) -> anyhow::Result<VadFrame<'a>> {
+        if frame.iter().any(|&sample| sample.abs() > 0.1) {
+            Ok(VadFrame::Speech(frame))
+        } else {
+            Ok(VadFrame::Noise)
+        }
+    }
+
+    fn frame_samples(&self) -> usize {
+        480
+    }
+}
+
+#[test]
+fn hangover_from_pre_roll_speech_does_not_make_a_silent_tap_speech() {
+    // The user finishes a sentence, then taps for 200 ms in silence. The
+    // smoothing hangover (450 ms) started in the pre-roll and still emits
+    // `Speech` for the live frames, but none of them is voiced.
+    let live = live_stats_with_smoothed_vad(&[0.5; 4_800], &[0.0; 3_200]);
+    assert!(live.vad_active);
+    assert_eq!(live.speech_samples, 0, "hangover-only frames are not speech");
+    assert!(!live.has_speech());
+}
+
+#[test]
+fn voiced_live_frames_still_count_as_speech_with_smoothed_vad() {
+    let live = live_stats_with_smoothed_vad(&[0.5; 4_800], &[0.5; 3_200]);
+    assert!(live.has_speech());
+
+    let live = live_stats_with_smoothed_vad(&[0.0; 4_800], &[0.5; 3_200]);
+    assert!(live.has_speech(), "fresh onset after the press is speech");
+}
