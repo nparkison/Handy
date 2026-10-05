@@ -148,6 +148,9 @@ pub async fn retry_history_entry_transcription(
             transcription,
             processed.post_processed_text,
             processed.post_process_prompt,
+            // Retry can turn cleanup on for an entry that never had it (every
+            // dictation is cleaned up now); record that so a failure shows.
+            post_process,
             processed.context,
         )
         .map(|_| ())

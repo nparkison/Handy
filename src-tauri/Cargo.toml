@@ -72,7 +72,7 @@ regex = "1"
 whatlang = "0.16"
 isolang = "2"
 chrono = "0.4"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled", "functions"] }
 tar = "0.4.44"
 flate2 = "1.0"
 sha2 = "0.10"
