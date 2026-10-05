@@ -329,7 +329,9 @@ pub(crate) async fn run_cleanup(
                     model
                 );
             } else {
-                request.report.mark_sent(false);
+                // Recorded before sending: if the request fails, the image
+                // may still have left the machine, and History says so.
+                request.report.mark_screenshot_uploaded();
                 sent.mark();
                 if let Some(result) = post_process_with_screen_context(
                     &provider,

@@ -594,7 +594,8 @@
         "cleanedUpLate": "Cleaned up late"
       },
       "contextSent": "Sent: {{details}}",
-      "screenshotShared": "Screenshot shared"
+      "screenshotShared": "Screenshot shared",
+      "screenshotSentUnused": "Screenshot sent (not used)"
     },
     "debug": {
       "title": "デバッグ",

@@ -1308,7 +1308,15 @@ export type GpuDeviceOption = { id: string; name: string; total_vram_mb: number 
  * What app context was sent with an entry's cleanup request: never the
  * screenshot itself, only whether one was shared.
  */
-export type HistoryContext = { app: string | null; title: string | null; screenshot: boolean }
+export type HistoryContext = { app: string | null; title: string | null; 
+/**
+ * The screenshot shaped the cleanup that was used.
+ */
+screenshot: boolean; 
+/**
+ * The screenshot was uploaded (it left the machine), used or not.
+ */
+screenshot_sent?: boolean }
 export type HistoryEntry = { id: number; file_name: string; timestamp: number; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; post_process_requested: boolean; cleanup_state: CleanupState | null; 
 /**
  * App context sent with the cleanup request (`None` when none was sent).

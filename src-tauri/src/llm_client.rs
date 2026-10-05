@@ -3,7 +3,7 @@ use log::{debug, error, info};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, REFERER, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -131,13 +131,22 @@ fn remember_rejection(key: String) {
     }
 }
 
-/// Endpoints (base_url|model) that rejected an image request with a 4xx
-/// while it carried no other optional fields: the model cannot read images.
-/// Remembered for the process lifetime so later dictations skip the doomed
-/// upload and go straight to the text request.
+/// Endpoints (base_url|model) known not to read images: an image request was
+/// refused with an error that names images, or was refused ambiguously while
+/// a text request with the same optional fields then succeeded. Remembered
+/// for the process lifetime so later dictations skip the doomed upload (and
+/// the press-time capture).
 fn image_rejections() -> &'static Mutex<HashSet<String>> {
     static REJECTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     REJECTED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Endpoints whose image request got an ambiguous 400/422 (no mention of
+/// images). Value: whether that request carried reasoning-disable fields.
+/// Settled by the text fallback that follows (see [`settle_image_suspicion`]).
+fn image_suspicions() -> &'static Mutex<HashMap<String, bool>> {
+    static SUSPECTED: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    SUSPECTED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Has this provider + model already rejected an image request?
@@ -148,9 +157,79 @@ pub fn rejects_images(provider: &PostProcessProvider, model: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Test hook: mark `provider` + `model` as refusing images.
+#[cfg(test)]
+pub(crate) fn mark_rejects_images(provider: &PostProcessProvider, model: &str) {
+    remember_image_rejection(endpoint_key(provider, model));
+}
+
 fn remember_image_rejection(key: String) {
     if let Ok(mut set) = image_rejections().lock() {
         set.insert(key);
+    }
+}
+
+/// How an image request's error answer is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageFailure {
+    /// The endpoint says it can't take images (OpenRouter answers 404 "no
+    /// endpoints found that support image input"; others 400/422 naming
+    /// images or modalities).
+    Unsupported,
+    /// The image was too large this time: a smaller one may work later.
+    TooLarge,
+    /// A 400/422 that doesn't say why: the image, or an optional field.
+    Ambiguous,
+    /// Anything else (auth, rate limit, server error): says nothing about images.
+    Unrelated,
+}
+
+fn classify_image_failure(status: u16, body: &str) -> ImageFailure {
+    let body = body.to_lowercase();
+    let too_large = status == 413
+        || ["too large", "too big", "exceeds", "maximum size", "max size"]
+            .iter()
+            .any(|needle| body.contains(needle));
+    if too_large {
+        return ImageFailure::TooLarge;
+    }
+    if !matches!(status, 400 | 404 | 422) {
+        return ImageFailure::Unrelated;
+    }
+    let names_images = ["image", "vision", "multimodal", "multi-modal", "modalit"]
+        .iter()
+        .any(|needle| body.contains(needle));
+    if names_images {
+        ImageFailure::Unsupported
+    } else if status == 404 {
+        // A 404 that doesn't mention images is a wrong URL or model name.
+        ImageFailure::Unrelated
+    } else {
+        ImageFailure::Ambiguous
+    }
+}
+
+fn suspect_image_rejection(key: String, carried_reasoning: bool) {
+    if let Ok(mut map) = image_suspicions().lock() {
+        map.insert(key, carried_reasoning);
+    }
+}
+
+/// A text request to `key` succeeded. If an image request to it failed
+/// ambiguously with the same optional fields, the image was the culprit:
+/// remember the rejection. If the text request only worked after dropping
+/// the reasoning fields, those fields were the likelier culprit, and the next
+/// image request goes without them anyway, so the suspicion is dropped.
+fn settle_image_suspicion(key: &str, carried_reasoning: bool, retried: bool) {
+    let suspicion = image_suspicions()
+        .lock()
+        .ok()
+        .and_then(|mut map| map.remove(key));
+    if let Some(image_carried_reasoning) = suspicion {
+        if !retried && image_carried_reasoning == carried_reasoning {
+            info!("Text request succeeded where the image request failed; sending text only from now on");
+            remember_image_rejection(key.to_string());
+        }
     }
 }
 
@@ -461,9 +540,10 @@ pub async fn send_chat_completion_with_schema(
 /// message made of an image (base64-encoded, of type `image_mime`) and text.
 ///
 /// Uses the same request path as `send_chat_completion_with_schema`
-/// (`stream: false`, reasoning-disable fields), but never retries: a 4xx
-/// without optional fields marks the model as text-only (see
-/// [`rejects_images`]).
+/// (`stream: false`, reasoning-disable fields), but never retries. An error
+/// that names images marks the model as text-only; an ambiguous 400/422 does
+/// so only once a text request with the same fields succeeds; a too-large
+/// refusal never does (see [`rejects_images`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn send_chat_completion_with_image(
     provider: &PostProcessProvider,
@@ -569,6 +649,8 @@ async fn send_chat_request(
         sanitized_url(response.url())
     );
 
+    let carried_reasoning = !request_body.reasoning.is_empty();
+    let mut retried = false;
     // A 400/422 on a request carrying reasoning-disable fields is almost always
     // the endpoint rejecting those fields — retry once without them. Never for
     // an image request: the image is the likelier culprit, re-uploading it
@@ -576,20 +658,7 @@ async fn send_chat_request(
     // rejection on its own.
     if !status.is_success()
         && matches!(status.as_u16(), 400 | 422)
-        && has_image
-        && request_body.reasoning.is_empty()
-    {
-        info!(
-            "'{}' (model '{}') rejected an image request (status {}); sending text only from now on",
-            sanitized_url_for_log(base_url),
-            model,
-            status
-        );
-        remember_image_rejection(key.clone());
-    }
-    if !status.is_success()
-        && matches!(status.as_u16(), 400 | 422)
-        && !request_body.reasoning.is_empty()
+        && carried_reasoning
         && !has_image
     {
         let error_text = response.text().await.unwrap_or_else(|e| {
@@ -601,6 +670,7 @@ async fn send_chat_request(
         );
 
         request_body.reasoning = ReasoningParams::default();
+        retried = true;
         response = client
             .post(&url)
             .json(&request_body)
@@ -620,7 +690,7 @@ async fn send_chat_request(
                 "Retry without reasoning fields succeeded; '{}' (model '{}') will skip them from now on",
                 sanitized_url_for_log(base_url), model
             );
-            remember_rejection(key);
+            remember_rejection(key.clone());
         }
     }
 
@@ -629,10 +699,34 @@ async fn send_chat_request(
             .text()
             .await
             .unwrap_or_else(|e| report_reqwest_error("Failed to read API error response", &e));
+        if has_image {
+            match classify_image_failure(status.as_u16(), &error_text) {
+                ImageFailure::Unsupported => {
+                    info!(
+                        "'{}' (model '{}') does not accept images (status {}); sending text only from now on",
+                        sanitized_url_for_log(base_url),
+                        model,
+                        status
+                    );
+                    remember_image_rejection(key);
+                }
+                ImageFailure::Ambiguous => suspect_image_rejection(key, carried_reasoning),
+                ImageFailure::TooLarge => info!(
+                    "'{}' (model '{}') refused the screenshot as too large (status {}); will try again next time",
+                    sanitized_url_for_log(base_url),
+                    model,
+                    status
+                ),
+                ImageFailure::Unrelated => {}
+            }
+        }
         return Err(format!(
             "API request failed with status {}: {}",
             status, error_text
         ));
+    }
+    if !has_image {
+        settle_image_suspicion(&key, carried_reasoning, retried);
     }
 
     let completion: ChatCompletionResponse = response
@@ -715,6 +809,83 @@ pub async fn fetch_models(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_failures_are_classified_by_status_and_body() {
+        // OpenRouter: model without image input.
+        assert_eq!(
+            classify_image_failure(404, "No endpoints found that support image input"),
+            ImageFailure::Unsupported
+        );
+        assert_eq!(
+            classify_image_failure(400, "This model does not support vision"),
+            ImageFailure::Unsupported
+        );
+        assert_eq!(
+            classify_image_failure(422, "unsupported input modality"),
+            ImageFailure::Unsupported
+        );
+        // Too large is never a capability verdict.
+        assert_eq!(
+            classify_image_failure(413, "Request Entity Too Large"),
+            ImageFailure::TooLarge
+        );
+        assert_eq!(
+            classify_image_failure(400, "image exceeds 5 MB maximum"),
+            ImageFailure::TooLarge
+        );
+        assert_eq!(
+            classify_image_failure(400, "unknown field: reasoning"),
+            ImageFailure::Ambiguous
+        );
+        assert_eq!(
+            classify_image_failure(404, "model not found"),
+            ImageFailure::Unrelated
+        );
+        assert_eq!(
+            classify_image_failure(401, "image not allowed for this key"),
+            ImageFailure::Unrelated
+        );
+        assert_eq!(
+            classify_image_failure(500, "internal error"),
+            ImageFailure::Unrelated
+        );
+    }
+
+    fn vision_provider(base_url: &str) -> PostProcessProvider {
+        PostProcessProvider {
+            id: "custom".to_string(),
+            label: "Custom".to_string(),
+            base_url: base_url.to_string(),
+            allow_base_url_edit: true,
+            models_endpoint: None,
+            supports_structured_output: false,
+            supports_vision: true,
+        }
+    }
+
+    #[test]
+    fn ambiguous_image_failure_is_learned_only_when_text_with_same_fields_works() {
+        let provider = vision_provider("http://suspect-same-fields.test/v1");
+        let key = endpoint_key(&provider, "m");
+        suspect_image_rejection(key.clone(), true);
+        assert!(!rejects_images(&provider, "m"), "one ambiguous 400 is not proof");
+        settle_image_suspicion(&key, true, false);
+        assert!(rejects_images(&provider, "m"));
+    }
+
+    #[test]
+    fn ambiguous_image_failure_is_dropped_when_reasoning_fields_were_the_problem() {
+        let provider = vision_provider("http://suspect-reasoning.test/v1");
+        let key = endpoint_key(&provider, "m");
+        suspect_image_rejection(key.clone(), true);
+        // The text request needed the reasoning-free retry.
+        settle_image_suspicion(&key, true, true);
+        assert!(!rejects_images(&provider, "m"));
+        // And the suspicion is gone: a later clean text success learns nothing.
+        settle_image_suspicion(&key, true, false);
+        assert!(!rejects_images(&provider, "m"));
+    }
     use std::fmt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

@@ -307,18 +307,33 @@ pub fn context_block(context: &SharedContext) -> String {
 }
 
 /// What a cleanup request actually sent, filled in by the request itself.
+/// `screenshot_uploaded` (the image left the machine) and `screenshot`
+/// (the image shaped the cleanup that was used) are kept apart: a vision
+/// request that fails still uploaded the screenshot, and History must say so.
 #[derive(Debug, Default)]
 pub struct ContextReport {
     sent: AtomicBool,
     screenshot: AtomicBool,
+    screenshot_uploaded: AtomicBool,
 }
 
 impl ContextReport {
     pub fn mark_sent(&self, with_screenshot: bool) {
         self.sent.store(true, Ordering::Release);
         if with_screenshot {
+            self.screenshot_uploaded.store(true, Ordering::Release);
             self.screenshot.store(true, Ordering::Release);
         }
+    }
+
+    /// A request carrying the screenshot is about to go out.
+    pub fn mark_screenshot_uploaded(&self) {
+        self.sent.store(true, Ordering::Release);
+        self.screenshot_uploaded.store(true, Ordering::Release);
+    }
+
+    pub fn screenshot_uploaded(&self) -> bool {
+        self.screenshot_uploaded.load(Ordering::Acquire)
     }
 
     pub fn was_sent(&self) -> bool {
@@ -395,19 +410,30 @@ impl CleanupRequest {
             app: self.context.as_ref().and_then(|c| c.app_name.clone()),
             title: self.context.as_ref().and_then(|c| c.window_title.clone()),
             screenshot: self.report.screenshot_sent(),
+            screenshot_sent: self.report.screenshot_uploaded(),
         }
     }
 }
 
 /// A screenshot is captured only for a matched rule that opted in, only
-/// when the active provider accepts images, and never while "Share app info"
-/// is Off (Off means nothing about the app leaves the machine).
+/// when the active provider accepts images (and its model hasn't refused one
+/// this session), and never while "Share app info" is Off (Off means nothing
+/// about the app leaves the machine).
 pub fn screenshot_wanted(settings: &AppSettings, rule: Option<&AppRule>) -> bool {
     settings.app_context_mode != AppContextMode::Off
         && rule.is_some_and(|rule| rule.screenshot)
         && settings
             .active_post_process_provider()
-            .is_some_and(|provider| provider.supports_vision)
+            .is_some_and(|provider| {
+                provider.supports_vision && {
+                    let model = settings
+                        .post_process_models
+                        .get(&provider.id)
+                        .map(String::as_str)
+                        .unwrap_or_default();
+                    !crate::llm_client::rejects_images(provider, model)
+                }
+            })
 }
 
 #[cfg(test)]
@@ -659,6 +685,27 @@ mod tests {
         assert!(!screenshot_wanted(&settings, Some(&r)));
         settings.app_context_mode = AppContextMode::AppName;
         settings.post_process_provider_id = text_only;
+        assert!(!screenshot_wanted(&settings, Some(&r)));
+    }
+
+    #[test]
+    fn no_screenshot_once_the_model_refused_images() {
+        let mut settings = get_default_settings();
+        let mut r = rule("r", AppRuleMatch::App, "slack", "p");
+        r.screenshot = true;
+        let provider = settings
+            .post_process_providers
+            .iter()
+            .find(|p| p.supports_vision)
+            .unwrap()
+            .clone();
+        settings.post_process_provider_id = provider.id.clone();
+        settings.app_context_mode = AppContextMode::AppName;
+        settings
+            .post_process_models
+            .insert(provider.id.clone(), "text-only-model-for-test".to_string());
+        assert!(screenshot_wanted(&settings, Some(&r)));
+        crate::llm_client::mark_rejects_images(&provider, "text-only-model-for-test");
         assert!(!screenshot_wanted(&settings, Some(&r)));
     }
 

@@ -502,16 +502,21 @@ const ContextLine: React.FC<{ entry: HistoryEntry }> = ({ entry }) => {
   const context = entry.context;
   if (!context) return null;
   const sent = [context.app, context.title].filter(Boolean).join(" - ");
-  if (!sent && !context.screenshot) return null;
+  // An uploaded screenshot is shown even when the cleanup didn't use it:
+  // if an image left the machine, History says so.
+  const shotUploaded = context.screenshot || context.screenshot_sent === true;
+  if (!sent && !shotUploaded) return null;
   return (
     <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-text/60 break-words">
       {sent && (
         <span>{t("settings.history.contextSent", { details: sent })}</span>
       )}
-      {context.screenshot && (
+      {shotUploaded && (
         <span className="inline-flex items-center gap-1">
           <Camera width={12} height={12} aria-hidden="true" />
-          {t("settings.history.screenshotShared")}
+          {context.screenshot
+            ? t("settings.history.screenshotShared")
+            : t("settings.history.screenshotSentUnused")}
         </span>
       )}
     </p>

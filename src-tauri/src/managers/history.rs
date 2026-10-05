@@ -53,6 +53,9 @@ const FORK_COLUMNS: &[(&str, &str)] = &[
     // Executable/app identifier rules match on (e.g. `slack.exe`), so a retry
     // re-selects the same app rule. Local only: never shared or shown.
     ("context_process", "TEXT"),
+    // The screenshot left the machine (uploaded with a vision request), even
+    // when that request failed and the cleanup didn't use it.
+    ("context_screenshot_sent", "BOOLEAN NOT NULL DEFAULT 0"),
 ];
 
 /// Builds before this fix recorded the fork columns as migrations 5 (cleanup
@@ -143,7 +146,7 @@ macro_rules! entry_columns {
     () => {
         "id, file_name, timestamp, saved, title, transcription_text, post_processed_text, \
          post_process_prompt, post_process_requested, cleanup_state, context_app, \
-         context_title, context_screenshot"
+         context_title, context_screenshot, context_screenshot_sent"
     };
 }
 
@@ -153,13 +156,18 @@ macro_rules! entry_columns {
 pub struct HistoryContext {
     pub app: Option<String>,
     pub title: Option<String>,
+    /// The screenshot shaped the cleanup that was used.
     pub screenshot: bool,
+    /// The screenshot was uploaded (it left the machine), used or not.
+    #[serde(default)]
+    pub screenshot_sent: bool,
 }
 
 impl HistoryContext {
     /// `None` when nothing was shared.
     pub fn into_option(self) -> Option<Self> {
-        (self.app.is_some() || self.title.is_some() || self.screenshot).then_some(self)
+        (self.app.is_some() || self.title.is_some() || self.screenshot || self.screenshot_sent)
+            .then_some(self)
     }
 }
 
@@ -384,6 +392,7 @@ impl HistoryManager {
                 app: row.get("context_app")?,
                 title: row.get("context_title")?,
                 screenshot: row.get("context_screenshot")?,
+                screenshot_sent: row.get("context_screenshot_sent")?,
             }
             .into_option(),
         })
@@ -434,8 +443,9 @@ impl HistoryManager {
                 context_app,
                 context_title,
                 context_screenshot,
-                context_process
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                context_process,
+                context_screenshot_sent
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 &file_name,
                 timestamp,
@@ -450,6 +460,7 @@ impl HistoryManager {
                 &context.title,
                 context.screenshot,
                 &match_process,
+                context.screenshot_sent,
             ],
         )?;
 
@@ -555,7 +566,9 @@ impl HistoryManager {
                  cleanup_state = NULL,
                  context_app = CASE WHEN ?9 THEN context_app ELSE ?4 END,
                  context_title = CASE WHEN ?9 THEN context_title ELSE ?5 END,
-                 context_screenshot = CASE WHEN ?9 THEN context_screenshot ELSE ?6 END
+                 context_screenshot = CASE WHEN ?9 THEN context_screenshot ELSE ?6 END,
+                 context_screenshot_sent =
+                     CASE WHEN ?9 THEN context_screenshot_sent ELSE ?10 END
              WHERE id = ?7",
             params![
                 transcription_text,
@@ -566,7 +579,8 @@ impl HistoryManager {
                 context.screenshot,
                 id,
                 post_process_requested,
-                keep_context
+                keep_context,
+                context.screenshot_sent
             ],
         )?)
     }
@@ -609,7 +623,8 @@ impl HistoryManager {
             }) => conn.execute(
                 "UPDATE transcription_history
                  SET post_processed_text = ?1, post_process_prompt = ?2, cleanup_state = ?3,
-                     context_screenshot = (context_screenshot OR ?6)
+                     context_screenshot = (context_screenshot OR ?6),
+                     context_screenshot_sent = (context_screenshot_sent OR ?6)
                  WHERE id = ?4 AND cleanup_state = ?5",
                 params![
                     text,
@@ -1079,7 +1094,8 @@ mod tests {
                 context_app TEXT,
                 context_title TEXT,
                 context_screenshot BOOLEAN NOT NULL DEFAULT 0,
-                context_process TEXT
+                context_process TEXT,
+                context_screenshot_sent BOOLEAN NOT NULL DEFAULT 0
             );",
         )
         .expect("create transcription_history table");
@@ -1580,6 +1596,7 @@ mod tests {
                 app: Some("slack".into()),
                 title: Some("#general".into()),
                 screenshot: true,
+                screenshot_sent: false,
             })
         );
 
@@ -1628,6 +1645,7 @@ mod tests {
                 app: Some("Slack".into()),
                 title: None,
                 screenshot: false,
+                screenshot_sent: false,
             })
         );
         let first = HistoryManager::query_history_page(&conn, None, None, None)
@@ -1651,5 +1669,38 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(shot_only.clone().into_option(), Some(shot_only));
+        // An upload that the cleanup didn't use still shows in History.
+        let sent_only = HistoryContext {
+            screenshot_sent: true,
+            ..Default::default()
+        };
+        assert_eq!(sent_only.clone().into_option(), Some(sent_only));
+    }
+
+    #[test]
+    fn uploaded_screenshot_is_recorded_even_when_unused() {
+        let conn = setup_conn();
+        insert_entry(&conn, 1, "um hi", None);
+        HistoryManager::update_transcription_with_conn(
+            &conn,
+            1,
+            "hi".into(),
+            Some("Hi.".into()),
+            None,
+            true,
+            Some(HistoryContext {
+                app: Some("Slack".into()),
+                title: None,
+                screenshot: false,
+                screenshot_sent: true,
+            }),
+        )
+        .expect("update");
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .expect("fetch")
+            .expect("entry");
+        let context = entry.context.expect("context");
+        assert!(context.screenshot_sent);
+        assert!(!context.screenshot);
     }
 }
