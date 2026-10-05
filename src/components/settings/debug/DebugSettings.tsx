@@ -14,6 +14,7 @@ import { ClamshellMicrophoneSelector } from "../ClamshellMicrophoneSelector";
 import { UpdateChecksToggle } from "../UpdateChecksToggle";
 import { WhatsNewPreview } from "./WhatsNewPreview";
 import { KeyboardDiagnostic } from "./KeyboardDiagnostic";
+import { ReplayBench } from "./replay-bench/ReplayBench";
 import {
   OnboardingPreview,
   type OnboardingPreviewStep,
@@ -21,10 +22,12 @@ import {
 
 interface DebugSettingsProps {
   onPreviewOnboarding?: (step: OnboardingPreviewStep) => void;
+  onOpenModels?: () => void;
 }
 
 export const DebugSettings: React.FC<DebugSettingsProps> = ({
   onPreviewOnboarding,
+  onOpenModels,
 }) => {
   const { t } = useTranslation();
 
@@ -62,6 +65,7 @@ export const DebugSettings: React.FC<DebugSettingsProps> = ({
         <KeyboardDiagnostic />
         <LiveLogViewer descriptionMode="tooltip" grouped={true} />
       </SettingsGroup>
+      <ReplayBench onOpenModels={onOpenModels} />
     </div>
   );
 };
