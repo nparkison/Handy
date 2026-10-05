@@ -534,6 +534,7 @@
           "description": "Use a different prompt, or let the model see your screen, in specific apps.",
           "empty": "No app rules yet. Every app uses your Selected Prompt.",
           "add": "Add rule",
+          "limitReached": "You can have up to {{max}} app rules. Delete one to add another.",
           "recentApps": "Apps from recent dictations",
           "typeAppName": "Type an app name...",
           "cancel": "Cancel",

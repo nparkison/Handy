@@ -2,8 +2,12 @@ import React, { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { useSettings } from "../../hooks/useSettings";
+import { useSettingsStore } from "../../stores/settingsStore";
 import { Input } from "../ui/Input";
 import { SettingContainer } from "../ui/SettingContainer";
+
+const MIN_HISTORY_LIMIT = 0;
+const MAX_HISTORY_LIMIT = 1000;
 
 interface HistoryLimitProps {
   descriptionMode?: "tooltip" | "inline";
@@ -27,10 +31,21 @@ export const HistoryLimit: React.FC<HistoryLimitProps> = ({
     setDraft(String(historyLimit));
   }, [historyLimit]);
 
+  const reset = () => setDraft(String(historyLimit));
+
   const commit = async () => {
-    const value = parseInt(draft, 10);
-    if (isNaN(value) || value < 0 || value === historyLimit) {
-      setDraft(String(historyLimit));
+    const trimmed = draft.trim();
+    const parsed = Number(trimmed);
+    if (trimmed === "" || !Number.isInteger(parsed)) {
+      reset();
+      return;
+    }
+    const value = Math.min(
+      MAX_HISTORY_LIMIT,
+      Math.max(MIN_HISTORY_LIMIT, parsed),
+    );
+    if (value === historyLimit) {
+      reset();
       return;
     }
     // The limit only prunes under the count-based retention setting.
@@ -38,19 +53,36 @@ export const HistoryLimit: React.FC<HistoryLimitProps> = ({
       (retention ?? "preserve_limit") === "preserve_limit" &&
       value < historyLimit;
     if (prunes) {
-      const confirmed = await ask(
-        t("settings.debug.historyLimit.lowerConfirm", { count: value }),
-        {
-          title: t("settings.debug.historyLimit.lowerTitle"),
-          kind: "warning",
-        },
-      );
+      let confirmed = false;
+      try {
+        confirmed = await ask(
+          t("settings.debug.historyLimit.lowerConfirm", { count: value }),
+          {
+            title: t("settings.debug.historyLimit.lowerTitle"),
+            kind: "warning",
+          },
+        );
+      } catch (error) {
+        console.error("Failed to confirm history limit change:", error);
+      }
       if (!confirmed) {
-        setDraft(String(historyLimit));
+        reset();
         return;
       }
     }
-    updateSetting("history_limit", value);
+    await updateSetting("history_limit", value);
+    // A failed save is rolled back in the store; show what is actually saved.
+    const saved = useSettingsStore.getState().settings?.history_limit;
+    setDraft(String(saved ?? historyLimit));
+  };
+
+  const handleBlur = () => {
+    // Blur also fires when the whole window loses focus or is hidden (alt-tab,
+    // close to tray). Don't commit then: a confirm dialog would pop up over
+    // another app or a hidden window. The draft stays and commits on the next
+    // real blur.
+    if (document.hidden || !document.hasFocus()) return;
+    void commit();
   };
 
   return (
@@ -64,16 +96,16 @@ export const HistoryLimit: React.FC<HistoryLimitProps> = ({
       <div className="flex items-center space-x-2">
         <Input
           type="number"
-          min="0"
-          max="1000"
+          min={MIN_HISTORY_LIMIT}
+          max={MAX_HISTORY_LIMIT}
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
-          onBlur={() => void commit()}
+          onBlur={handleBlur}
           onKeyDown={(event) => {
             if (event.key === "Enter") {
               event.currentTarget.blur();
             } else if (event.key === "Escape") {
-              setDraft(String(historyLimit));
+              reset();
             }
           }}
           disabled={isUpdating("history_limit")}

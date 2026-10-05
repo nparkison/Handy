@@ -157,7 +157,12 @@ const settingUpdaters: {
   auto_submit: (value) => commands.changeAutoSubmitSetting(value as boolean),
   auto_submit_key: (value) =>
     commands.changeAutoSubmitKeySetting(value as string),
-  history_limit: (value) => commands.updateHistoryLimit(value as number),
+  history_limit: async (value) => {
+    const result = await commands.updateHistoryLimit(value as number);
+    if (result.status === "error") {
+      throw new Error(result.error);
+    }
+  },
   post_process_enabled: (value) =>
     commands.changePostProcessEnabledSetting(value as boolean),
   app_context_mode: (value) =>
