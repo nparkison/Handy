@@ -1287,7 +1287,7 @@ pub fn get_settings(app: &AppHandle) -> AppSettings {
         store.set("settings", serde_json::to_value(&settings).unwrap());
     }
 
-    crate::cockpit::sync_settings(&settings);
+    crate::cockpit::sync_settings_on_read(&settings);
     settings
 }
 
