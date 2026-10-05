@@ -20,6 +20,12 @@ type OverlayState =
   | "processing"
   | "notice";
 
+/** What the running cleanup shares (overlay.rs `emit_cleanup_context`). */
+interface CleanupContext {
+  app: string | null;
+  screenshot: boolean;
+}
+
 // Number of reactive bars in the waveform (the simple, smoothed style shared by
 // every overlay form). Mic levels arrive as 16 FFT buckets; we take the first N.
 const WAVE_BARS = 9;
@@ -69,6 +75,11 @@ const RecordingOverlay: React.FC = () => {
   // Show events finish asynchronously (settings I/O); only the newest one may
   // apply its state, so a slow notice can never override a newer press.
   const showSeqRef = useRef(0);
+  // App context chip for "Cleaning up... · Slack" (+ camera if a screenshot
+  // was shared). Cleared whenever a new dictation starts.
+  const [cleanupContext, setCleanupContext] = useState<CleanupContext | null>(
+    null,
+  );
 
   useEffect(() => {
     const readPlacement = async () => {
@@ -95,6 +106,13 @@ const RecordingOverlay: React.FC = () => {
         // Reset synchronously before settings I/O. A fast microphone can emit
         // recording-ready while the awaits below are in flight; resetting after
         // them would overwrite that event and leave the overlay stuck arming.
+        if (
+          overlayState === "recording" ||
+          overlayState === "streaming" ||
+          overlayState === "transcribing"
+        ) {
+          setCleanupContext(null);
+        }
         if (overlayState === "recording" || overlayState === "streaming") {
           setCaptureReady(false);
           smoothedLevelsRef.current = Array(16).fill(0);
@@ -139,6 +157,13 @@ const RecordingOverlay: React.FC = () => {
         },
       );
 
+      const unlistenContext = await listen<CleanupContext>(
+        "cleanup-context",
+        (event) => {
+          setCleanupContext(event.payload);
+        },
+      );
+
       const unlistenReady = await listen("recording-ready", () => {
         setElapsed(0);
         setCaptureReady(true);
@@ -170,6 +195,7 @@ const RecordingOverlay: React.FC = () => {
         unlistenShow();
         unlistenHide();
         unlistenNotice();
+        unlistenContext();
         unlistenReady();
         unlistenLevel();
         unlistenStream();
@@ -287,15 +313,53 @@ const RecordingOverlay: React.FC = () => {
 
   // spinner (left) | label (center) | cancel (right) — same 3-zone grid as the
   // listening row, so the label is centered.
-  const workingRow = (label: string, showCancel: boolean) => (
+  const workingRow = (
+    label: string,
+    showCancel: boolean,
+    screenshotShared = false,
+  ) => (
     <div className="sbase">
       <div className="sbase-l">
         <span className="sspinner" />
       </div>
-      <span className="swork-label">{label}</span>
+      <span className={`swork-label ${screenshotShared ? "with-icon" : ""}`}>
+        <span className="swork-text">{label}</span>
+        {screenshotShared && (
+          <span
+            className="scamera"
+            role="img"
+            aria-label={t("overlay.screenshotShared")}
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path
+                d="M2 5.2 H4.6 L5.8 3.6 H10.2 L11.4 5.2 H14 V12.6 H2 Z"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.3"
+                strokeLinejoin="round"
+              />
+              <circle
+                cx="8"
+                cy="8.8"
+                r="2.2"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.3"
+              />
+            </svg>
+          </span>
+        )}
+      </span>
       <div className="sbase-r">{showCancel && cancelBtn}</div>
     </div>
   );
+
+  // "Cleaning up..." plus the app chip when app info is shared.
+  const cleanupLabel = cleanupContext?.app
+    ? t("overlay.processingWithApp", { app: cleanupContext.app })
+    : t("overlay.processing");
+  const cleanupScreenshot = cleanupContext?.screenshot ?? false;
+  const hasCleanupChip = Boolean(cleanupContext?.app) || cleanupScreenshot;
 
   // ---- Notice: icon + one short line + optional action button ----
   if (state === "notice" && notice) {
@@ -402,14 +466,15 @@ const RecordingOverlay: React.FC = () => {
     // when there was no text to preserve.
     const open = hasText;
     const collapsed = working && !hasText;
+    const polishing = working && workKind === "polishing";
 
     return (
       <div dir={direction} className={`ov-stage ${position}`}>
         <div
           key={session}
           className={`scard ${open ? "open" : ""} ${collapsed ? "working" : ""} ${
-            isVisible ? "" : "leaving"
-          }`}
+            polishing && hasCleanupChip ? "ctx" : ""
+          } ${isVisible ? "" : "leaving"}`}
         >
           <div className="stext">
             <div className="stext-clip">
@@ -431,12 +496,9 @@ const RecordingOverlay: React.FC = () => {
             </div>
           </div>
           {working
-            ? workingRow(
-                workKind === "polishing"
-                  ? t("overlay.processing")
-                  : t("overlay.transcribing"),
-                true,
-              )
+            ? polishing
+              ? workingRow(cleanupLabel, true, cleanupScreenshot)
+              : workingRow(t("overlay.transcribing"), true)
             : listeningRow(open, true)}
         </div>
       </div>
@@ -447,10 +509,8 @@ const RecordingOverlay: React.FC = () => {
   // spinner + label (transcribing / processing). Never both. The pill animates its
   // width between them; the cancel button is in both rows so it stays put.
   const working = state === "transcribing" || state === "processing";
-  const workLabel =
-    state === "processing"
-      ? t("overlay.processing")
-      : t("overlay.transcribing");
+  const processing = state === "processing";
+  const workLabel = processing ? cleanupLabel : t("overlay.transcribing");
 
   return (
     <div
@@ -458,9 +518,13 @@ const RecordingOverlay: React.FC = () => {
       className={`ov-stage ${position} ov-fade ${isVisible ? "show" : ""}`}
     >
       <div
-        className={`scard compact ${working && isVisible ? "cworking" : ""}`}
+        className={`scard compact ${working && isVisible ? "cworking" : ""} ${
+          processing && hasCleanupChip ? "ctx" : ""
+        }`}
       >
-        {working ? workingRow(workLabel, true) : listeningRow(false, true)}
+        {working
+          ? workingRow(workLabel, true, processing && cleanupScreenshot)
+          : listeningRow(false, true)}
       </div>
     </div>
   );

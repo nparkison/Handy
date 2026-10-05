@@ -466,6 +466,33 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Cleanup context chip ("Cleaning up... · Slack" + camera): the text keeps the
+   ellipsis safety net while the camera icon never gets clipped. */
+.swork-label.with-icon {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.swork-label.with-icon .swork-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.scamera {
+  flex: none;
+  display: inline-flex;
+  width: 13px;
+  height: 13px;
+}
+.scamera svg {
+  width: 100%;
+  height: 100%;
+}
+/* A working pill carrying the app chip is a little wider (the compact native
+   window, OVERLAY_WIDTH in overlay.rs, is 256 wide). */
+.scard.ctx {
+  --ov-work-w: 248px;
+}
 
 /* ============================================================
    Notice (overlay_notice.rs): icon + one short line + optional action. Grows
