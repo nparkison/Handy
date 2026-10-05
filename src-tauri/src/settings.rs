@@ -1,5 +1,5 @@
 use crate::utils;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use specta::Type;
@@ -92,6 +92,47 @@ pub struct LLMPrompt {
     pub id: String,
     pub name: String,
     pub prompt: String,
+}
+
+/// How much about the app being dictated into is shared with the cleanup
+/// model. Matching app rules always happens locally, whatever this is.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AppContextMode {
+    Off,
+    AppName,
+    #[default]
+    AppAndTitle,
+}
+
+/// What an app rule's pattern is matched against.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AppRuleMatch {
+    /// App / process name (e.g. `slack.exe`), case-insensitive "contains".
+    #[default]
+    App,
+    /// Window title, case-insensitive "contains".
+    Title,
+}
+
+/// Per-app cleanup override. Rules are checked top to bottom; the first match
+/// picks the cleanup prompt (and whether a screenshot is attached).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Type)]
+pub struct AppRule {
+    pub id: String,
+    #[serde(default)]
+    pub match_on: AppRuleMatch,
+    /// Plain text, no wildcards or regex. An empty pattern never matches.
+    #[serde(default)]
+    pub pattern: String,
+    /// Prompt to use; a prompt that no longer exists falls back to the
+    /// selected prompt.
+    #[serde(default)]
+    pub prompt_id: String,
+    /// Attach a screenshot of the active window (vision providers only).
+    #[serde(default)]
+    pub screenshot: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type)]
@@ -471,8 +512,13 @@ pub struct AppSettings {
     pub post_process_prompts: Vec<LLMPrompt>,
     #[serde(default)]
     pub post_process_selected_prompt_id: Option<String>,
+    /// Share the app (and window title) being dictated into with cleanup.
     #[serde(default)]
-    pub screen_context_enabled: bool,
+    pub app_context_mode: AppContextMode,
+    /// Per-app prompt / screenshot overrides, first match wins. Replaces the
+    /// retired global `screen_context_enabled` toggle.
+    #[serde(default)]
+    pub app_rules: Vec<AppRule>,
     #[serde(default)]
     pub mute_while_recording: bool,
     /// Dead-air guard: skip silent recordings and say which mic to check.
@@ -1079,7 +1125,8 @@ pub fn get_default_settings() -> AppSettings {
         post_process_models: default_post_process_models(),
         post_process_prompts: default_post_process_prompts(),
         post_process_selected_prompt_id: None,
-        screen_context_enabled: false,
+        app_context_mode: AppContextMode::default(),
+        app_rules: Vec::new(),
         mute_while_recording: false,
         silent_mic_warning: default_silent_mic_warning(),
         post_process_every_dictation: false,
@@ -1372,6 +1419,24 @@ fn apply_settings_migrations(
     // other position had it visible → Live. The position enum no longer has a
     // `none` variant (legacy "none" deserializes to Bottom via a serde alias), so
     // read the raw stored string to recover the old intent.
+    // One-time screen context migration (only while `app_rules` is absent):
+    // the global `screen_context_enabled` toggle is retired in favour of
+    // per-rule screenshots. A rule needs an app to match, so there is no
+    // faithful translation; screenshots stay off and the change is logged.
+    if settings_value.get("app_rules").is_none() {
+        if settings_value
+            .get("screen_context_enabled")
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            info!(
+                "Screen context is now per app rule; the old global toggle was on, \
+                 so screenshots are off until an app rule opts in"
+            );
+        }
+        updated = true;
+    }
+
     if settings_value.get("overlay_style").is_none() {
         let was_hidden = settings_value
             .get("overlay_position")
@@ -1720,6 +1785,33 @@ mod tests {
     }
 
     #[test]
+    fn retired_screen_context_toggle_loads_without_creating_rules() {
+        let mut raw = default_settings_json();
+        let map = raw.as_object_mut().unwrap();
+        map.remove("app_rules");
+        map.remove("app_context_mode");
+        map.insert("screen_context_enabled".into(), serde_json::json!(true));
+
+        let mut settings: AppSettings = serde_json::from_value(raw.clone()).unwrap();
+        assert!(apply_settings_migrations(&mut settings, &raw));
+        assert!(settings.app_rules.is_empty());
+        assert_eq!(settings.app_context_mode, AppContextMode::AppAndTitle);
+        // The retired key is not written back.
+        assert!(serde_json::to_value(&settings)
+            .unwrap()
+            .get("screen_context_enabled")
+            .is_none());
+    }
+
+    #[test]
+    fn app_rule_fields_default_when_missing() {
+        let rule: AppRule = serde_json::from_value(serde_json::json!({ "id": "r1" })).unwrap();
+        assert_eq!(rule.match_on, AppRuleMatch::App);
+        assert!(rule.pattern.is_empty());
+        assert!(!rule.screenshot);
+    }
+
+    #[test]
     fn default_settings_disable_auto_submit() {
         let settings = get_default_settings();
         assert!(!settings.auto_submit);
@@ -1961,7 +2053,8 @@ mod tests {
             "overlay_style": "live",
             "chinese_script": "as_transcribed",
             "transcribe_accelerator": "gpu",
-            "transcribe_gpu_device": settings.transcribe_gpu_device
+            "transcribe_gpu_device": settings.transcribe_gpu_device,
+            "app_rules": []
         });
 
         assert!(!apply_settings_migrations(&mut settings, &raw));

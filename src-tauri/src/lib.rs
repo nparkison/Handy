@@ -1,4 +1,5 @@
 mod actions;
+mod app_context;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod apple_intelligence;
 mod audio_feedback;
@@ -698,7 +699,8 @@ pub fn run(cli_args: CliArgs) {
             shortcut::change_auto_submit_setting,
             shortcut::change_auto_submit_key_setting,
             shortcut::change_post_process_enabled_setting,
-            shortcut::change_screen_context_enabled_setting,
+            shortcut::change_app_context_mode_setting,
+            shortcut::change_app_rules_setting,
             shortcut::change_experimental_enabled_setting,
             shortcut::change_post_process_base_url_setting,
             shortcut::change_post_process_api_key_setting,
@@ -795,6 +797,7 @@ pub fn run(cli_args: CliArgs) {
             commands::history::search_history_entries,
             commands::history::toggle_history_entry_saved,
             commands::history::get_audio_file_path,
+            commands::history::get_recent_context_apps,
             commands::history::delete_history_entry,
             commands::history::retry_history_entry_transcription,
             commands::history::update_history_limit,
@@ -1051,7 +1054,7 @@ pub fn run(cli_args: CliArgs) {
             app.manage(TranscriptionCoordinator::new(app_handle.clone()));
 
             // Hands the screenshot taken at hotkey press (start) to the pipeline (stop)
-            app.manage(screen_context::ScreenContextSlot::default());
+            app.manage(screen_context::PressContextSlot::default());
 
             initialize_core_logic(&app_handle);
 

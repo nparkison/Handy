@@ -1,3 +1,4 @@
+use crate::app_context::{self, CleanupRequest};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::apple_intelligence;
 use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, SoundType};
@@ -7,14 +8,15 @@ use crate::audio_toolkit::{
 use crate::cockpit::deadline::{race_with_deadline, AbortOnDrop, CleanupOutcome, RequestSent};
 use crate::cockpit::{self, gestures};
 use crate::managers::audio::AudioRecordingManager;
-use crate::managers::history::{CleanupState, HistoryManager};
+use crate::managers::history::{CleanupState, HistoryContext, HistoryManager};
 use crate::managers::model::ModelManager;
 use crate::managers::transcription::StreamWorkKind;
 use crate::managers::transcription::TranscriptionManager;
 use crate::overlay_notice::{show_overlay_notice, Notice, NoticeText};
-use crate::screen_context::{PendingScreenContext, ScreenContext, ScreenContextSlot};
+use crate::screen_context::{PressContextSlot, Screenshot};
 use crate::settings::{
-    get_settings, AppSettings, OverlayStyle, PostProcessProvider, APPLE_INTELLIGENCE_PROVIDER_ID,
+    get_settings, AppContextMode, AppSettings, OverlayStyle, PostProcessProvider,
+    APPLE_INTELLIGENCE_PROVIDER_ID,
 };
 use crate::shortcut;
 use crate::tray::{set_tray_state, TrayIconState};
@@ -94,6 +96,14 @@ fn build_system_prompt(prompt_template: &str) -> String {
     prompt_template.replace("${output}", "").trim().to_string()
 }
 
+/// Append the (untrusted, delimited) app context block to a prompt.
+fn with_app_context(prompt: String, context_block: Option<&str>) -> String {
+    match context_block {
+        Some(block) => format!("{prompt}\n\n{block}"),
+        None => prompt,
+    }
+}
+
 /// System prompt for the screen-context (vision) post-processing request. The
 /// screenshot is untrusted input: it can contain arbitrary text, so the model
 /// is told to use it only as formatting context.
@@ -123,13 +133,15 @@ fn build_screen_context_user_text(prompt_template: &str, transcription: &str) ->
 
 /// Post-process with a screenshot of the focused window attached.
 /// Returns `None` on failure so the caller falls back to text-only processing.
+#[allow(clippy::too_many_arguments)]
 async fn post_process_with_screen_context(
     provider: &PostProcessProvider,
     api_key: &str,
     model: &str,
     prompt: &str,
     transcription: &str,
-    screen_context: &ScreenContext,
+    screenshot: &Screenshot,
+    context_block: Option<&str>,
     disable_reasoning: bool,
 ) -> Option<String> {
     debug!(
@@ -141,9 +153,10 @@ async fn post_process_with_screen_context(
         provider,
         api_key.to_string(),
         model,
-        SCREEN_CONTEXT_SYSTEM_PROMPT.to_string(),
+        with_app_context(SCREEN_CONTEXT_SYSTEM_PROMPT.to_string(), context_block),
         build_screen_context_user_text(prompt, transcription),
-        &screen_context.image_base64,
+        Screenshot::MIME,
+        &screenshot.base64,
         disable_reasoning,
     )
     .await
@@ -231,26 +244,17 @@ fn should_use_streaming_overlay(style: OverlayStyle, is_streaming: bool) -> bool
 pub(crate) async fn post_process_transcription(
     settings: &AppSettings,
     transcription: &str,
-    screen_context: Option<PendingScreenContext>,
+    request: &CleanupRequest,
 ) -> Option<String> {
-    run_cleanup(
-        settings,
-        transcription,
-        screen_context,
-        &RequestSent::detached(),
-    )
-    .await
-    .cleaned()
+    run_cleanup(settings, transcription, request, &RequestSent::detached())
+        .await
+        .cleaned()
 }
 
-/// The selected prompt's text, saved with a cleaned-up History entry.
-fn selected_prompt_text(settings: &AppSettings) -> Option<String> {
-    let prompt_id = settings.post_process_selected_prompt_id.as_ref()?;
-    settings
-        .post_process_prompts
-        .iter()
-        .find(|prompt| &prompt.id == prompt_id)
-        .map(|prompt| prompt.prompt.clone())
+/// The text of the prompt `request` uses (rule prompt or the selected one),
+/// saved with a cleaned-up History entry.
+fn request_prompt_text(settings: &AppSettings, request: &CleanupRequest) -> Option<String> {
+    request.prompt(settings).map(|prompt| prompt.prompt.clone())
 }
 
 /// Cleanup with the outcome distinguished (skipped vs failed). `sent` fires
@@ -258,7 +262,7 @@ fn selected_prompt_text(settings: &AppSettings) -> Option<String> {
 pub(crate) async fn run_cleanup(
     settings: &AppSettings,
     transcription: &str,
-    screen_context: Option<PendingScreenContext>,
+    request: &CleanupRequest,
     sent: &RequestSent,
 ) -> CleanupOutcome {
     if is_blank_transcription(transcription) {
@@ -288,25 +292,11 @@ pub(crate) async fn run_cleanup(
         return CleanupOutcome::Skipped;
     }
 
-    let selected_prompt_id = match &settings.post_process_selected_prompt_id {
-        Some(id) => id.clone(),
-        None => {
-            debug!("Post-processing skipped because no prompt is selected");
-            return CleanupOutcome::Skipped;
-        }
-    };
-
-    let prompt = match settings
-        .post_process_prompts
-        .iter()
-        .find(|prompt| prompt.id == selected_prompt_id)
-    {
+    // An app rule's prompt wins; a missing one falls back to the selected prompt.
+    let prompt = match request.prompt(settings) {
         Some(prompt) => prompt.prompt.clone(),
         None => {
-            debug!(
-                "Post-processing skipped because prompt '{}' was not found",
-                selected_prompt_id
-            );
+            debug!("Post-processing skipped because no prompt is selected (or it was not found)");
             return CleanupOutcome::Skipped;
         }
     };
@@ -332,29 +322,30 @@ pub(crate) async fn run_cleanup(
     // field the endpoint understands and retries without it if rejected.
     let disable_reasoning = matches!(provider.id.as_str(), "custom" | "openrouter");
 
-    // Vision path: attach the focused-window screenshot captured at hotkey
-    // press when the provider supports images. Falls through to the regular
-    // text-only paths on any failure.
+    // App context: plain text, so it works with every provider. Delimited
+    // and marked as untrusted data, like the transcript itself.
+    let context_block = request.context.as_ref().map(app_context::context_block);
+    let context_block = context_block.as_deref();
+
+    // Vision path: attach the active-window screenshot a matching app rule
+    // asked for. Falls through to the regular text-only paths on any failure.
     if provider.supports_vision {
-        if let Some(pending) = screen_context {
-            match pending.resolve().await {
-                Some(ctx) => {
-                    sent.mark();
-                    if let Some(result) = post_process_with_screen_context(
-                        &provider,
-                        &api_key,
-                        &model,
-                        &prompt,
-                        transcription,
-                        &ctx,
-                        disable_reasoning,
-                    )
-                    .await
-                    {
-                        return CleanupOutcome::Cleaned(result);
-                    }
-                }
-                None => debug!("Screen context unavailable; using text-only post-processing"),
+        if let Some(screenshot) = &request.screenshot {
+            request.report.mark_sent(true);
+            sent.mark();
+            if let Some(result) = post_process_with_screen_context(
+                &provider,
+                &api_key,
+                &model,
+                &prompt,
+                transcription,
+                screenshot,
+                context_block,
+                disable_reasoning,
+            )
+            .await
+            {
+                return CleanupOutcome::Cleaned(result);
             }
         }
     }
@@ -362,7 +353,7 @@ pub(crate) async fn run_cleanup(
     if provider.supports_structured_output {
         debug!("Using structured outputs for provider '{}'", provider.id);
 
-        let system_prompt = build_system_prompt(&prompt);
+        let system_prompt = with_app_context(build_system_prompt(&prompt), context_block);
         let user_content = transcription.to_string();
 
         // Handle Apple Intelligence separately since it uses native Swift APIs
@@ -376,6 +367,7 @@ pub(crate) async fn run_cleanup(
                     return CleanupOutcome::Failed;
                 }
 
+                request.report.mark_sent(false);
                 sent.mark();
 
                 let token_limit = model.trim().parse::<i32>().unwrap_or(0);
@@ -424,6 +416,7 @@ pub(crate) async fn run_cleanup(
             "additionalProperties": false
         });
 
+        request.report.mark_sent(false);
         sent.mark();
         match crate::llm_client::send_chat_completion_with_schema(
             &provider,
@@ -479,10 +472,16 @@ pub(crate) async fn run_cleanup(
         }
     }
 
-    // Legacy mode: Replace ${output} variable in the prompt with the actual text
-    let processed_prompt = prompt.replace("${output}", transcription);
+    // Legacy mode: Replace ${output} variable in the prompt with the actual
+    // text. The app context goes first so the prompt (which usually ends with
+    // "return only the cleaned text") keeps the last word.
+    let processed_prompt = match context_block {
+        Some(block) => format!("{block}\n\n{}", prompt.replace("${output}", transcription)),
+        None => prompt.replace("${output}", transcription),
+    };
     debug!("Processed prompt length: {} chars", processed_prompt.len());
 
+    request.report.mark_sent(false);
     sent.mark();
     match crate::llm_client::send_chat_completion(
         &provider,
@@ -520,32 +519,38 @@ pub(crate) async fn run_cleanup(
 pub(crate) struct ProcessedTranscription {
     pub post_processed_text: Option<String>,
     pub post_process_prompt: Option<String>,
+    /// App context the cleanup request carried.
+    pub context: HistoryContext,
 }
 
 /// Cleanup for a re-transcribed History entry (no deadline: the user is
-/// waiting on the History page, not on a paste).
+/// waiting on the History page, not on a paste). `app_info` is the app recorded
+/// with the entry, if any: it re-selects the app rule's prompt and is shared
+/// again as far as the current share mode allows (no screenshot is retaken).
 pub(crate) async fn process_transcription_output(
     app: &AppHandle,
     transcription: &str,
     post_process: bool,
-    screen_context: Option<PendingScreenContext>,
+    app_info: Option<app_context::AppInfo>,
 ) -> ProcessedTranscription {
     let settings = get_settings(app);
     let mut post_processed_text: Option<String> = None;
     let mut post_process_prompt: Option<String> = None;
+    let request = CleanupRequest::for_app(&settings, app_info.as_ref());
 
     if post_process {
         if let Some(processed_text) =
-            post_process_transcription(&settings, transcription, screen_context).await
+            post_process_transcription(&settings, transcription, &request).await
         {
             post_processed_text = Some(processed_text);
-            post_process_prompt = selected_prompt_text(&settings);
+            post_process_prompt = request_prompt_text(&settings, &request);
         }
     }
 
     ProcessedTranscription {
         post_processed_text,
         post_process_prompt,
+        context: request.history_context(),
     }
 }
 
@@ -570,7 +575,7 @@ struct PipelineOutput {
 }
 
 impl PipelineOutput {
-    fn new(cleanup: CleanupResult, transcription: &str, settings: &AppSettings) -> Self {
+    fn new(cleanup: CleanupResult, transcription: &str, prompt_text: Option<String>) -> Self {
         let original = |notice: Option<Notice>| PipelineOutput {
             final_text: transcription.to_string(),
             post_processed_text: None,
@@ -590,7 +595,7 @@ impl PipelineOutput {
             CleanupResult::Done(CleanupOutcome::Cleaned(text)) => PipelineOutput {
                 final_text: text.clone(),
                 post_processed_text: Some(text.clone()),
-                post_process_prompt: selected_prompt_text(settings),
+                post_process_prompt: prompt_text,
                 pasted_version: cockpit::Version::CleanedUp,
                 polished: cockpit::Polished::Ready(text),
                 notice: None,
@@ -663,9 +668,10 @@ impl ShortcutAction for TranscribeAction {
         let settings = get_settings(app);
         let is_always_on = settings.always_on_microphone;
 
-        // Screen context: capture the focused window now, while the user's
-        // target app still has focus. Runs on a background thread so it adds
-        // no keypress->capture latency; the pipeline picks it up at stop.
+        // App context: note the focused app now, while the user's target app
+        // still has focus (plus a screenshot if an app rule asks for one). Runs
+        // on a background thread so it adds no keypress->capture latency; the
+        // pipeline picks it up at stop.
         let post_process = self.post_process
             || (binding_id == "transcribe" && settings.cleans_up_every_dictation());
         // Tap gestures: hold back the start cue and overlay for the tap window
@@ -673,14 +679,21 @@ impl ShortcutAction for TranscribeAction {
         let gesture_delay = gestures::active_for(&binding_id, &settings)
             .then(|| Duration::from_millis(settings.tap_max_duration_ms));
         gestures::reset_press_overlay();
-        if let Some(slot) = app.try_state::<ScreenContextSlot>() {
-            let wants_screen_context = post_process
-                && settings.screen_context_enabled
+        if let Some(slot) = app.try_state::<PressContextSlot>() {
+            let cleanup_will_run = post_process
                 && settings
                     .active_post_process_provider()
-                    .is_some_and(|provider| provider.supports_vision);
-            if wants_screen_context {
-                slot.begin_capture();
+                    .is_some_and(|provider| {
+                        settings
+                            .post_process_models
+                            .get(&provider.id)
+                            .is_some_and(|model| !model.trim().is_empty())
+                    });
+            let wants_app_context = cleanup_will_run
+                && (settings.app_context_mode != AppContextMode::Off
+                    || !settings.app_rules.is_empty());
+            if wants_app_context {
+                slot.begin_capture(&settings, cleanup_will_run);
             } else {
                 slot.clear();
             }
@@ -915,9 +928,9 @@ impl ShortcutAction for TranscribeAction {
             || (binding_id == "transcribe" && settings.cleans_up_every_dictation());
         let gestures_active = gestures::active_for(&binding_id, &settings);
         let cancel_generation = rm.cancel_generation();
-        // Take (and consume) the screen context captured at hotkey press
-        let screen_context = app
-            .try_state::<ScreenContextSlot>()
+        // Take (and consume) the app context captured at hotkey press
+        let press_context = app
+            .try_state::<PressContextSlot>()
             .and_then(|slot| slot.take());
 
         tauri::async_runtime::spawn(async move {
@@ -1074,7 +1087,28 @@ impl ShortcutAction for TranscribeAction {
 
                             let settings = get_settings(&ah);
                             let mut cleanup = CleanupResult::NotRequested;
+                            let mut request = CleanupRequest::plain();
                             if post_process {
+                                // The app info was captured at press; it is
+                                // ready long before transcription finishes.
+                                let (app_info, pending_shot) = match press_context {
+                                    Some(pending) => {
+                                        let (info, shot) = pending.resolve_app().await;
+                                        (info, Some(shot))
+                                    }
+                                    None => (None, None),
+                                };
+                                request = CleanupRequest::for_app(&settings, app_info.as_ref());
+                                if let Some(rule) = &request.rule {
+                                    debug!("App rule '{}' matched", rule.id);
+                                }
+                                let pending_shot =
+                                    pending_shot.filter(|_| request.wants_screenshot(&settings));
+                                crate::overlay::emit_cleanup_context(
+                                    &ah,
+                                    request.display_app(),
+                                    false,
+                                );
                                 if use_streaming_overlay {
                                     tm.emit_stream_working(StreamWorkKind::Polishing);
                                 } else {
@@ -1085,12 +1119,27 @@ impl ShortcutAction for TranscribeAction {
                                 let (sent, sent_rx) = RequestSent::new();
                                 let task_settings = settings.clone();
                                 let task_text = transcription.clone();
+                                let mut task_request = request.clone();
+                                let task_app = ah.clone();
                                 let mut task =
                                     AbortOnDrop(tauri::async_runtime::spawn(async move {
+                                        // Waiting for the screenshot happens
+                                        // before the request is sent, so it
+                                        // never counts against the deadline.
+                                        if let Some(pending) = pending_shot {
+                                            task_request.screenshot = pending.resolve().await;
+                                            if task_request.screenshot.is_some() {
+                                                crate::overlay::emit_cleanup_context(
+                                                    &task_app,
+                                                    task_request.display_app(),
+                                                    true,
+                                                );
+                                            }
+                                        }
                                         run_cleanup(
                                             &task_settings,
                                             &task_text,
-                                            screen_context,
+                                            &task_request,
                                             &sent,
                                         )
                                         .await
@@ -1131,7 +1180,9 @@ impl ShortcutAction for TranscribeAction {
                                 return;
                             }
 
-                            let output = PipelineOutput::new(cleanup, &transcription, &settings);
+                            let prompt_text = request_prompt_text(&settings, &request);
+                            let output =
+                                PipelineOutput::new(cleanup, &transcription, prompt_text.clone());
 
                             // Save to history if WAV was saved
                             let mut entry_id = None;
@@ -1143,12 +1194,13 @@ impl ShortcutAction for TranscribeAction {
                                     output.post_processed_text.clone(),
                                     output.post_process_prompt.clone(),
                                     output.late_task.is_some().then_some(CleanupState::Pending),
+                                    request.history_context(),
                                 ) {
                                     Ok(entry) => entry_id = Some(entry.id),
                                     Err(err) => error!("Failed to save history entry: {}", err),
                                 }
                             }
-                            let late_prompt = selected_prompt_text(&settings);
+                            let late_prompt = prompt_text;
 
                             if output.final_text.is_empty() {
                                 if let Some(task) = output.late_task {
@@ -1250,6 +1302,7 @@ impl ShortcutAction for TranscribeAction {
                                     None,
                                     None,
                                     None,
+                                    HistoryContext::default(),
                                 ) {
                                     error!("Failed to save failed history entry: {}", save_err);
                                 }
@@ -1347,7 +1400,7 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 mod tests {
     use super::{
         build_screen_context_user_text, complete_unless_cancelled, is_blank_transcription,
-        should_use_streaming_overlay, strip_think_block,
+        should_use_streaming_overlay, strip_think_block, with_app_context,
     };
     use crate::settings::OverlayStyle;
     use std::future;
@@ -1421,6 +1474,20 @@ mod tests {
             strip_think_block("<think>never closed"),
             "<think>never closed"
         );
+    }
+
+    #[test]
+    fn app_context_is_appended_after_the_prompt_only_when_shared() {
+        assert_eq!(
+            with_app_context("Fix grammar.".into(), None),
+            "Fix grammar."
+        );
+        let with = with_app_context(
+            "Fix grammar.".into(),
+            Some("<app_context>\nApp: Slack\n</app_context>"),
+        );
+        assert!(with.starts_with("Fix grammar.\n\n<app_context>"));
+        assert!(with.ends_with("</app_context>"));
     }
 
     #[test]

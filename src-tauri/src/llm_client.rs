@@ -434,26 +434,29 @@ pub async fn send_chat_completion_with_schema(
 }
 
 /// Send a multimodal chat completion request: a system prompt plus a user
-/// message made of an image (base64-encoded PNG) and text.
+/// message made of an image (base64-encoded, of type `image_mime`) and text.
 ///
 /// Uses the same request path as `send_chat_completion_with_schema`
 /// (`stream: false`, reasoning-disable fields with retry-on-rejection).
+#[allow(clippy::too_many_arguments)]
 pub async fn send_chat_completion_with_image(
     provider: &PostProcessProvider,
     api_key: String,
     model: &str,
     system_prompt: String,
     user_text: String,
+    image_mime: &str,
     image_base64: &str,
     disable_reasoning: bool,
 ) -> Result<Option<String>, String> {
-    let messages = build_image_messages(system_prompt, user_text, image_base64);
+    let messages = build_image_messages(system_prompt, user_text, image_mime, image_base64);
     send_chat_request(provider, &api_key, model, messages, None, disable_reasoning).await
 }
 
 fn build_image_messages(
     system_prompt: String,
     user_text: String,
+    image_mime: &str,
     image_base64: &str,
 ) -> Vec<ChatMessage> {
     vec![
@@ -466,7 +469,7 @@ fn build_image_messages(
             content: MessageContent::Parts(vec![
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        url: format!("data:image/png;base64,{}", image_base64),
+                        url: format!("data:{};base64,{}", image_mime, image_base64),
                     },
                 },
                 ContentPart::Text { text: user_text },
@@ -808,6 +811,7 @@ mod tests {
             messages: build_image_messages(
                 "system rules".to_string(),
                 "clean this".to_string(),
+                "image/jpeg",
                 "QUJD",
             ),
             stream: false,
@@ -823,7 +827,7 @@ mod tests {
         let parts = &json["messages"][1]["content"];
         assert_eq!(json["messages"][1]["role"], "user");
         assert_eq!(parts[0]["type"], "image_url");
-        assert_eq!(parts[0]["image_url"]["url"], "data:image/png;base64,QUJD");
+        assert_eq!(parts[0]["image_url"]["url"], "data:image/jpeg;base64,QUJD");
         assert_eq!(parts[1]["type"], "text");
         assert_eq!(parts[1]["text"], "clean this");
     }

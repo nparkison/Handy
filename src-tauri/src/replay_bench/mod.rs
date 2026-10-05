@@ -517,8 +517,12 @@ fn bench_entry(
             progress(model, entry_index, total, ReplayBenchPhase::Cleanup),
         );
         let start = Instant::now();
+        // No app context: the bench replays audio outside the app it was
+        // dictated into, so it always measures the selected prompt.
         let cleaned = tauri::async_runtime::block_on(crate::actions::post_process_transcription(
-            settings, &text, None,
+            settings,
+            &text,
+            &crate::app_context::CleanupRequest::plain(),
         ));
         result.cleanup_ms = Some(elapsed_ms(start));
         match cleaned {

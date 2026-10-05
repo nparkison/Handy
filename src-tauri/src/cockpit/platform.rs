@@ -19,7 +19,9 @@ pub struct ForegroundApp {
 /// attributed to the trigger itself (hook delivery order is not guaranteed).
 pub const TRIGGER_SLACK: Duration = Duration::from_millis(50);
 
-pub use imp::{foreground_app, modifiers_released, real_input_between, start_input_watch};
+pub use imp::{
+    foreground_app, modifiers_released, real_input_between, start_input_watch, window_title,
+};
 
 #[cfg(windows)]
 mod imp {
@@ -30,7 +32,7 @@ mod imp {
     use std::sync::{Mutex, Once};
     use std::time::{Duration, Instant};
     use windows::core::{PCWSTR, PWSTR};
-    use windows::Win32::Foundation::{CloseHandle, HINSTANCE, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::{CloseHandle, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
@@ -38,10 +40,10 @@ mod imp {
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW,
-        GetWindowThreadProcessId, SetWindowsHookExW, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
-        LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
-        WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_XBUTTONDOWN,
+        CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowTextLengthW,
+        GetWindowTextW, GetWindowThreadProcessId, SetWindowsHookExW, KBDLLHOOKSTRUCT,
+        LLKHF_INJECTED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL,
+        WM_KEYDOWN, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_XBUTTONDOWN,
     };
 
     /// Recent qualifying inputs, newest last.
@@ -161,6 +163,25 @@ mod imp {
         }
     }
 
+    /// Title of a window from [`foreground_app`]; `None` when it has none.
+    pub fn window_title(window: isize) -> Option<String> {
+        let hwnd = HWND(window as *mut core::ffi::c_void);
+        unsafe {
+            let len = GetWindowTextLengthW(hwnd);
+            if len <= 0 {
+                return None;
+            }
+            // Titles can change between the two calls; the buffer caps the copy.
+            let mut buffer = vec![0u16; len as usize + 1];
+            let copied = GetWindowTextW(hwnd, &mut buffer);
+            if copied <= 0 {
+                return None;
+            }
+            let title = String::from_utf16_lossy(&buffer[..copied as usize]);
+            (!title.trim().is_empty()).then_some(title)
+        }
+    }
+
     unsafe fn process_path(pid: u32) -> Option<String> {
         if pid == 0 {
             return None;
@@ -213,6 +234,10 @@ mod imp {
     }
 
     pub fn foreground_app() -> Option<ForegroundApp> {
+        None
+    }
+
+    pub fn window_title(_window: isize) -> Option<String> {
         None
     }
 
